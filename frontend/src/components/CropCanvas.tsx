@@ -72,6 +72,7 @@ export function CropCanvas({
   onSetPreviewModalOpen,
 }: CropCanvasProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
 
   const [showMask, setShowMask] = useState(true);
@@ -91,6 +92,9 @@ export function CropCanvas({
 
   const segArtifacts = segment ? manifest.segments[segment.id] : undefined;
   const audioDur = segArtifacts?.audio_duration ?? 0;
+  const voiceAudioUrl = segArtifacts?.audio_artifact_id
+    ? `${apiClient.mediaUrl(projectId, segArtifacts.audio_artifact_id)}?v=${segArtifacts.tts_hash ?? ""}`
+    : null;
   const durationPlan = segment
     ? computeDurationPlan(segment, audioDur, srcDur, tailPaddingSec)
     : null;
@@ -108,11 +112,18 @@ export function CropCanvas({
     ? segment.crop_keyframes.filter((kf) => kf.t > rawVideoDur + 1e-4)
     : [];
 
-  // Sync <video> playback & currentTime
+  // Sync <video> playback, volume, & currentTime
   useEffect(() => {
     const vid = videoRef.current;
     if (!vid || !proxyUrl) return;
+    const targetVol = segment ? Math.max(0, Math.min(1, segment.source_audio_volume)) : 1;
+    vid.volume = targetVol;
+    vid.muted = targetVol <= 0;
+
     if (isPlaying) {
+      if (Math.abs(vid.currentTime - sourceTime) > 0.3) {
+        vid.currentTime = Math.max(0, sourceTime);
+      }
       if (vid.paused) {
         vid.play().catch(() => {});
       }
@@ -124,7 +135,33 @@ export function CropCanvas({
         vid.currentTime = Math.max(0, sourceTime);
       }
     }
-  }, [isPlaying, sourceTime, proxyUrl]);
+  }, [isPlaying, sourceTime, proxyUrl, segment]);
+
+  // Sync synthesized voiceover <audio> playback with segment playhead
+  useEffect(() => {
+    const aud = voiceAudioRef.current;
+    if (!aud || !voiceAudioUrl) return;
+    const withinAudio = audioDur > 0 && segRelTime < audioDur - 0.02;
+
+    if (isPlaying && withinAudio) {
+      if (Math.abs(aud.currentTime - segRelTime) > 0.25) {
+        aud.currentTime = Math.max(0, segRelTime);
+      }
+      if (aud.paused) {
+        aud.play().catch(() => {});
+      }
+    } else {
+      if (!aud.paused) {
+        aud.pause();
+      }
+      if (!isPlaying && audioDur > 0) {
+        const clamped = Math.max(0, Math.min(audioDur, segRelTime));
+        if (Math.abs(aud.currentTime - clamped) > 0.08) {
+          aud.currentTime = clamped;
+        }
+      }
+    }
+  }, [isPlaying, segRelTime, voiceAudioUrl, audioDur]);
 
   // Evaluated crop at current segment time
   const currentCrop = segment
@@ -374,18 +411,22 @@ export function CropCanvas({
           }}
         >
           {proxyUrl ? (
-            <video
-              ref={videoRef}
-              src={proxyUrl}
-              className="h-full w-full object-contain"
-              playsInline
-              muted
-              onTimeUpdate={(e) => {
-                if (isPlaying) {
-                  onSourceTimeChange(e.currentTarget.currentTime);
-                }
-              }}
-            />
+            <>
+              <video
+                ref={videoRef}
+                src={proxyUrl}
+                className="h-full w-full object-contain"
+                playsInline
+                onTimeUpdate={(e) => {
+                  if (isPlaying) {
+                    onSourceTimeChange(e.currentTarget.currentTime);
+                  }
+                }}
+              />
+              {voiceAudioUrl && (
+                <audio ref={voiceAudioRef} src={voiceAudioUrl} preload="auto" />
+              )}
+            </>
           ) : (
             <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-zinc-400">
               {manifest.proxy.status === "failed" ? (
