@@ -1,14 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
+  Captions,
   Copy,
+  Film,
+  KeyRound,
   Pause,
   Play,
   Plus,
   Snowflake,
   Trash2,
+  Volume2,
 } from "lucide-react";
 import type { ArtifactManifest, SegmentInput } from "../types/studio";
 import { computeDurationPlan, formatTimecode } from "../utils/studioMath";
@@ -52,10 +56,47 @@ export function Timeline({
   const [markIn, setMarkIn] = useState(0);
   const [markOut, setMarkOut] = useState(() => Math.min(3.0, sourceDur));
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [isScrubbingTracks, setIsScrubbingTracks] = useState(false);
+  const trackLaneRef = useRef<HTMLDivElement | null>(null);
+
+  const selectedSegment =
+    segments.find((s) => s.id === selectedSegId) ?? null;
 
   useEffect(() => {
     setMarkOut((prev) => (prev > sourceDur ? Math.max(0.5, sourceDur) : prev));
   }, [sourceDur]);
+
+  const scrubTracksAtClientX = (clientX: number) => {
+    if (!selectedSegment || !trackLaneRef.current) return;
+    const rect = trackLaneRef.current.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const segArt = manifest.segments[selectedSegment.id];
+    const audioDur = segArt?.audio_duration ?? 0;
+    const plan = computeDurationPlan(
+      selectedSegment,
+      audioDur,
+      sourceDur,
+      tailPaddingSec
+    );
+    const totalDur = Math.max(0.1, plan.finalDur);
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const relTime = ratio * totalDur;
+    onSourceTimeChange(
+      selectedSegment.video_in + Math.min(plan.rawVideoDur, relTime)
+    );
+  };
+
+  useEffect(() => {
+    if (!isScrubbingTracks) return;
+    const onMove = (e: MouseEvent) => scrubTracksAtClientX(e.clientX);
+    const onUp = () => setIsScrubbingTracks(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  });
 
   // Global keyboard shortcuts I (Set In) and O (Set Out), disabled inside inputs/textareas/selects
   useEffect(() => {
@@ -366,6 +407,287 @@ export function Timeline({
           })
         )}
       </div>
+
+      {/* Joined-up Video / Audio / Captions / Keyframes Alignment View */}
+      {selectedSegment && (() => {
+        const segArt = manifest.segments[selectedSegment.id];
+        const audioDur = segArt?.audio_duration ?? 0;
+        const plan = computeDurationPlan(
+          selectedSegment,
+          audioDur,
+          sourceDur,
+          tailPaddingSec
+        );
+        const totalDur = Math.max(0.1, plan.finalDur);
+        const totalFrames = plan.frameCount;
+        const segRelTime = Math.max(
+          0,
+          Math.min(totalDur, sourceTime - selectedSegment.video_in)
+        );
+        const currentFrame = Math.min(totalFrames, Math.round(segRelTime * 30));
+        const playheadPct = Math.max(0, Math.min(100, (segRelTime / totalDur) * 100));
+        const videoEndPct = Math.max(
+          0,
+          Math.min(100, (plan.rawVideoDur / totalDur) * 100)
+        );
+        const audioEndPct = Math.max(
+          0,
+          Math.min(100, (audioDur / totalDur) * 100)
+        );
+
+        const timings = segArt?.clause_timings ?? [];
+        const timingById = new Map(timings.map((t) => [t.clause_id, t]));
+        const hasRealTimings =
+          selectedSegment.clauses.length > 0 &&
+          timings.length > 0 &&
+          selectedSegment.clauses.some((c) => timingById.has(c.id));
+
+        const captionBlocks = selectedSegment.clauses.map((clause, i) => {
+          if (hasRealTimings) {
+            const t = timingById.get(clause.id);
+            if (!t) return null;
+            const nextClause = selectedSegment.clauses[i + 1];
+            const nextTiming = nextClause ? timingById.get(nextClause.id) : undefined;
+            const endSec = nextTiming ? nextTiming.start_sec : t.end_sec;
+            return {
+              id: clause.id,
+              text: clause.display_text,
+              startSec: t.start_sec,
+              endSec: Math.max(t.start_sec, endSec),
+              estimated: false,
+            };
+          }
+          const span = Math.max(0.1, plan.rawVideoDur) / Math.max(1, selectedSegment.clauses.length);
+          const startSec = i * span;
+          const endSec = (i + 1) * span;
+          return {
+            id: clause.id,
+            text: clause.display_text,
+            startSec,
+            endSec,
+            estimated: true,
+          };
+        }).filter((b): b is NonNullable<typeof b> => b !== null);
+
+        const tickCount = 5;
+        const ticks = Array.from({ length: tickCount + 1 }, (_, i) => {
+          const frac = i / tickCount;
+          const t = frac * totalDur;
+          const f = Math.round(t * 30);
+          return { frac, t, f };
+        });
+
+        return (
+          <div className="border-t border-zinc-800 bg-[#11141b] px-3 py-2 space-y-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+              <div className="flex items-center gap-2">
+                <span className="font-semibold text-zinc-200">
+                  Segment Alignment ({selectedSegment.id})
+                </span>
+                <span className="font-mono text-zinc-400">
+                  {segRelTime.toFixed(2)}s / {totalDur.toFixed(2)}s •{" "}
+                  <span className="text-emerald-300">
+                    f{currentFrame} / {totalFrames}f
+                  </span>{" "}
+                  (30fps)
+                </span>
+              </div>
+              <span className="text-[10px] text-zinc-500">
+                Click or drag tracks to scrub frames, captions &amp; keyframes
+              </span>
+            </div>
+
+            <div className="flex gap-2 select-none">
+              {/* Track Labels */}
+              <div className="w-20 shrink-0 space-y-1 pt-5 text-[10px] font-medium text-zinc-400">
+                <div className="flex h-5 items-center gap-1">
+                  <Film className="h-3 w-3 text-emerald-400" />
+                  <span>Video</span>
+                </div>
+                <div className="flex h-5 items-center gap-1">
+                  <Volume2 className="h-3 w-3 text-violet-400" />
+                  <span>Audio</span>
+                </div>
+                <div className="flex h-6 items-center gap-1">
+                  <Captions className="h-3 w-3 text-sky-400" />
+                  <span>Captions</span>
+                </div>
+                <div className="flex h-5 items-center gap-1">
+                  <KeyRound className="h-3 w-3 text-amber-400" />
+                  <span>Keyframes</span>
+                </div>
+              </div>
+
+              {/* Shared Scrubbable Multi-Track Lane */}
+              <div
+                ref={trackLaneRef}
+                onMouseDown={(e) => {
+                  setIsScrubbingTracks(true);
+                  scrubTracksAtClientX(e.clientX);
+                }}
+                className="relative flex-1 cursor-ew-resize space-y-1 overflow-hidden rounded border border-zinc-800 bg-[#0b0d11] px-0 py-1"
+              >
+                {/* Time & Frame Ruler */}
+                <div className="relative h-4 border-b border-zinc-800/80 text-[9px] font-mono text-zinc-500">
+                  {ticks.map((tk, idx) => (
+                    <div
+                      key={idx}
+                      className="absolute top-0 flex flex-col items-center"
+                      style={{
+                        left: `${tk.frac * 100}%`,
+                        transform:
+                          idx === 0
+                            ? "translateX(2px)"
+                            : idx === ticks.length - 1
+                              ? "translateX(-100%)"
+                              : "translateX(-50%)",
+                      }}
+                    >
+                      <span>
+                        {tk.t.toFixed(1)}s ({tk.f}f)
+                      </span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Track 1: Video Frames */}
+                <div className="relative h-5 bg-zinc-900/60">
+                  <div
+                    className="absolute inset-y-0 left-0 flex items-center overflow-hidden border-r border-emerald-400/50 bg-emerald-500/20 px-1.5 text-[10px] font-mono text-emerald-200"
+                    style={{ width: `${videoEndPct}%` }}
+                  >
+                    <span className="truncate">
+                      Vid 0f–{Math.round(plan.rawVideoDur * 30)}f ({plan.rawVideoDur.toFixed(2)}s)
+                    </span>
+                  </div>
+                  {videoEndPct < 99.9 && (
+                    <div
+                      className="absolute inset-y-0 right-0 flex items-center overflow-hidden bg-sky-500/15 px-1.5 text-[10px] font-mono text-sky-200"
+                      style={{ left: `${videoEndPct}%` }}
+                    >
+                      <span className="truncate">
+                        {plan.isFreezeFrame ? "Freeze" : "Extended"} (+
+                        {(totalDur - plan.rawVideoDur).toFixed(2)}s)
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Track 2: Voiceover Audio */}
+                <div className="relative h-5 bg-zinc-900/60">
+                  {audioDur > 0 ? (
+                    <div
+                      className="absolute inset-y-0 left-0 flex items-center overflow-hidden rounded-sm border border-violet-400/40 bg-violet-500/25 px-1.5 text-[10px] font-mono text-violet-200"
+                      style={{ width: `${audioEndPct}%` }}
+                    >
+                      <span className="truncate">
+                        TTS 0.00s → {audioDur.toFixed(2)}s
+                      </span>
+                    </div>
+                  ) : selectedSegment.clauses.length > 0 ? (
+                    <div className="flex h-full items-center px-2 text-[10px] text-amber-300/80">
+                      Pending TTS — click Preview to align audio &amp; captions
+                    </div>
+                  ) : (
+                    <div className="flex h-full items-center px-2 text-[10px] text-zinc-600">
+                      Silent (no narration)
+                    </div>
+                  )}
+                </div>
+
+                {/* Track 3: Captions */}
+                <div className="relative h-6 bg-zinc-900/60">
+                  {captionBlocks.length === 0 ? (
+                    <div className="flex h-full items-center px-2 text-[10px] text-zinc-600">
+                      No captions
+                    </div>
+                  ) : (
+                    captionBlocks.map((b) => {
+                      const leftPct = Math.max(0, Math.min(100, (b.startSec / totalDur) * 100));
+                      const widthPct = Math.max(
+                        2,
+                        Math.min(100 - leftPct, ((b.endSec - b.startSec) / totalDur) * 100)
+                      );
+                      return (
+                        <button
+                          key={b.id}
+                          type="button"
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={() =>
+                            onSourceTimeChange(
+                              selectedSegment.video_in +
+                                Math.min(plan.rawVideoDur, b.startSec)
+                            )
+                          }
+                          title={`${b.id}: "${b.text}" (${b.startSec.toFixed(2)}s – ${b.endSec.toFixed(2)}s${b.estimated ? ", estimated" : ""})`}
+                          className={`absolute inset-y-0.5 flex items-center gap-1 overflow-hidden rounded px-1.5 text-left text-[10px] transition hover:brightness-125 ${
+                            b.estimated
+                              ? "border border-dashed border-sky-400/50 bg-sky-500/10 text-sky-200/80"
+                              : "border border-sky-400/60 bg-sky-500/25 text-sky-100"
+                          }`}
+                          style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
+                        >
+                          <span className="shrink-0 font-mono text-[9px] text-sky-300">
+                            {b.id}
+                          </span>
+                          <span className="truncate">{b.text || "—"}</span>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+
+                {/* Track 4: View Window Keyframes */}
+                <div className="relative h-5 bg-zinc-900/60">
+                  {selectedSegment.crop_keyframes.map((kf, idx) => {
+                    const leftPct = Math.max(
+                      0,
+                      Math.min(100, (kf.t / totalDur) * 100)
+                    );
+                    const isOut = kf.t > plan.rawVideoDur + 1e-4;
+                    return (
+                      <button
+                        key={`${kf.t}-${idx}`}
+                        type="button"
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onClick={() =>
+                          onSourceTimeChange(
+                            selectedSegment.video_in +
+                              Math.min(plan.rawVideoDur, kf.t)
+                          )
+                        }
+                        title={`Keyframe @${kf.t.toFixed(2)}s (f${Math.round(kf.t * 30)}) • Zoom ${kf.zoom.toFixed(2)}x`}
+                        className={`absolute top-0.5 -translate-x-1/2 rounded border px-1 py-0 text-[9px] font-mono ${
+                          isOut
+                            ? "border-rose-400/70 bg-rose-500/30 text-rose-100"
+                            : "border-amber-400/70 bg-amber-500/25 text-amber-100 hover:bg-amber-500/40"
+                        }`}
+                        style={{
+                          left: `${leftPct}%`,
+                          transform:
+                            leftPct < 4
+                              ? "translateX(0)"
+                              : leftPct > 96
+                                ? "translateX(-100%)"
+                                : "translateX(-50%)",
+                        }}
+                      >
+                        ◆ {kf.zoom.toFixed(1)}x
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Shared Playhead */}
+                <div
+                  className="pointer-events-none absolute inset-y-0 z-10 w-0.5 bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)]"
+                  style={{ left: `${playheadPct}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </section>
   );
 }
