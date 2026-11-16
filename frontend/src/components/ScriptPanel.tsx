@@ -332,7 +332,7 @@ export function ScriptPanel({
                   {isStale ? (
                     <span className="inline-flex items-center gap-1 rounded border border-amber-500/50 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-200">
                       <AlertTriangle className="h-3 w-3" />
-                      Narration Updated — Render Preview to Sync
+                      Narration Updated — Click Preview to Sync
                     </span>
                   ) : hasAudioArtifact ? (
                     <span className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-200">

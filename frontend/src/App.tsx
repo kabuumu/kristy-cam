@@ -29,6 +29,7 @@ import type {
 } from "./types/studio";
 import {
   clampCropPosition,
+  computeClientPreviewSignature,
   computeClientTtsSignature,
   computeDurationPlan,
   computeIdealCrop,
@@ -65,6 +66,8 @@ export default function App() {
   const [lastSynthesizedSignatures, setLastSynthesizedSignatures] = useState<
     Record<string, string>
   >({});
+  const [lastRenderedPreviewSignatures, setLastRenderedPreviewSignatures] =
+    useState<Record<string, string>>({});
 
   // Modals
   const [newProjectOpen, setNewProjectOpen] = useState(false);
@@ -106,6 +109,7 @@ export default function App() {
       return bundle.project.segments[0]?.id ?? null;
     });
     const sigs: Record<string, string> = {};
+    const previewSigs: Record<string, string> = {};
     for (const seg of bundle.project.segments) {
       if (bundle.manifest.segments[seg.id]?.audio_artifact_id) {
         sigs[seg.id] = computeClientTtsSignature(
@@ -116,8 +120,12 @@ export default function App() {
           bundle.project.output_settings.inter_clause_pause_ms
         );
       }
+      if (bundle.manifest.segments[seg.id]?.preview_artifact_id) {
+        previewSigs[seg.id] = computeClientPreviewSignature(seg, bundle.project);
+      }
     }
     setLastSynthesizedSignatures((prev) => ({ ...sigs, ...prev }));
+    setLastRenderedPreviewSignatures((prev) => ({ ...previewSigs, ...prev }));
   }, []);
 
   const loadProject = useCallback(
@@ -227,6 +235,21 @@ export default function App() {
               setLastSynthesizedSignatures((prev) => ({ ...prev, ...sigs }));
             }
             if (updated.job_type === "preview") {
+              if (updated.seg_id && projectRef.current) {
+                const seg = projectRef.current.segments.find(
+                  (s) => s.id === updated.seg_id
+                );
+                if (seg) {
+                  const pSig = computeClientPreviewSignature(
+                    seg,
+                    projectRef.current
+                  );
+                  setLastRenderedPreviewSignatures((prev) => ({
+                    ...prev,
+                    [seg.id]: pSig,
+                  }));
+                }
+              }
               setPreviewModalOpen(true);
             } else if (updated.job_type === "export") {
               setExportModalOpen(true);
@@ -353,6 +376,17 @@ export default function App() {
   };
 
   const handleRenderPreview = async (segId: string) => {
+    if (project && !dirty && manifest?.segments[segId]?.preview_artifact_id) {
+      const seg = project.segments.find((s) => s.id === segId);
+      if (
+        seg &&
+        lastRenderedPreviewSignatures[segId] ===
+          computeClientPreviewSignature(seg, project)
+      ) {
+        setPreviewModalOpen(true);
+        return;
+      }
+    }
     const saved = await ensureSavedBeforeJob();
     if (!saved) return;
     try {

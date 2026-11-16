@@ -284,6 +284,37 @@ export function computeClientTtsSignature(
   });
 }
 
+export function computeClientPreviewSignature(
+  segment: SegmentInput,
+  project: {
+    voice: string;
+    language: string;
+    pronunciations: Record<string, string>;
+    output_settings: unknown;
+    caption_settings: unknown;
+    source_media: unknown;
+  }
+): string {
+  return JSON.stringify({
+    tts: computeClientTtsSignature(
+      segment,
+      project.pronunciations,
+      project.voice,
+      project.language,
+      (project.output_settings as { inter_clause_pause_ms?: number })
+        ?.inter_clause_pause_ms ?? 120
+    ),
+    video_in: segment.video_in,
+    video_out: segment.video_out,
+    duration_mode: segment.duration_mode,
+    source_audio_volume: segment.source_audio_volume,
+    crop_keyframes: segment.crop_keyframes,
+    output_settings: project.output_settings,
+    caption_settings: project.caption_settings,
+    source_media: project.source_media,
+  });
+}
+
 export function formatTimecode(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) return "00:00.00";
   const mins = Math.floor(sec / 60);

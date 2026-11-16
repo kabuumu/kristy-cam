@@ -349,17 +349,7 @@ export function CropCanvas({
               ) : (
                 <Sparkles className="h-3.5 w-3.5" />
               )}
-              Render Segment Preview
-            </button>
-          )}
-
-          {previewArtifactId && (
-            <button
-              type="button"
-              onClick={() => onSetPreviewModalOpen(true)}
-              className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
-            >
-              Watch Preview
+              Preview
             </button>
           )}
         </div>
