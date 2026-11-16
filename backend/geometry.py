@@ -168,9 +168,12 @@ def evaluate_crop_at(
         for idx in range(len(keyframes) - 1):
             k0 = keyframes[idx]
             k1 = keyframes[idx + 1]
-            if k0.t <= t <= k1.t:
+            if k0.t <= t < k1.t or (idx == len(keyframes) - 2 and k0.t <= t <= k1.t):
                 dt = k1.t - k0.t
-                alpha = 0.0 if dt <= 0.0 else (t - k0.t) / dt
+                if k0.transition == "snap" and t < k1.t:
+                    alpha = 0.0
+                else:
+                    alpha = 0.0 if dt <= 0.0 else (t - k0.t) / dt
                 x_norm = k0.x + (k1.x - k0.x) * alpha
                 y_norm = k0.y + (k1.y - k0.y) * alpha
                 zoom = k0.zoom + (k1.zoom - k0.zoom) * alpha
@@ -199,8 +202,9 @@ def _piecewise_linear_expr(
     times: Sequence[float],
     values: Sequence[float],
     time_var: str = "t",
+    transitions: Sequence[str] | None = None,
 ) -> str:
-    """Build a nested FFmpeg piecewise-linear expression over `time_var` with final hold."""
+    """Build a nested FFmpeg piecewise-linear/step expression over `time_var` with final hold."""
     if len(values) == 1:
         return f"{values[0]:.6f}"
 
@@ -211,9 +215,8 @@ def _piecewise_linear_expr(
         v0 = values[idx]
         v1 = values[idx + 1]
         dt = t1 - t0
-        if dt <= 0.0:
-            seg_expr = f"{v0:.6f}"
-        elif abs(v1 - v0) < 1e-12:
+        is_snap = transitions is not None and idx < len(transitions) and transitions[idx] == "snap"
+        if dt <= 0.0 or is_snap or abs(v1 - v0) < 1e-12:
             seg_expr = f"{v0:.6f}"
         else:
             dv = v1 - v0
@@ -259,14 +262,15 @@ def build_crop_filter(
         max_y = max(0.0, float(height - crop_h))
 
         times = [kf.t for kf in keyframes]
+        transitions = [kf.transition for kf in keyframes]
         xs = [min(max(kf.x * float(width), 0.0), max_x) for kf in keyframes]
         ys = [min(max(kf.y * float(height), 0.0), max_y) for kf in keyframes]
 
         if len(keyframes) == 1:
             crop_part = f"crop=w={crop_w}:h={crop_h}:x={xs[0]:.4f}:y={ys[0]:.4f}"
         else:
-            x_expr = f"clip({_piecewise_linear_expr(times, xs, 't')},0,{max_x:.4f})"
-            y_expr = f"clip({_piecewise_linear_expr(times, ys, 't')},0,{max_y:.4f})"
+            x_expr = f"clip({_piecewise_linear_expr(times, xs, 't', transitions)},0,{max_x:.4f})"
+            y_expr = f"clip({_piecewise_linear_expr(times, ys, 't', transitions)},0,{max_y:.4f})"
             crop_part = f"crop=w={crop_w}:h={crop_h}:x='{x_expr}':y='{y_expr}'"
 
         return f"{crop_part},scale={out_w}:{out_h}:flags=lanczos,setsar=1,fps={fps}"
@@ -287,13 +291,14 @@ def build_crop_filter(
     zoom_scale = float(pad_w) / base_crop_w
 
     times = [kf.t for kf in keyframes]
+    transitions = [kf.transition for kf in keyframes]
     zooms = [kf.zoom for kf in keyframes]
     xs = [kf.x * float(width) for kf in keyframes]
     ys = [kf.y * float(height) for kf in keyframes]
 
-    z_expr = f"({zoom_scale:.8f})*({_piecewise_linear_expr(times, zooms, 'it')})"
-    x_raw = _piecewise_linear_expr(times, xs, "it")
-    y_raw = _piecewise_linear_expr(times, ys, "it")
+    z_expr = f"({zoom_scale:.8f})*({_piecewise_linear_expr(times, zooms, 'it', transitions)})"
+    x_raw = _piecewise_linear_expr(times, xs, "it", transitions)
+    y_raw = _piecewise_linear_expr(times, ys, "it", transitions)
     x_expr = f"clip({x_raw},0,max(0,{width}-iw/zoom))"
     y_expr = f"clip({y_raw},0,max(0,{height}-ih/zoom))"
 

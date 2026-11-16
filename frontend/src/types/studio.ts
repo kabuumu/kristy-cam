@@ -35,18 +35,29 @@ export interface CaptionSettings {
   margin_v: number;
 }
 
+export type KeyframeTransition = "tween" | "snap";
+
 export interface CropKeyframe {
   t: number;
   x: number;
   y: number;
   zoom: number;
+  transition?: KeyframeTransition;
 }
 
 export interface ClauseInput {
   id: string;
   display_text: string;
   spoken_text_override: string | null;
+  start_sec?: number | null;
+  duration_sec?: number | null;
 }
+
+export type TimelineSelection =
+  | { type: "video"; segId: string }
+  | { type: "keyframe"; segId: string; index: number }
+  | { type: "clause"; segId: string; index: number }
+  | null;
 
 export interface SegmentInput {
   id: string;

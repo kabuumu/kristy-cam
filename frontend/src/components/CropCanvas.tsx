@@ -10,7 +10,6 @@ import {
   Play,
   Plus,
   Sparkles,
-  Trash2,
   X,
 } from "lucide-react";
 import { apiClient } from "../api/client";
@@ -174,11 +173,6 @@ export function CropCanvas({
   const boxWidthPct = (ideal.idealCropW / srcW) * 100;
   const boxHeightPct = (ideal.idealCropH / srcH) * 100;
 
-  // Active keyframe near current time (within 0.05s)
-  const activeKfIndex = segment
-    ? segment.crop_keyframes.findIndex((kf) => Math.abs(kf.t - segRelTime) < 0.05)
-    : -1;
-
   const upsertKeyframeAt = (
     t: number,
     x: number,
@@ -282,12 +276,6 @@ export function CropCanvas({
       ...segment,
       crop_keyframes: kept.length > 0 ? kept : [{ t: 0, x: 0.28, y: 0, zoom: 1.0 }],
     });
-  };
-
-  const handleDeleteKeyframe = (index: number) => {
-    if (!segment || index === 0) return; // t=0 keyframe is required
-    const next = segment.crop_keyframes.filter((_, i) => i !== index);
-    onUpdateSegment({ ...segment, crop_keyframes: next });
   };
 
   const previewArtifactId = segArtifacts?.preview_artifact_id ?? null;
@@ -509,132 +497,53 @@ export function CropCanvas({
         </div>
       </div>
 
-      {/* Keyframe Scrubber & Transport Controls */}
-      {segment && (
-        <div className="border-t border-zinc-800 bg-[#13161c] px-3 py-2 space-y-2">
-          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={onTogglePlay}
-                className="inline-flex items-center gap-1 rounded bg-zinc-800 px-2.5 py-1 text-zinc-100 hover:bg-zinc-700"
-              >
-                {isPlaying ? (
-                  <>
-                    <Pause className="h-3.5 w-3.5" /> Pause
-                  </>
-                ) : (
-                  <>
-                    <Play className="h-3.5 w-3.5" /> Play
-                  </>
-                )}
-              </button>
-              <span className="font-mono text-zinc-300">
-                Seg: {formatTimecode(segRelTime)} / {formatTimecode(durationPlan?.finalDur ?? rawVideoDur)}
-              </span>
-              <span className="font-mono text-zinc-500">
-                Src: {formatTimecode(sourceTime)}
-              </span>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <label className="flex items-center gap-1.5 text-zinc-300">
-                <span>Zoom</span>
-                <input
-                  type="range"
-                  min={1}
-                  max={3}
-                  step={0.05}
-                  value={currentCrop.zoom}
-                  onChange={(e) =>
-                    upsertKeyframeAt(
-                      segRelTime,
-                      currentCrop.x,
-                      currentCrop.y,
-                      parseFloat(e.target.value)
-                    )
-                  }
-                  className="w-24"
-                />
-                <span className="w-10 font-mono text-right">
-                  {currentCrop.zoom.toFixed(2)}x
-                </span>
-              </label>
-
-              <button
-                type="button"
-                onClick={() =>
-                  upsertKeyframeAt(
-                    segRelTime,
-                    currentCrop.x,
-                    currentCrop.y,
-                    currentCrop.zoom
-                  )
-                }
-                className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-emerald-200 hover:bg-emerald-500/25"
-              >
-                <Plus className="h-3.5 w-3.5" />
-                Add Keyframe
-              </button>
-            </div>
-          </div>
-
-          {/* Segment Scrubber */}
-          <input
-            type="range"
-            min={0}
-            max={Math.max(0.1, durationPlan?.finalDur ?? rawVideoDur)}
-            step={0.033}
-            value={segRelTime}
-            onChange={(e) => {
-              const rel = parseFloat(e.target.value);
-              onSourceTimeChange(segment.video_in + Math.min(rawVideoDur, rel));
-            }}
-            className="w-full"
-            aria-label="Segment Keyframe Scrubber"
-          />
-
-          {/* Keyframe Chips */}
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[11px] text-zinc-400">Keyframes:</span>
-            {segment.crop_keyframes.map((kf, idx) => {
-              const isOut = kf.t > rawVideoDur + 1e-4;
-              const isActive = idx === activeKfIndex;
-              return (
-                <div
-                  key={`${kf.t}-${idx}`}
-                  className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-mono ${
-                    isOut
-                      ? "border-amber-500/60 bg-amber-500/15 text-amber-200"
-                      : isActive
-                        ? "border-emerald-500 bg-emerald-500/20 text-emerald-200"
-                        : "border-zinc-700 bg-zinc-800/70 text-zinc-300"
-                  }`}
-                >
-                  <button
-                    type="button"
-                    onClick={() => onSourceTimeChange(segment.video_in + Math.min(rawVideoDur, kf.t))}
-                    className="hover:underline"
-                    title="Jump to keyframe"
-                  >
-                    @{kf.t.toFixed(2)}s ({kf.zoom.toFixed(1)}x)
-                  </button>
-                  {idx > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteKeyframe(idx)}
-                      className="text-zinc-400 hover:text-rose-400"
-                      title="Delete keyframe"
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+      {/* Minimal Transport Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 bg-[#13161c] px-3 py-2 text-xs">
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onTogglePlay}
+            className="inline-flex items-center gap-1 rounded bg-zinc-800 px-2.5 py-1 text-zinc-100 hover:bg-zinc-700"
+          >
+            {isPlaying ? (
+              <>
+                <Pause className="h-3.5 w-3.5" /> Pause
+              </>
+            ) : (
+              <>
+                <Play className="h-3.5 w-3.5" /> Play
+              </>
+            )}
+          </button>
+          {segment ? (
+            <span className="font-mono text-zinc-300">
+              {formatTimecode(segRelTime)} / {formatTimecode(durationPlan?.finalDur ?? rawVideoDur)}
+            </span>
+          ) : (
+            <span className="font-mono text-zinc-500">
+              Src: {formatTimecode(sourceTime)}
+            </span>
+          )}
         </div>
-      )}
+
+        {segment && (
+          <button
+            type="button"
+            onClick={() =>
+              upsertKeyframeAt(
+                segRelTime,
+                currentCrop.x,
+                currentCrop.y,
+                currentCrop.zoom
+              )
+            }
+            className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-amber-200 hover:bg-amber-500/25"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            Add Keyframe @{segRelTime.toFixed(2)}s
+          </button>
+        )}
+      </div>
 
       {/* In-place Captioned Preview Modal */}
       {previewModalOpen && previewArtifactId && (

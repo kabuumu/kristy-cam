@@ -91,6 +91,7 @@ class CropKeyframe(BaseModel):
     x: float = Field(ge=0.0, le=1.0)
     y: float = Field(ge=0.0, le=1.0)
     zoom: float = Field(default=1.0, ge=1.0, le=3.0)
+    transition: Literal["tween", "snap"] = "tween"
 
     @field_validator("t", "x", "y", "zoom")
     @classmethod
@@ -99,13 +100,22 @@ class CropKeyframe(BaseModel):
 
 
 class ClauseInput(BaseModel):
-    """Paired caption/narration clause; display_text is authoritative for captions."""
+    """Paired caption/narration block; display_text is authoritative for captions."""
 
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1)
     display_text: str
     spoken_text_override: str | None = None
+    start_sec: float | None = Field(default=None, ge=0.0)
+    duration_sec: float | None = Field(default=None, gt=0.0)
+
+    @field_validator("start_sec", "duration_sec")
+    @classmethod
+    def _validate_optional_finite(cls, v: float | None, info: Any) -> float | None:
+        if v is None:
+            return None
+        return _check_finite(v, info.field_name)
 
 
 class SegmentInput(BaseModel):

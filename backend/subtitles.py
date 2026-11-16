@@ -49,11 +49,20 @@ def build_segment_subtitle_events(
             f"Mismatch between clauses ({len(clauses)}) and clause_timings ({len(clause_timings)})"
         )
 
+    has_custom_timings = any(
+        c.start_sec is not None or c.duration_sec is not None for c in clauses
+    )
     events: list[SubtitleEvent] = []
     last_idx = len(clauses) - 1
     for idx, (clause, timing) in enumerate(zip(clauses, clause_timings)):
-        start_sec = segment_offset_sec + timing.start_sec
-        if idx < last_idx:
+        start_sec = segment_offset_sec + (
+            clause.start_sec if clause.start_sec is not None else timing.start_sec
+        )
+        if clause.duration_sec is not None:
+            end_sec = start_sec + clause.duration_sec
+        elif has_custom_timings:
+            end_sec = segment_offset_sec + timing.end_sec
+        elif idx < last_idx:
             end_sec = segment_offset_sec + clause_timings[idx + 1].start_sec
         else:
             end_sec = segment_offset_sec + timing.end_sec

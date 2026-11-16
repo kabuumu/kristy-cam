@@ -135,9 +135,14 @@ export function evaluateCropAt(
   for (let i = 0; i < sorted.length - 1; i++) {
     const a = sorted[i];
     const b = sorted[i + 1];
-    if (t >= a.t && t <= b.t) {
+    if ((t >= a.t && t < b.t) || (i === sorted.length - 2 && t >= a.t && t <= b.t)) {
       const span = b.t - a.t;
-      const alpha = span > 0 ? (t - a.t) / span : 0;
+      const alpha =
+        a.transition === "snap" && t < b.t
+          ? 0
+          : span > 0
+            ? (t - a.t) / span
+            : 0;
       const x = a.x + (b.x - a.x) * alpha;
       const y = a.y + (b.y - a.y) * alpha;
       const zoom = a.zoom + (b.zoom - a.zoom) * alpha;
@@ -280,6 +285,8 @@ export function computeClientTtsSignature(
       display_text: c.display_text,
       spoken_text_override: c.spoken_text_override,
       resolved: resolveClauseSpokenText(c, pronunciations),
+      start_sec: c.start_sec ?? null,
+      duration_sec: c.duration_sec ?? null,
     })),
   });
 }

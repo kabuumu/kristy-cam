@@ -15,8 +15,8 @@ import {
 import { ApiError, apiClient } from "./api/client";
 import { ActivityLogModal } from "./components/ActivityLogModal";
 import { CropCanvas } from "./components/CropCanvas";
+import { ContextualInspector } from "./components/ContextualInspector";
 import { JobStatusBar } from "./components/JobStatusBar";
-import { ScriptPanel } from "./components/ScriptPanel";
 import { Timeline } from "./components/Timeline";
 import type {
   ArtifactManifest,
@@ -28,6 +28,7 @@ import type {
   ProjectSummary,
   SegmentInput,
   SourceStatus,
+  TimelineSelection,
 } from "./types/studio";
 import {
   clampCropPosition,
@@ -54,6 +55,7 @@ export default function App() {
   const [manifest, setManifest] = useState<ArtifactManifest | null>(null);
   const [sourceStatus, setSourceStatus] = useState<SourceStatus | null>(null);
   const [selectedSegId, setSelectedSegId] = useState<string | null>(null);
+  const [selection, setSelection] = useState<TimelineSelection>(null);
 
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -641,24 +643,6 @@ export default function App() {
     );
   };
 
-  const handleReorderSegment = (index: number, dir: -1 | 1) => {
-    if (!project) return;
-    const target = index + dir;
-    if (target < 0 || target >= project.segments.length) return;
-    const movedId = project.segments[index]?.id;
-    handleUpdateProject((prev) => {
-      const next = [...prev.segments];
-      [next[index], next[target]] = [next[target], next[index]];
-      return { ...prev, segments: next };
-    });
-    usageLogger.logActionOutput(
-      "Reorder segment",
-      "segment.reorder",
-      { from_index: index, to_index: target },
-      { projectId: project.project_id, segId: movedId }
-    );
-  };
-
   const handleDuplicateSegment = (index: number) => {
     if (!project) return;
     const orig = project.segments[index];
@@ -1132,38 +1116,58 @@ export default function App() {
               onSetPreviewModalOpen={setPreviewModalOpen}
             />
 
-            <ScriptPanel
+            <ContextualInspector
               project={project}
               manifest={manifest}
               selectedSegment={selectedSegment}
+              selection={
+                selection ??
+                (selectedSegment
+                  ? { type: "video", segId: selectedSegment.id }
+                  : null)
+              }
               voices={capabilities?.voices ?? []}
               ttsError={ttsError}
               lastSynthesizedSignatures={lastSynthesizedSignatures}
               onUpdateProject={handleUpdateProject}
               onUpdateSegment={handleUpdateSegment}
+              onDuplicateSegment={(segId) => {
+                const idx = project.segments.findIndex((s) => s.id === segId);
+                if (idx >= 0) handleDuplicateSegment(idx);
+              }}
+              onDeleteSegment={(segId) => {
+                const idx = project.segments.findIndex((s) => s.id === segId);
+                if (idx >= 0) handleDeleteSegment(idx);
+              }}
+              onSelectItem={setSelection}
             />
           </div>
 
-          {/* Lower Storyboard Timeline */}
+          {/* Lower Unified Multi-Track Timeline */}
           <Timeline
             segments={project.segments}
             manifest={manifest}
             selectedSegId={selectedSegId}
+            selection={
+              selection ??
+              (selectedSegment
+                ? { type: "video", segId: selectedSegment.id }
+                : null)
+            }
             tailPaddingSec={project.output_settings.tail_padding_sec}
             sourceTime={sourceTime}
             isModalOpen={isModalOpen}
             isProjectPlaying={isProjectPlaying}
             onSelectSegment={(segId) => {
               setSelectedSegId(segId);
+              setSelection({ type: "video", segId });
               const seg = project.segments.find((s) => s.id === segId);
               if (seg) setSourceTime(seg.video_in);
             }}
+            onSelectItem={setSelection}
             onSourceTimeChange={(t) => setSourceTime(t)}
             onAddSegment={handleAddSegment}
             onUpdateSegment={handleUpdateSegment}
-            onReorderSegment={handleReorderSegment}
-            onDuplicateSegment={handleDuplicateSegment}
-            onDeleteSegment={handleDeleteSegment}
             onToggleProjectPlayback={() => {
               if (isProjectPlaying) {
                 setIsProjectPlaying(false);
