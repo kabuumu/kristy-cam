@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import type { ArtifactManifest, SegmentInput } from "../types/studio";
 import { computeDurationPlan, formatTimecode } from "../utils/studioMath";
+import { usageLogger } from "../utils/usageLogger";
 
 interface TimelineProps {
   segments: SegmentInput[];
@@ -116,15 +117,33 @@ export function Timeline({
 
       if (e.key === "i" || e.key === "I") {
         e.preventDefault();
-        const clampedIn = Math.max(0, Math.min(sourceTime, sourceDur - 0.1));
-        setMarkIn(Number(clampedIn.toFixed(2)));
-        if (markOut <= clampedIn) {
-          setMarkOut(Number(Math.min(sourceDur, clampedIn + 2.0).toFixed(2)));
+        const clampedIn = Number(
+          Math.max(0, Math.min(sourceTime, sourceDur - 0.1)).toFixed(2)
+        );
+        const nextOut =
+          markOut <= clampedIn
+            ? Number(Math.min(sourceDur, clampedIn + 2.0).toFixed(2))
+            : markOut;
+        setMarkIn(clampedIn);
+        if (nextOut !== markOut) {
+          setMarkOut(nextOut);
         }
+        usageLogger.logActionOutput(
+          "Mark segment In-point via keyboard",
+          "timeline.mark_in",
+          { mark_in: clampedIn, mark_out: nextOut, via: "key_i" }
+        );
       } else if (e.key === "o" || e.key === "O") {
         e.preventDefault();
-        const clampedOut = Math.max(markIn + 0.1, Math.min(sourceTime, sourceDur));
-        setMarkOut(Number(clampedOut.toFixed(2)));
+        const clampedOut = Number(
+          Math.max(markIn + 0.1, Math.min(sourceTime, sourceDur)).toFixed(2)
+        );
+        setMarkOut(clampedOut);
+        usageLogger.logActionOutput(
+          "Mark segment Out-point via keyboard",
+          "timeline.mark_out",
+          { mark_in: markIn, mark_out: clampedOut, via: "key_o" }
+        );
       }
     };
 
@@ -133,16 +152,34 @@ export function Timeline({
   }, [isModalOpen, sourceTime, sourceDur, markIn, markOut]);
 
   const handleSetIn = () => {
-    const clampedIn = Math.max(0, Math.min(sourceTime, sourceDur - 0.1));
-    setMarkIn(Number(clampedIn.toFixed(2)));
-    if (markOut <= clampedIn) {
-      setMarkOut(Number(Math.min(sourceDur, clampedIn + 2.0).toFixed(2)));
+    const clampedIn = Number(
+      Math.max(0, Math.min(sourceTime, sourceDur - 0.1)).toFixed(2)
+    );
+    const nextOut =
+      markOut <= clampedIn
+        ? Number(Math.min(sourceDur, clampedIn + 2.0).toFixed(2))
+        : markOut;
+    setMarkIn(clampedIn);
+    if (nextOut !== markOut) {
+      setMarkOut(nextOut);
     }
+    usageLogger.logActionOutput(
+      "Mark segment In-point",
+      "timeline.mark_in",
+      { mark_in: clampedIn, mark_out: nextOut, via: "button" }
+    );
   };
 
   const handleSetOut = () => {
-    const clampedOut = Math.max(markIn + 0.1, Math.min(sourceTime, sourceDur));
-    setMarkOut(Number(clampedOut.toFixed(2)));
+    const clampedOut = Number(
+      Math.max(markIn + 0.1, Math.min(sourceTime, sourceDur)).toFixed(2)
+    );
+    setMarkOut(clampedOut);
+    usageLogger.logActionOutput(
+      "Mark segment Out-point",
+      "timeline.mark_out",
+      { mark_in: markIn, mark_out: clampedOut, via: "button" }
+    );
   };
 
   const handleAdd = () => {

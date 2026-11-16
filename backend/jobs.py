@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -15,6 +16,7 @@ from typing import Any
 from backend.bootstrap import get_data_dir
 from backend.schemas import JobState, JobType, utc_now_iso
 from backend.storage import atomic_write_json
+from backend.usage_log import get_usage_logger
 
 
 class JobCancelledError(RuntimeError):
@@ -77,6 +79,7 @@ class JobManager:
         self.data_dir = data_dir if data_dir is not None else get_data_dir()
         self.jobs_dir = self.data_dir / "jobs"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self._usage_logger = get_usage_logger(self.data_dir)
 
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix="studio-job")
@@ -143,6 +146,16 @@ class JobManager:
             future = self._executor.submit(self._execute_job, job_id, worker_fn)
             self._futures[job_id] = future
 
+        self._usage_logger.log_event(
+            source="job",
+            category="job",
+            action="job.queued",
+            intention=f"Queue {job_type} job",
+            project_id=project_id,
+            seg_id=seg_id,
+            job_id=job_id,
+            input_data={"job_type": job_type},
+        )
         return job.model_copy(deep=True)
 
     def _execute_job(
@@ -150,6 +163,7 @@ class JobManager:
         job_id: str,
         worker_fn: Callable[[JobContext], dict[str, Any] | None],
     ) -> None:
+        t0 = time.perf_counter()
         with self._lock:
             job = self._jobs.get(job_id)
             cancel_event = self._cancel_events.get(job_id)
@@ -162,6 +176,16 @@ class JobManager:
                 self._jobs[job_id] = cancelled
                 self._persist_job(cancelled)
                 self._processes.pop(job_id, None)
+                self._usage_logger.log_event(
+                    source="job",
+                    category="action_output",
+                    action="job.cancelled",
+                    intention=f"Cancel {job.job_type} job before start",
+                    project_id=job.project_id,
+                    seg_id=job.seg_id,
+                    job_id=job_id,
+                    output_data={"status": "cancelled"},
+                )
                 return
 
             running = job.model_copy(
@@ -177,8 +201,19 @@ class JobManager:
                 cancel_event=cancel_event,
             )
 
+        self._usage_logger.log_event(
+            source="job",
+            category="job",
+            action="job.started",
+            intention=f"Run {job.job_type} job",
+            project_id=job.project_id,
+            seg_id=job.seg_id,
+            job_id=job_id,
+        )
+
         try:
             result = worker_fn(ctx)
+            duration_ms = (time.perf_counter() - t0) * 1000.0
             with self._lock:
                 current = self._jobs[job_id]
                 if cancel_event.is_set() or current.status == "cancelled":
@@ -198,7 +233,19 @@ class JobManager:
                     )
                 self._jobs[job_id] = final_job
                 self._persist_job(final_job)
+            self._usage_logger.log_event(
+                source="job",
+                category="action_output",
+                action=f"job.{final_job.status}",
+                intention=f"Complete {job.job_type} job",
+                project_id=job.project_id,
+                seg_id=job.seg_id,
+                job_id=job_id,
+                output_data={"status": final_job.status, "result": final_job.result},
+                duration_ms=duration_ms,
+            )
         except JobCancelledError:
+            duration_ms = (time.perf_counter() - t0) * 1000.0
             with self._lock:
                 current = self._jobs[job_id]
                 final_job = current.model_copy(
@@ -206,7 +253,19 @@ class JobManager:
                 )
                 self._jobs[job_id] = final_job
                 self._persist_job(final_job)
+            self._usage_logger.log_event(
+                source="job",
+                category="action_output",
+                action="job.cancelled",
+                intention=f"Cancel {job.job_type} job",
+                project_id=job.project_id,
+                seg_id=job.seg_id,
+                job_id=job_id,
+                output_data={"status": "cancelled", "stage": current.stage, "progress": current.progress},
+                duration_ms=duration_ms,
+            )
         except Exception as exc:
+            duration_ms = (time.perf_counter() - t0) * 1000.0
             with self._lock:
                 current = self._jobs[job_id]
                 if cancel_event.is_set() or current.status == "cancelled":
@@ -224,6 +283,34 @@ class JobManager:
                     )
                 self._jobs[job_id] = final_job
                 self._persist_job(final_job)
+            if final_job.status == "failed":
+                self._usage_logger.log_error(
+                    source="job",
+                    action="job.failed",
+                    intention=f"Execute {job.job_type} job",
+                    project_id=job.project_id,
+                    seg_id=job.seg_id,
+                    job_id=job_id,
+                    context={
+                        "job_type": job.job_type,
+                        "last_stage": current.stage,
+                        "last_progress": current.progress,
+                    },
+                    exc=exc,
+                    duration_ms=duration_ms,
+                )
+            else:
+                self._usage_logger.log_event(
+                    source="job",
+                    category="action_output",
+                    action="job.cancelled",
+                    intention=f"Cancel {job.job_type} job",
+                    project_id=job.project_id,
+                    seg_id=job.seg_id,
+                    job_id=job_id,
+                    output_data={"status": "cancelled"},
+                    duration_ms=duration_ms,
+                )
         finally:
             with self._lock:
                 self._processes.pop(job_id, None)

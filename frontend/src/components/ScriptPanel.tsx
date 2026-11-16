@@ -26,6 +26,7 @@ import {
   computeClientTtsSignature,
   resolveClauseSpokenText,
 } from "../utils/studioMath";
+import { usageLogger } from "../utils/usageLogger";
 
 interface ScriptPanelProps {
   project: ProjectInput;
@@ -102,6 +103,12 @@ export function ScriptPanel({
         { id, display_text: "", spoken_text_override: null },
       ],
     });
+    usageLogger.logActionOutput(
+      "Add caption clause",
+      "clause.add",
+      { clause_id: id, clause_count: selectedSegment.clauses.length + 1 },
+      { segId: selectedSegment.id }
+    );
   };
 
   const handleUpdateClause = (
@@ -117,10 +124,20 @@ export function ScriptPanel({
 
   const handleDeleteClause = (idx: number) => {
     if (!selectedSegment) return;
+    const removed = selectedSegment.clauses[idx];
     onUpdateSegment({
       ...selectedSegment,
       clauses: selectedSegment.clauses.filter((_, i) => i !== idx),
     });
+    usageLogger.logActionOutput(
+      "Delete caption clause",
+      "clause.delete",
+      {
+        clause_id: removed?.id,
+        remaining_count: selectedSegment.clauses.length - 1,
+      },
+      { segId: selectedSegment.id }
+    );
   };
 
   const handleMoveClause = (idx: number, dir: -1 | 1) => {
@@ -130,6 +147,12 @@ export function ScriptPanel({
     const next = [...selectedSegment.clauses];
     [next[idx], next[target]] = [next[target], next[idx]];
     onUpdateSegment({ ...selectedSegment, clauses: next });
+    usageLogger.logActionOutput(
+      "Reorder caption clause",
+      "clause.move",
+      { from_index: idx, to_index: target },
+      { segId: selectedSegment.id }
+    );
   };
 
   const handleSplitClause = (idx: number) => {
@@ -167,6 +190,12 @@ export function ScriptPanel({
       ...selectedSegment.clauses.slice(idx + 1),
     ];
     onUpdateSegment({ ...selectedSegment, clauses: next });
+    usageLogger.logActionOutput(
+      "Split caption clause",
+      "clause.split",
+      { source_clause_id: clause.id, new_count: newClauses.length },
+      { segId: selectedSegment.id }
+    );
   };
 
   const handleMergeWithNext = (idx: number) => {
@@ -184,6 +213,12 @@ export function ScriptPanel({
       ...selectedSegment.clauses.slice(idx + 2),
     ];
     onUpdateSegment({ ...selectedSegment, clauses: next });
+    usageLogger.logActionOutput(
+      "Merge caption clauses",
+      "clause.merge",
+      { kept_clause_id: curr.id, merged_clause_id: nextClause.id },
+      { segId: selectedSegment.id }
+    );
   };
 
   const handleAddPronunciation = () => {
@@ -196,6 +231,11 @@ export function ScriptPanel({
     }));
     setNewPronKey("");
     setNewPronVal("");
+    usageLogger.logActionOutput(
+      "Add pronunciation override",
+      "pronunciation.add",
+      { term: k, spoken_as: v }
+    );
   };
 
   const handleDeletePronunciation = (key: string) => {
@@ -204,6 +244,11 @@ export function ScriptPanel({
       delete next[key];
       return { ...prev, pronunciations: next };
     });
+    usageLogger.logActionOutput(
+      "Delete pronunciation override",
+      "pronunciation.delete",
+      { term: key }
+    );
   };
 
   return (

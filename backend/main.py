@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -22,7 +23,9 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
+
+from backend.usage_log import UsageLogger, get_usage_logger
 
 from backend.bootstrap import REPO_ROOT, get_data_dir, is_offline_env, verify_ffmpeg, verify_font
 from backend.geometry import COORD_EPSILON, GeometryValidationError, compute_ideal_crop_size
@@ -110,6 +113,8 @@ def _ensure_state_initialized(target_app: FastAPI) -> None:
             jm = JobManager(data_dir=target_app.state.data_dir)
             jm.recover_on_startup()
             target_app.state.job_manager = jm
+        if not hasattr(target_app.state, "usage_logger") or target_app.state.usage_logger is None:
+            target_app.state.usage_logger = get_usage_logger(target_app.state.data_dir)
 
 
 def _get_data_dir(request: Request) -> Path:
@@ -120,6 +125,11 @@ def _get_data_dir(request: Request) -> Path:
 def _get_job_manager(request: Request) -> JobManager:
     _ensure_state_initialized(request.app)
     return request.app.state.job_manager
+
+
+def _get_usage_logger(request: Request) -> UsageLogger:
+    _ensure_state_initialized(request.app)
+    return request.app.state.usage_logger
 
 
 def _get_manifest_lock(target_app: FastAPI, project_id: str) -> threading.Lock:
@@ -136,15 +146,24 @@ def _get_manifest_lock(target_app: FastAPI, project_id: str) -> threading.Lock:
 async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
     """Initialize data dir, recover interrupted jobs, generate session token, and shut down cleanly."""
     data_dir = get_data_dir()
+    usage_logger = get_usage_logger(data_dir)
     job_manager = JobManager(data_dir=data_dir)
     job_manager.recover_on_startup()
 
     target_app.state.data_dir = data_dir
+    target_app.state.usage_logger = usage_logger
     target_app.state.job_manager = job_manager
     target_app.state.session_token = secrets.token_urlsafe(32)
     target_app.state.media_registry = {}
     target_app.state.manifest_locks_guard = threading.Lock()
     target_app.state.manifest_locks = {}
+    usage_logger.log_event(
+        source="backend",
+        category="intention",
+        action="server.started",
+        intention="Start Sims 4 Vertical Video Studio backend server",
+        output_data={"data_dir": str(data_dir), "app_version": APP_VERSION},
+    )
     try:
         yield
     finally:
@@ -156,14 +175,73 @@ app.state.session_token = secrets.token_urlsafe(32)
 app.state.media_registry = {}
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_logging_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Log HTTPException details to usage/debug logs before returning standard JSON error."""
+    try:
+        usage_logger = _get_usage_logger(request)
+        usage_logger.log_error(
+            source="backend",
+            action="api.http_error",
+            intention=f"{request.method} {request.url.path}",
+            target=f"{request.method} {request.url.path}",
+            status_code=exc.status_code,
+            message=str(exc.detail),
+            error_type="HTTPException",
+            detail=exc.detail,
+            context={
+                "method": request.method,
+                "path": request.url.path,
+                "query": str(request.url.query) if request.url.query else None,
+            },
+        )
+    except Exception:
+        pass
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_logging_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Log unhandled exceptions with full traceback to usage/debug logs."""
+    try:
+        usage_logger = _get_usage_logger(request)
+        usage_logger.log_error(
+            source="backend",
+            action="api.unhandled_error",
+            intention=f"{request.method} {request.url.path}",
+            target=f"{request.method} {request.url.path}",
+            status_code=500,
+            context={
+                "method": request.method,
+                "path": request.url.path,
+                "query": str(request.url.query) if request.url.query else None,
+            },
+            exc=exc,
+        )
+    except Exception:
+        pass
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
 @app.middleware("http")
 async def loopback_security_middleware(request: Request, call_next: Any) -> Response:
     """Enforce loopback Host/Origin checks and X-Session-Token on mutating endpoints."""
     _ensure_state_initialized(request.app)
+    usage_logger: UsageLogger = request.app.state.usage_logger
 
     host_header = request.headers.get("host", "")
     hostname = _extract_hostname(host_header)
     if hostname not in ALLOWED_HOSTS:
+        usage_logger.log_error(
+            source="backend",
+            action="security.forbidden_host",
+            intention="Validate loopback Host header",
+            target=f"{request.method} {request.url.path}",
+            status_code=403,
+            message="Forbidden Host header",
+            error_type="SecurityRejection",
+            context={"host": host_header},
+        )
         return JSONResponse(status_code=403, content={"detail": "Forbidden Host header"})
 
     origin_header = request.headers.get("origin")
@@ -172,17 +250,61 @@ async def loopback_security_middleware(request: Request, call_next: Any) -> Resp
         origin_host = (parsed.hostname or "").lower()
         origin_scheme = (parsed.scheme or "").lower()
         if origin_host not in ALLOWED_ORIGINS or (origin_scheme and origin_scheme not in {"http", "https"}):
+            usage_logger.log_error(
+                source="backend",
+                action="security.forbidden_origin",
+                intention="Validate loopback Origin header",
+                target=f"{request.method} {request.url.path}",
+                status_code=403,
+                message="Forbidden Origin header",
+                error_type="SecurityRejection",
+                context={"origin": origin_header},
+            )
             return JSONResponse(status_code=403, content={"detail": "Forbidden Origin header"})
 
     if request.method.upper() in MUTATING_METHODS:
         provided_token = request.headers.get("x-session-token")
         expected_token: str = request.app.state.session_token
         if not provided_token:
+            usage_logger.log_error(
+                source="backend",
+                action="security.missing_token",
+                intention="Validate X-Session-Token header",
+                target=f"{request.method} {request.url.path}",
+                status_code=401,
+                message="Missing X-Session-Token header",
+                error_type="SecurityRejection",
+            )
             return JSONResponse(status_code=401, content={"detail": "Missing X-Session-Token header"})
         if not hmac.compare_digest(provided_token, expected_token):
+            usage_logger.log_error(
+                source="backend",
+                action="security.invalid_token",
+                intention="Validate X-Session-Token header",
+                target=f"{request.method} {request.url.path}",
+                status_code=403,
+                message="Invalid X-Session-Token header",
+                error_type="SecurityRejection",
+            )
             return JSONResponse(status_code=403, content={"detail": "Invalid X-Session-Token header"})
 
-    return await call_next(request)
+    t0 = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - t0) * 1000.0
+        usage_logger.log_error(
+            source="backend",
+            action="api.unhandled_error",
+            intention=f"{request.method} {request.url.path}",
+            target=f"{request.method} {request.url.path}",
+            status_code=500,
+            context={"method": request.method, "path": request.url.path},
+            exc=exc,
+            duration_ms=duration_ms,
+        )
+        raise
+    return response
 
 
 def _validate_manual_media_path(raw_path: Any) -> Path:
@@ -477,6 +599,20 @@ async def api_media_select(request: Request) -> dict[str, Any]:
         "metadata": meta_dict,
     }
     request.app.state.media_registry[media_id] = entry
+    _get_usage_logger(request).log_event(
+        source="backend",
+        category="action_output",
+        action="media.select",
+        intention="Select and validate source gameplay media",
+        output_data={
+            "media_id": media_id,
+            "path": str(resolved_path),
+            "width": metadata.width,
+            "height": metadata.height,
+            "fps": metadata.fps,
+            "duration": metadata.duration,
+        },
+    )
     return entry
 
 
@@ -630,6 +766,15 @@ async def api_create_project(request: Request) -> JSONResponse:
         return {"artifact_id": "art_proxy", "path": "artifacts/proxy.mp4"}
 
     job = job_manager.submit_job(project_id, "proxy", _proxy_worker)
+    _get_usage_logger(request).log_event(
+        source="backend",
+        category="action_output",
+        action="project.create",
+        intention="Create new project",
+        project_id=project_id,
+        job_id=job.job_id,
+        output_data={"project_id": project_id, "title": project.title, "job_id": job.job_id},
+    )
     return JSONResponse(
         status_code=202,
         content={
@@ -750,6 +895,18 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     manifest = load_manifest(project_id, data_dir=data_dir)
+    _get_usage_logger(request).log_event(
+        source="backend",
+        category="action_output",
+        action="project.save",
+        intention="Save project changes",
+        project_id=project_id,
+        output_data={
+            "revision": saved.revision,
+            "segment_count": len(saved.segments),
+            "output_resolution": f"{saved.output_settings.width}x{saved.output_settings.height}",
+        },
+    )
     return {
         "project": saved.model_dump(mode="json"),
         "manifest": manifest.model_dump(mode="json"),
@@ -823,6 +980,18 @@ async def api_relink_source(project_id: str, request: Request) -> dict[str, Any]
         save_manifest(manifest, data_dir=data_dir)
 
     source_status = check_source_media(updated_project.source_media)
+    _get_usage_logger(request).log_event(
+        source="backend",
+        category="action_output",
+        action="source.relink",
+        intention="Relink source media",
+        project_id=project_id,
+        output_data={
+            "source_status": source_status.get("status"),
+            "path": updated_project.source_media.path,
+            "copied_to_project": updated_project.source_media.copied_to_project,
+        },
+    )
     return {
         "project": updated_project.model_dump(mode="json"),
         "manifest": manifest.model_dump(mode="json"),
@@ -1179,7 +1348,114 @@ async def api_put_pronunciations(request: Request) -> dict[str, dict[str, str]]:
 
     cleaned = {str(k): str(v) for k, v in raw_prons.items() if str(k).strip()}
     saved = save_global_pronunciations(cleaned, data_dir=data_dir)
+    _get_usage_logger(request).log_event(
+        source="backend",
+        category="action_output",
+        action="pronunciations.save",
+        intention="Save global pronunciation overrides",
+        output_data={"count": len(saved)},
+    )
     return {"pronunciations": saved}
+
+
+# --- Usage & Debug Logging Endpoints ---
+
+
+class ClientLogEvent(BaseModel):
+    ts: str | None = None
+    category: str = Field(default="intention", max_length=64)
+    action: str = Field(min_length=1, max_length=128)
+    intention: str | None = Field(default=None, max_length=500)
+    target: str | None = Field(default=None, max_length=500)
+    project_id: str | None = Field(default=None, max_length=128)
+    seg_id: str | None = Field(default=None, max_length=128)
+    job_id: str | None = Field(default=None, max_length=128)
+    input: Any = None
+    output: Any = None
+    error: dict[str, Any] | None = None
+    duration_ms: float | None = None
+
+
+class ClientLogBatch(BaseModel):
+    events: list[ClientLogEvent] = Field(default_factory=list, max_length=100)
+
+
+@app.post("/api/logs/events")
+async def api_ingest_log_events(request: Request) -> dict[str, int]:
+    """Ingest structured frontend usage events (intentions, clicks, keypresses, outputs, errors)."""
+    usage_logger = _get_usage_logger(request)
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}") from exc
+
+    if isinstance(payload, dict) and "events" in payload:
+        try:
+            batch = ClientLogBatch.model_validate(payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        events = batch.events
+    elif isinstance(payload, dict):
+        try:
+            events = [ClientLogEvent.model_validate(payload)]
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    else:
+        raise HTTPException(status_code=422, detail="Log payload must be a JSON object")
+
+    for ev in events:
+        if ev.category == "error" or ev.error is not None:
+            err = ev.error or {}
+            usage_logger.log_error(
+                source="frontend",
+                action=ev.action,
+                intention=ev.intention,
+                target=ev.target,
+                project_id=ev.project_id,
+                seg_id=ev.seg_id,
+                job_id=ev.job_id,
+                input_data=ev.input,
+                message=str(err.get("message") or "Frontend error"),
+                error_type=str(err.get("type") or "FrontendError"),
+                status_code=err.get("status_code") if isinstance(err.get("status_code"), int) else None,
+                detail=err.get("detail"),
+                context=err.get("context") if isinstance(err.get("context"), dict) else None,
+                duration_ms=ev.duration_ms,
+            )
+        else:
+            usage_logger.log_event(
+                source="frontend",
+                category=ev.category,
+                action=ev.action,
+                intention=ev.intention,
+                target=ev.target,
+                project_id=ev.project_id,
+                seg_id=ev.seg_id,
+                job_id=ev.job_id,
+                input_data=ev.input,
+                output_data=ev.output,
+                duration_ms=ev.duration_ms,
+                ts=ev.ts,
+            )
+    return {"accepted": len(events)}
+
+
+@app.get("/api/logs")
+def api_get_logs(
+    request: Request,
+    limit: int = 200,
+    category: str | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Return recent structured usage & error log entries from usage.jsonl."""
+    usage_logger = _get_usage_logger(request)
+    events = usage_logger.read_recent(limit=limit, category=category or None, project_id=project_id or None)
+    return {
+        "events": events,
+        "count": len(events),
+        "usage_log_path": str(usage_logger.usage_log_path),
+        "debug_log_path": str(usage_logger.debug_log_path),
+    }
 
 
 # --- Static Frontend Serving (F38) ---

@@ -1,3 +1,4 @@
+import { usageLogger, type UsageLogEvent } from "../utils/usageLogger";
 import type {
   Capabilities,
   JobAccepted,
@@ -35,6 +36,8 @@ async function request<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
+  const method = (options.method ?? "GET").toUpperCase();
+  const startedAt = performance.now();
   const headers = new Headers(options.headers);
   const token = getSessionToken();
   if (token) {
@@ -48,11 +51,29 @@ async function request<T>(
     headers.set("Content-Type", "application/json");
   }
 
-  const response = await fetch(path, {
-    ...options,
-    headers,
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      headers,
+    });
+  } catch (err) {
+    const durationMs = performance.now() - startedAt;
+    if (!path.startsWith("/api/logs/events")) {
+      usageLogger.logError(
+        `API network failure: ${method} ${path}`,
+        "api.network_error",
+        err,
+        {
+          target: `${method} ${path}`,
+          durationMs,
+        }
+      );
+    }
+    throw err;
+  }
 
+  const durationMs = performance.now() - startedAt;
   const contentType = response.headers.get("content-type") ?? "";
   let payload: unknown = null;
   if (contentType.includes("application/json")) {
@@ -73,7 +94,21 @@ async function request<T>(
     } else if (typeof payload === "string" && payload.trim()) {
       detail = payload;
     }
-    throw new ApiError(response.status, detail, payload);
+    const apiErr = new ApiError(response.status, detail, payload);
+    if (!path.startsWith("/api/logs/events")) {
+      usageLogger.logError(
+        `API error ${response.status}: ${method} ${path}`,
+        "api.error",
+        apiErr,
+        {
+          target: `${method} ${path}`,
+          statusCode: response.status,
+          durationMs,
+          context: { detail },
+        }
+      );
+    }
+    throw apiErr;
   }
 
   return payload as T;
@@ -251,5 +286,23 @@ export const apiClient = {
       method: "PUT",
       body: JSON.stringify({ pronunciations }),
     });
+  },
+
+  getLogs(options?: {
+    limit?: number;
+    category?: string;
+    projectId?: string;
+  }): Promise<{
+    events: UsageLogEvent[];
+    count: number;
+    usage_log_path: string;
+    debug_log_path: string;
+  }> {
+    const params = new URLSearchParams();
+    if (options?.limit) params.set("limit", String(options.limit));
+    if (options?.category) params.set("category", options.category);
+    if (options?.projectId) params.set("project_id", options.projectId);
+    const qs = params.toString();
+    return request(`/api/logs${qs ? `?${qs}` : ""}`, { method: "GET" });
   },
 };

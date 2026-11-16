@@ -8,10 +8,12 @@ import {
   Loader2,
   RefreshCw,
   Save,
+  ScrollText,
   Upload,
   X,
 } from "lucide-react";
 import { ApiError, apiClient } from "./api/client";
+import { ActivityLogModal } from "./components/ActivityLogModal";
 import { CropCanvas } from "./components/CropCanvas";
 import { JobStatusBar } from "./components/JobStatusBar";
 import { ScriptPanel } from "./components/ScriptPanel";
@@ -35,6 +37,7 @@ import {
   computeIdealCrop,
   formatAspectRatio,
 } from "./utils/studioMath";
+import { usageLogger } from "./utils/usageLogger";
 
 const OUTPUT_ASPECT_PRESETS = [
   { label: "9:16 (1080×1920)", width: 1080, height: 1920 },
@@ -88,10 +91,20 @@ export default function App() {
 
   const [previewModalOpen, setPreviewModalOpen] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [logModalOpen, setLogModalOpen] = useState(false);
   const [customResolutionMode, setCustomResolutionMode] = useState(false);
 
   const projectRef = useRef<ProjectInput | null>(null);
   projectRef.current = project;
+  const selectedSegIdRef = useRef<string | null>(null);
+  selectedSegIdRef.current = selectedSegId;
+
+  useEffect(() => {
+    usageLogger.init(() => ({
+      projectId: projectRef.current?.project_id ?? null,
+      segId: selectedSegIdRef.current ?? null,
+    }));
+  }, []);
 
   const applyBundle = useCallback((bundle: ProjectBundle) => {
     setProject(bundle.project);
@@ -130,6 +143,9 @@ export default function App() {
 
   const loadProject = useCallback(
     async (projectId: string) => {
+      usageLogger.logIntention("Load project", "project.load", {
+        projectId,
+      });
       try {
         setBannerError(null);
         const bundle = await apiClient.getProject(projectId);
@@ -137,10 +153,23 @@ export default function App() {
         const url = new URL(window.location.href);
         url.searchParams.set("project", projectId);
         window.history.replaceState({}, "", url.toString());
-      } catch (err) {
-        setBannerError(
-          err instanceof Error ? err.message : "Failed to load project"
+        usageLogger.logActionOutput(
+          "Load project",
+          "project.load",
+          {
+            title: bundle.project.title,
+            revision: bundle.project.revision,
+            segment_count: bundle.project.segments.length,
+            source_status: bundle.source_status?.status ?? "unknown",
+          },
+          { projectId }
         );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Failed to load project";
+        usageLogger.logError("Load project", "project.load_failed", err, {
+          projectId,
+        });
+        setBannerError(msg);
       }
     },
     [applyBundle]
@@ -254,8 +283,47 @@ export default function App() {
             } else if (updated.job_type === "export") {
               setExportModalOpen(true);
             }
-          } else if (updated.job_type === "tts" && updated.error) {
-            setTtsError(updated.error);
+            usageLogger.logActionOutput(
+              `Job ${updated.job_type} succeeded`,
+              `job.${updated.job_type}.succeeded`,
+              updated.result ?? { status: "succeeded" },
+              {
+                projectId: updated.project_id,
+                segId: updated.seg_id,
+                jobId: updated.job_id,
+              }
+            );
+          } else {
+            if (updated.job_type === "tts" && updated.error) {
+              setTtsError(updated.error);
+            }
+            if (updated.status === "failed" || updated.status === "interrupted") {
+              usageLogger.logError(
+                `Job ${updated.job_type} ${updated.status}`,
+                `job.${updated.job_type}.${updated.status}`,
+                updated.error || `Job ${updated.status}`,
+                {
+                  projectId: updated.project_id,
+                  segId: updated.seg_id,
+                  jobId: updated.job_id,
+                  context: {
+                    stage: updated.stage,
+                    progress: updated.progress,
+                  },
+                }
+              );
+            } else {
+              usageLogger.logActionOutput(
+                `Job ${updated.job_type} ${updated.status}`,
+                `job.${updated.job_type}.${updated.status}`,
+                { status: updated.status, stage: updated.stage },
+                {
+                  projectId: updated.project_id,
+                  segId: updated.seg_id,
+                  jobId: updated.job_id,
+                }
+              );
+            }
           }
         }
       } catch {
@@ -340,6 +408,13 @@ export default function App() {
 
   const handleSave = async (): Promise<ProjectInput | null> => {
     if (!project) return null;
+    usageLogger.logIntention("Save project", "project.save", {
+      projectId: project.project_id,
+      input: {
+        expected_revision: project.revision,
+        segment_count: project.segments.length,
+      },
+    });
     setSaving(true);
     setBannerError(null);
     setRevisionConflict(false);
@@ -351,6 +426,15 @@ export default function App() {
       );
       applyBundle(bundle);
       await refreshProjectList();
+      usageLogger.logActionOutput(
+        "Save project",
+        "project.save",
+        {
+          revision: bundle.project.revision,
+          segment_count: bundle.project.segments.length,
+        },
+        { projectId: bundle.project.project_id }
+      );
       return bundle.project;
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
@@ -363,6 +447,10 @@ export default function App() {
           err instanceof Error ? err.message : "Failed to save project"
         );
       }
+      usageLogger.logError("Save project", "project.save_failed", err, {
+        projectId: project.project_id,
+        context: { expected_revision: project.revision },
+      });
       return null;
     } finally {
       setSaving(false);
@@ -376,6 +464,9 @@ export default function App() {
   };
 
   const handleRenderPreview = async (segId: string) => {
+    usageLogger.logIntention("Render segment preview", "preview.render", {
+      segId,
+    });
     if (project && !dirty && manifest?.segments[segId]?.preview_artifact_id) {
       const seg = project.segments.find((s) => s.id === segId);
       if (
@@ -384,6 +475,12 @@ export default function App() {
           computeClientPreviewSignature(seg, project)
       ) {
         setPreviewModalOpen(true);
+        usageLogger.logActionOutput(
+          "Open cached segment preview",
+          "preview.cached",
+          { seg_id: segId, artifact_id: manifest.segments[segId]?.preview_artifact_id },
+          { projectId: project.project_id, segId }
+        );
         return;
       }
     }
@@ -393,35 +490,67 @@ export default function App() {
       const res = await apiClient.renderPreview(saved.project_id, segId);
       const job = await apiClient.getJob(res.job_id);
       setActiveJob(job);
+      usageLogger.logActionOutput(
+        "Queue segment preview job",
+        "preview.queued",
+        { job_id: job.job_id, status: job.status },
+        { projectId: saved.project_id, segId, jobId: job.job_id }
+      );
     } catch (err) {
       setBannerError(
         err instanceof Error ? err.message : "Failed to start preview"
       );
+      usageLogger.logError("Render segment preview", "preview.start_failed", err, {
+        projectId: saved.project_id,
+        segId,
+      });
     }
   };
 
   const handleExport = async () => {
+    usageLogger.logIntention("Export final vertical MP4", "export.render");
     const saved = await ensureSavedBeforeJob();
     if (!saved) return;
     try {
       const res = await apiClient.exportProject(saved.project_id);
       const job = await apiClient.getJob(res.job_id);
       setActiveJob(job);
+      usageLogger.logActionOutput(
+        "Queue final export job",
+        "export.queued",
+        { job_id: job.job_id, status: job.status },
+        { projectId: saved.project_id, jobId: job.job_id }
+      );
     } catch (err) {
       setBannerError(
         err instanceof Error ? err.message : "Failed to start export"
       );
+      usageLogger.logError("Export final vertical MP4", "export.start_failed", err, {
+        projectId: saved.project_id,
+      });
     }
   };
 
   const handleCancelJob = async (jobId: string) => {
+    usageLogger.logIntention("Cancel active background job", "job.cancel", {
+      jobId,
+    });
     try {
       const job = await apiClient.cancelJob(jobId);
       setActiveJob(job);
+      usageLogger.logActionOutput(
+        "Cancel background job",
+        "job.cancel",
+        { job_id: job.job_id, status: job.status },
+        { jobId: job.job_id }
+      );
     } catch (err) {
       setBannerError(
         err instanceof Error ? err.message : "Failed to cancel job"
       );
+      usageLogger.logError("Cancel background job", "job.cancel_failed", err, {
+        jobId,
+      });
     }
   };
 
@@ -462,6 +591,12 @@ export default function App() {
         }),
       })),
     }));
+    usageLogger.logActionOutput(
+      "Change output resolution",
+      "project.resolution_change",
+      { width: nextW, height: nextH },
+      { projectId: project.project_id }
+    );
   };
 
   // Segment CRUD
@@ -498,17 +633,30 @@ export default function App() {
     }));
     setSelectedSegId(id);
     setSourceTime(videoIn);
+    usageLogger.logActionOutput(
+      "Add segment to timeline",
+      "segment.add",
+      { seg_id: id, video_in: videoIn, video_out: videoOut },
+      { projectId: project.project_id, segId: id }
+    );
   };
 
   const handleReorderSegment = (index: number, dir: -1 | 1) => {
     if (!project) return;
     const target = index + dir;
     if (target < 0 || target >= project.segments.length) return;
+    const movedId = project.segments[index]?.id;
     handleUpdateProject((prev) => {
       const next = [...prev.segments];
       [next[index], next[target]] = [next[target], next[index]];
       return { ...prev, segments: next };
     });
+    usageLogger.logActionOutput(
+      "Reorder segment",
+      "segment.reorder",
+      { from_index: index, to_index: target },
+      { projectId: project.project_id, segId: movedId }
+    );
   };
 
   const handleDuplicateSegment = (index: number) => {
@@ -530,6 +678,12 @@ export default function App() {
       return { ...prev, segments: next };
     });
     setSelectedSegId(newId);
+    usageLogger.logActionOutput(
+      "Duplicate segment",
+      "segment.duplicate",
+      { source_seg_id: orig.id, new_seg_id: newId },
+      { projectId: project.project_id, segId: newId }
+    );
   };
 
   const handleDeleteSegment = (index: number) => {
@@ -540,10 +694,19 @@ export default function App() {
     if (selectedSegId === removed.id) {
       setSelectedSegId(next[Math.max(0, index - 1)]?.id ?? null);
     }
+    usageLogger.logActionOutput(
+      "Delete segment",
+      "segment.delete",
+      { deleted_seg_id: removed.id, remaining_count: next.length },
+      { projectId: project.project_id, segId: removed.id }
+    );
   };
 
   // New Project Media Upload
   const handleUploadMedia = async (file: File) => {
+    usageLogger.logIntention("Upload gameplay media", "media.upload", {
+      input: { name: file.name, size: file.size, type: file.type },
+    });
     setMediaSelectBusy(true);
     setNewProjectError(null);
     setSelectedMedia(null);
@@ -560,10 +723,24 @@ export default function App() {
           "New Sims Project";
         setNewTitle(base);
       }
+      usageLogger.logActionOutput(
+        "Upload and validate gameplay media",
+        "media.upload",
+        {
+          media_id: res.media_id,
+          width: res.metadata.width,
+          height: res.metadata.height,
+          fps: res.metadata.fps,
+          duration: res.metadata.duration,
+        }
+      );
     } catch (err) {
       setNewProjectError(
         err instanceof Error ? err.message : "Media upload failed"
       );
+      usageLogger.logError("Upload gameplay media", "media.upload_failed", err, {
+        input: { name: file.name, size: file.size },
+      });
     } finally {
       setMediaSelectBusy(false);
     }
@@ -571,12 +748,16 @@ export default function App() {
 
   const handleCreateProject = async () => {
     if (!selectedMedia) return;
+    const title = newTitle.trim() || "Untitled Sims Short";
+    usageLogger.logIntention("Create new project", "project.create", {
+      input: { title, media_id: selectedMedia.media_id, copy_to_project: copyToProject },
+    });
     setCreateBusy(true);
     setNewProjectError(null);
     try {
       const res = await apiClient.createProject({
         media_id: selectedMedia.media_id,
-        title: newTitle.trim() || "Untitled Sims Short",
+        title,
         copy_to_project: copyToProject,
       });
       const pid = res.project_id || res.project?.project_id;
@@ -584,6 +765,12 @@ export default function App() {
         const job = await apiClient.getJob(res.job_id);
         setActiveJob(job);
       }
+      usageLogger.logActionOutput(
+        "Create new project",
+        "project.create",
+        { project_id: pid, title, job_id: res.job_id },
+        { projectId: pid ?? null, jobId: res.job_id ?? null }
+      );
       setNewProjectOpen(false);
       setSelectedMedia(null);
       setNewProjectError(null);
@@ -596,6 +783,9 @@ export default function App() {
       setNewProjectError(
         err instanceof Error ? err.message : "Failed to create project"
       );
+      usageLogger.logError("Create new project", "project.create_failed", err, {
+        input: { title },
+      });
     } finally {
       setCreateBusy(false);
     }
@@ -603,6 +793,10 @@ export default function App() {
 
   const handleRelink = async (mode: "native" | "path" | "file") => {
     if (!project) return;
+    usageLogger.logIntention("Relink missing source media", "source.relink", {
+      projectId: project.project_id,
+      input: { mode },
+    });
     setRelinkBusy(true);
     setBannerError(null);
     try {
@@ -615,6 +809,16 @@ export default function App() {
         const job = await apiClient.getJob(res.job_id);
         setActiveJob(job);
       }
+      usageLogger.logActionOutput(
+        "Relink source media",
+        "source.relink",
+        {
+          status: res.source_status?.status,
+          path: res.project.source_media.path,
+          job_id: res.job_id,
+        },
+        { projectId: project.project_id, jobId: res.job_id ?? null }
+      );
       setRelinkOpen(false);
       setRelinkPath("");
       setRelinkFile(null);
@@ -622,6 +826,10 @@ export default function App() {
       setBannerError(
         err instanceof Error ? err.message : "Source relink failed"
       );
+      usageLogger.logError("Relink source media", "source.relink_failed", err, {
+        projectId: project.project_id,
+        input: { mode },
+      });
     } finally {
       setRelinkBusy(false);
     }
@@ -630,7 +838,11 @@ export default function App() {
   const isJobBusy =
     activeJob?.status === "queued" || activeJob?.status === "running";
   const isModalOpen =
-    newProjectOpen || relinkOpen || previewModalOpen || exportModalOpen;
+    newProjectOpen ||
+    relinkOpen ||
+    previewModalOpen ||
+    exportModalOpen ||
+    logModalOpen;
   const sourceBroken =
     sourceStatus &&
     (sourceStatus.status === "missing" || sourceStatus.status === "modified");
@@ -672,6 +884,16 @@ export default function App() {
           >
             <FolderPlus className="h-3.5 w-3.5 text-emerald-400" />
             + New Project
+          </button>
+
+          <button
+            type="button"
+            data-log-intent="Open Usage & Debug Log"
+            onClick={() => setLogModalOpen(true)}
+            className="inline-flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-200 hover:bg-zinc-700"
+          >
+            <ScrollText className="h-3.5 w-3.5 text-sky-400" />
+            Logs
           </button>
         </div>
 
@@ -1212,6 +1434,12 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <ActivityLogModal
+        open={logModalOpen}
+        projectId={project?.project_id ?? null}
+        onClose={() => setLogModalOpen(false)}
+      />
     </div>
   );
 }
