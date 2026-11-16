@@ -58,14 +58,14 @@ export default function App() {
   // Modals
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newTitle, setNewTitle] = useState("");
-  const [manualMediaPath, setManualMediaPath] = useState("");
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [copyToProject, setCopyToProject] = useState(false);
   const [selectedMedia, setSelectedMedia] = useState<MediaSelectResult | null>(
     null
   );
+  const [newProjectError, setNewProjectError] = useState<string | null>(null);
   const [mediaSelectBusy, setMediaSelectBusy] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
+  const newProjectFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [relinkOpen, setRelinkOpen] = useState(false);
   const [relinkPath, setRelinkPath] = useState("");
@@ -458,24 +458,27 @@ export default function App() {
     }
   };
 
-  // New Project Media Selection
-  const handleSelectMedia = async (mode: "native" | "path" | "file") => {
+  // New Project Media Upload
+  const handleUploadMedia = async (file: File) => {
     setMediaSelectBusy(true);
-    setBannerError(null);
+    setNewProjectError(null);
+    setSelectedMedia(null);
     try {
       const res = await apiClient.selectMedia({
-        path: mode === "path" ? manualMediaPath.trim() : undefined,
-        file: mode === "file" ? selectedFile ?? undefined : undefined,
+        file,
         copyToProject,
       });
       setSelectedMedia(res);
       if (!newTitle.trim()) {
-        const base = res.path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") ?? "New Sims Project";
+        const base =
+          file.name.replace(/\.[^.]+$/, "") ||
+          res.path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") ||
+          "New Sims Project";
         setNewTitle(base);
       }
     } catch (err) {
-      setBannerError(
-        err instanceof Error ? err.message : "Media selection failed"
+      setNewProjectError(
+        err instanceof Error ? err.message : "Media upload failed"
       );
     } finally {
       setMediaSelectBusy(false);
@@ -485,7 +488,7 @@ export default function App() {
   const handleCreateProject = async () => {
     if (!selectedMedia) return;
     setCreateBusy(true);
-    setBannerError(null);
+    setNewProjectError(null);
     try {
       const res = await apiClient.createProject({
         media_id: selectedMedia.media_id,
@@ -499,15 +502,14 @@ export default function App() {
       }
       setNewProjectOpen(false);
       setSelectedMedia(null);
+      setNewProjectError(null);
       setNewTitle("");
-      setManualMediaPath("");
-      setSelectedFile(null);
       await refreshProjectList();
       if (pid) {
         await loadProject(pid);
       }
     } catch (err) {
-      setBannerError(
+      setNewProjectError(
         err instanceof Error ? err.message : "Failed to create project"
       );
     } finally {
@@ -813,7 +815,10 @@ export default function App() {
               </h2>
               <button
                 type="button"
-                onClick={() => setNewProjectOpen(false)}
+                onClick={() => {
+                  setNewProjectOpen(false);
+                  setNewProjectError(null);
+                }}
                 className="rounded p-1 text-zinc-400 hover:bg-zinc-800"
               >
                 <X className="h-4 w-4" />
@@ -822,63 +827,46 @@ export default function App() {
 
             <div className="space-y-3 text-xs">
               <div className="space-y-1.5">
-                <span className="font-medium text-zinc-300">
+                <span className="block font-medium text-zinc-300">
                   1. Select 16:9 Gameplay Recording
                 </span>
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    disabled={mediaSelectBusy}
-                    onClick={() => handleSelectMedia("native")}
-                    className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-1.5 font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
-                  >
-                    {mediaSelectBusy ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <FolderPlus className="h-3.5 w-3.5" />
-                    )}
-                    Open Native File Picker
-                  </button>
-                </div>
-
-                <div className="flex gap-2 pt-1">
-                  <input
-                    type="text"
-                    value={manualMediaPath}
-                    onChange={(e) => setManualMediaPath(e.target.value)}
-                    placeholder="Or enter local video path..."
-                    className="flex-1 rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-zinc-100 focus:border-emerald-500 focus:outline-none"
-                  />
-                  <button
-                    type="button"
-                    disabled={!manualMediaPath.trim() || mediaSelectBusy}
-                    onClick={() => handleSelectMedia("path")}
-                    className="rounded border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
-                  >
-                    Use Path
-                  </button>
-                </div>
-
-                <div className="flex items-center gap-2 pt-1">
-                  <input
-                    type="file"
-                    accept="video/mp4,video/*"
-                    onChange={(e) =>
-                      setSelectedFile(e.target.files?.[0] ?? null)
+                <input
+                  ref={newProjectFileInputRef}
+                  type="file"
+                  accept="video/mp4,video/*"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = "";
+                    if (file) {
+                      void handleUploadMedia(file);
                     }
-                    className="flex-1 text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-800 file:px-2.5 file:py-1 file:text-xs file:text-zinc-200"
-                  />
-                  <button
-                    type="button"
-                    disabled={!selectedFile || mediaSelectBusy}
-                    onClick={() => handleSelectMedia("file")}
-                    className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
-                  >
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={mediaSelectBusy}
+                  onClick={() => newProjectFileInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-1.5 font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+                >
+                  {mediaSelectBusy ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
                     <Upload className="h-3.5 w-3.5" />
-                    Upload
-                  </button>
-                </div>
+                  )}
+                  {mediaSelectBusy ? "Uploading..." : "Upload File"}
+                </button>
               </div>
+
+              {newProjectError && (
+                <div
+                  role="alert"
+                  className="flex items-start gap-2 rounded-lg border border-rose-500/40 bg-rose-500/15 p-2.5 text-rose-200"
+                >
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
+                  <span>{newProjectError}</span>
+                </div>
+              )}
 
               {selectedMedia && (
                 <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-2.5 text-emerald-200">
@@ -918,7 +906,10 @@ export default function App() {
             <div className="flex justify-end gap-2 pt-2">
               <button
                 type="button"
-                onClick={() => setNewProjectOpen(false)}
+                onClick={() => {
+                  setNewProjectOpen(false);
+                  setNewProjectError(null);
+                }}
                 className="rounded border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
               >
                 Cancel
