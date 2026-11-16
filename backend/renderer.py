@@ -154,6 +154,7 @@ def compute_preview_hash(
         "tts_hash": tts_hash,
         "display_texts": [c.display_text for c in segment.clauses],
         "caption_settings": caption_settings.model_dump(mode="json"),
+        "ass_wrap_v2": True,
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]

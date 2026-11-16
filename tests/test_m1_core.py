@@ -621,7 +621,17 @@ def test_subtitles_escaping_continuity_and_ass_output(tmp_path: Path) -> None:
     content = ass_path.read_text(encoding="utf-8")
     assert "PlayResX: 1080" in content
     assert "PlayResY: 1920" in content
-    assert "WrapStyle: 2" in content
+    assert "WrapStyle: 0" in content
     assert ",2,60,60,340,1" in content  # Alignment=2 (\an2)
     assert "Dialogue: 0,0:00:10.00,0:00:11.12,Default,,0,0,0,,Lord Vaelen" in content
     assert r"Dialogue: 0,0:00:11.12,0:00:12.12,Default,,0,0,0,,refused \{to\} leave." in content
+
+    from backend.subtitles import SubtitleEvent, render_ass_content
+
+    long_ev = SubtitleEvent(
+        start_sec=0.0,
+        end_sec=2.0,
+        text="This is a very long caption that will wrap across four or more lines on a vertical screen",
+    )
+    long_content = render_ass_content([long_ev], CaptionSettings(), width=1080, height=1920)
+    assert r"{\an5}This is a very long caption" in long_content

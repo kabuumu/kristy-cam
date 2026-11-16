@@ -69,22 +69,48 @@ def build_segment_subtitle_events(
     return events
 
 
+def _estimate_wrapped_lines(text: str, max_width_px: int, font_size: int) -> int:
+    """Estimate wrapped line count for Montserrat ExtraBold at given width & font size."""
+    avg_char_w = max(1.0, float(font_size) * 0.58)
+    max_chars = max(8, int(max_width_px / avg_char_w))
+    total_lines = 0
+    for para in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        words = para.split()
+        if not words:
+            total_lines += 1
+            continue
+        lines = 1
+        cur_len = 0
+        for w in words:
+            w_len = len(w)
+            if cur_len == 0:
+                cur_len = w_len
+            elif cur_len + 1 + w_len <= max_chars:
+                cur_len += 1 + w_len
+            else:
+                lines += 1
+                cur_len = w_len
+        total_lines += lines
+    return max(1, total_lines)
+
+
 def render_ass_content(
     events: Sequence[SubtitleEvent],
     caption_settings: CaptionSettings,
     width: int = 1080,
     height: int = 1920,
 ) -> str:
-    """Render complete UTF-8 ASS subtitle document with bottom-center alignment (\\an2)."""
+    """Render complete UTF-8 ASS subtitle document with auto-wrap (WrapStyle: 0) and bottom-center/vertical centering."""
     outline_w = (
         int(caption_settings.outline_width)
         if float(caption_settings.outline_width).is_integer()
         else caption_settings.outline_width
     )
+    margin_lr = 60
     style_line = (
         f"Style: Default,{caption_settings.font_name},{caption_settings.font_size},"
         f"{caption_settings.primary_color},&H000000FF,{caption_settings.outline_color},&H64000000,"
-        f"0,0,0,0,100,100,0,0,1,{outline_w},0,2,60,60,{caption_settings.margin_v},1"
+        f"0,0,0,0,100,100,0,0,1,{outline_w},0,2,{margin_lr},{margin_lr},{caption_settings.margin_v},1"
     )
 
     lines = [
@@ -92,7 +118,7 @@ def render_ass_content(
         "ScriptType: v4.00+",
         f"PlayResX: {width}",
         f"PlayResY: {height}",
-        "WrapStyle: 2",
+        "WrapStyle: 0",
         "ScaledBorderAndShadow: yes",
         "",
         "[V4+ Styles]",
@@ -105,10 +131,15 @@ def render_ass_content(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
+    usable_width = max(100, width - (margin_lr * 2))
     for ev in events:
         start_ts = format_ass_timestamp(ev.start_sec)
         end_ts = format_ass_timestamp(ev.end_sec)
         text = escape_ass_text(ev.text)
+        est_lines = _estimate_wrapped_lines(ev.text, usable_width, caption_settings.font_size)
+        est_block_h = est_lines * float(caption_settings.font_size) * 1.25
+        if est_lines >= 4 or (est_block_h + caption_settings.margin_v > float(height) * 0.55):
+            text = f"{{\\an5}}{text}"
         lines.append(f"Dialogue: 0,{start_ts},{end_ts},Default,,0,0,0,,{text}")
 
     lines.append("")
