@@ -6,7 +6,6 @@ import {
   ArrowUp,
   BookOpen,
   CheckCircle2,
-  Loader2,
   Merge,
   Mic,
   Plus,
@@ -33,12 +32,10 @@ interface ScriptPanelProps {
   manifest: ArtifactManifest;
   selectedSegment: SegmentInput | null;
   voices: string[];
-  ttsBusy: boolean;
   ttsError: string | null;
   lastSynthesizedSignatures: Record<string, string>;
   onUpdateProject: (updater: (prev: ProjectInput) => ProjectInput) => void;
   onUpdateSegment: (updated: SegmentInput) => void;
-  onGenerateVoiceover: (segId: string) => void;
 }
 
 export function ScriptPanel({
@@ -46,12 +43,10 @@ export function ScriptPanel({
   manifest,
   selectedSegment,
   voices,
-  ttsBusy,
   ttsError,
   lastSynthesizedSignatures,
   onUpdateProject,
   onUpdateSegment,
-  onGenerateVoiceover,
 }: ScriptPanelProps) {
   const [newPronKey, setNewPronKey] = useState("");
   const [newPronVal, setNewPronVal] = useState("");
@@ -319,22 +314,12 @@ export function ScriptPanel({
               </label>
             </div>
 
-            {/* Voiceover Synthesis & Status Badges (non-color-only) */}
+            {/* Voiceover Status & Audio Player (synthesized automatically on Render Segment Preview / Export) */}
             <div className="space-y-2 rounded-lg border border-zinc-800 bg-[#11141b] p-2.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <button
-                  type="button"
-                  disabled={ttsBusy}
-                  onClick={() => onGenerateVoiceover(selectedSegment.id)}
-                  className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {ttsBusy ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Mic className="h-3.5 w-3.5" />
-                  )}
-                  Generate Voiceover
-                </button>
+                <span className="text-[11px] font-medium text-zinc-400">
+                  Voiceover Status
+                </span>
 
                 <div className="flex items-center gap-1.5">
                   {ttsError && (
@@ -347,7 +332,7 @@ export function ScriptPanel({
                   {isStale ? (
                     <span className="inline-flex items-center gap-1 rounded border border-amber-500/50 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-200">
                       <AlertTriangle className="h-3 w-3" />
-                      Stale Audio — Re-synthesize
+                      Narration Updated — Render Preview to Sync
                     </span>
                   ) : hasAudioArtifact ? (
                     <span className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-200">

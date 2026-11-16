@@ -205,25 +205,28 @@ export default function App() {
             setManifest(bundle.manifest);
             setSourceStatus(bundle.source_status ?? null);
 
-            if (updated.job_type === "tts" && updated.seg_id) {
+            if (
+              (updated.job_type === "tts" ||
+                updated.job_type === "preview" ||
+                updated.job_type === "export") &&
+              projectRef.current
+            ) {
               setTtsError(null);
-              const seg = projectRef.current?.segments.find(
-                (s) => s.id === updated.seg_id
-              );
-              if (seg && projectRef.current) {
-                const sig = computeClientTtsSignature(
-                  seg,
-                  projectRef.current.pronunciations,
-                  projectRef.current.voice,
-                  projectRef.current.language,
-                  projectRef.current.output_settings.inter_clause_pause_ms
-                );
-                setLastSynthesizedSignatures((prev) => ({
-                  ...prev,
-                  [seg.id]: sig,
-                }));
+              const sigs: Record<string, string> = {};
+              for (const seg of projectRef.current.segments) {
+                if (bundle.manifest.segments[seg.id]?.audio_artifact_id) {
+                  sigs[seg.id] = computeClientTtsSignature(
+                    seg,
+                    projectRef.current.pronunciations,
+                    projectRef.current.voice,
+                    projectRef.current.language,
+                    projectRef.current.output_settings.inter_clause_pause_ms
+                  );
+                }
               }
-            } else if (updated.job_type === "preview") {
+              setLastSynthesizedSignatures((prev) => ({ ...prev, ...sigs }));
+            }
+            if (updated.job_type === "preview") {
               setPreviewModalOpen(true);
             } else if (updated.job_type === "export") {
               setExportModalOpen(true);
@@ -347,21 +350,6 @@ export default function App() {
     if (!project) return null;
     if (!dirty) return project;
     return handleSave();
-  };
-
-  const handleGenerateVoiceover = async (segId: string) => {
-    const saved = await ensureSavedBeforeJob();
-    if (!saved) return;
-    setTtsError(null);
-    try {
-      const res = await apiClient.synthesizeTts(saved.project_id, segId);
-      const job = await apiClient.getJob(res.job_id);
-      setActiveJob(job);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to start TTS";
-      setTtsError(msg);
-      setBannerError(msg);
-    }
   };
 
   const handleRenderPreview = async (segId: string) => {
@@ -893,12 +881,10 @@ export default function App() {
               manifest={manifest}
               selectedSegment={selectedSegment}
               voices={capabilities?.voices ?? []}
-              ttsBusy={Boolean(isJobBusy && activeJob?.job_type === "tts")}
               ttsError={ttsError}
               lastSynthesizedSignatures={lastSynthesizedSignatures}
               onUpdateProject={handleUpdateProject}
               onUpdateSegment={handleUpdateSegment}
-              onGenerateVoiceover={handleGenerateVoiceover}
             />
           </div>
 
