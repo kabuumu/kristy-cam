@@ -63,6 +63,7 @@ export default function App() {
   const [revisionConflict, setRevisionConflict] = useState(false);
 
   const [sourceTime, setSourceTime] = useState(0);
+  const [segTime, setSegTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isProjectPlaying, setIsProjectPlaying] = useState(false);
 
@@ -98,6 +99,8 @@ export default function App() {
 
   const projectRef = useRef<ProjectInput | null>(null);
   projectRef.current = project;
+  const manifestRef = useRef<ArtifactManifest | null>(null);
+  manifestRef.current = manifest;
   const selectedSegIdRef = useRef<string | null>(null);
   selectedSegIdRef.current = selectedSegId;
 
@@ -1101,12 +1104,19 @@ export default function App() {
               outputHeight={project.output_settings.height}
               tailPaddingSec={project.output_settings.tail_padding_sec}
               sourceTime={sourceTime}
+              segTime={segTime}
               isPlaying={isPlaying}
+              isProjectPlaying={isProjectPlaying}
               onTogglePlay={() => {
                 setIsProjectPlaying(false);
                 setIsPlaying((p) => !p);
               }}
-              onSourceTimeChange={(t) => setSourceTime(t)}
+              onSourceTimeChange={(t) => {
+                setSourceTime(t);
+                if (selectedSegment) {
+                  setSegTime(Math.max(0, t - selectedSegment.video_in));
+                }
+              }}
               onUpdateSegment={handleUpdateSegment}
               onRenderPreview={handleRenderPreview}
               previewBusy={
@@ -1156,16 +1166,42 @@ export default function App() {
             }
             tailPaddingSec={project.output_settings.tail_padding_sec}
             sourceTime={sourceTime}
+            segTime={segTime}
             isModalOpen={isModalOpen}
             isProjectPlaying={isProjectPlaying}
             onSelectSegment={(segId) => {
               setSelectedSegId(segId);
               setSelection({ type: "video", segId });
               const seg = project.segments.find((s) => s.id === segId);
-              if (seg) setSourceTime(seg.video_in);
+              if (seg) {
+                setSegTime(0);
+                setSourceTime(seg.video_in);
+              }
             }}
             onSelectItem={setSelection}
-            onSourceTimeChange={(t) => setSourceTime(t)}
+            onSourceTimeChange={(t) => {
+              setSourceTime(t);
+              if (selectedSegment) {
+                setSegTime(Math.max(0, t - selectedSegment.video_in));
+              }
+            }}
+            onSegTimeChange={(t) => {
+              setSegTime(t);
+              if (selectedSegment) {
+                const srcDur = manifest.source_metadata?.duration ?? 0;
+                const audioDur =
+                  manifest.segments[selectedSegment.id]?.audio_duration ?? 0;
+                const plan = computeDurationPlan(
+                  selectedSegment,
+                  audioDur,
+                  srcDur,
+                  project.output_settings.tail_padding_sec
+                );
+                setSourceTime(
+                  selectedSegment.video_in + Math.min(plan.movingSourceDur, t)
+                );
+              }
+            }}
             onAddSegment={handleAddSegment}
             onUpdateSegment={handleUpdateSegment}
             onToggleProjectPlayback={() => {

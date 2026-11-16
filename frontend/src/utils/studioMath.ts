@@ -174,6 +174,7 @@ export interface DurationPlan {
   rawTarget: number;
   frameCount: number;
   finalDur: number;
+  movingSourceDur: number;
   isFreezeFrame: boolean;
   isSourceExtended: boolean;
 }
@@ -199,6 +200,15 @@ export function computeDurationPlan(
   const frameCount = Math.max(1, Math.ceil(rawTarget * 30));
   const finalDur = frameCount / 30;
 
+  const availableSourceDur =
+    sourceDuration > 0
+      ? Math.max(0, sourceDuration - segment.video_in)
+      : Number.POSITIVE_INFINITY;
+  const movingSourceDur =
+    segment.duration_mode === "preserve_video"
+      ? Math.min(rawVideoDur, availableSourceDur)
+      : Math.min(rawTarget, availableSourceDur);
+
   const isFreezeFrame =
     segment.duration_mode === "preserve_video"
       ? rawTarget > rawVideoDur + 1e-4
@@ -217,6 +227,7 @@ export function computeDurationPlan(
     rawTarget,
     frameCount,
     finalDur,
+    movingSourceDur,
     isFreezeFrame,
     isSourceExtended,
   };

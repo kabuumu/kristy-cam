@@ -37,7 +37,9 @@ interface CropCanvasProps {
   outputHeight: number;
   tailPaddingSec: number;
   sourceTime: number;
+  segTime?: number | null;
   isPlaying: boolean;
+  isProjectPlaying?: boolean;
   onTogglePlay: () => void;
   onSourceTimeChange: (t: number) => void;
   onUpdateSegment: (updated: SegmentInput) => void;
@@ -61,7 +63,9 @@ export function CropCanvas({
   outputHeight,
   tailPaddingSec,
   sourceTime,
+  segTime = null,
   isPlaying,
+  isProjectPlaying = false,
   onTogglePlay,
   onSourceTimeChange,
   onUpdateSegment,
@@ -103,8 +107,21 @@ export function CropCanvas({
     : 1;
 
   const segRelTime = segment
-    ? Math.max(0, Math.min(durationPlan?.finalDur ?? rawVideoDur, sourceTime - segment.video_in))
+    ? Math.max(
+        0,
+        Math.min(
+          durationPlan?.finalDur ?? rawVideoDur,
+          segTime != null ? segTime : sourceTime - segment.video_in
+        )
+      )
     : 0;
+
+  const isVideoFrozen = Boolean(
+    segment &&
+      durationPlan &&
+      isProjectPlaying &&
+      segRelTime >= durationPlan.movingSourceDur - 0.02
+  );
 
   // Out-of-range keyframes detected after trim-shift
   const outOfRangeKeyframes = segment
@@ -119,8 +136,8 @@ export function CropCanvas({
     vid.volume = targetVol;
     vid.muted = targetVol <= 0;
 
-    if (isPlaying) {
-      if (Math.abs(vid.currentTime - sourceTime) > 0.3) {
+    if (isPlaying && !isVideoFrozen) {
+      if (Math.abs(vid.currentTime - sourceTime) > 0.35) {
         vid.currentTime = Math.max(0, sourceTime);
       }
       if (vid.paused) {
@@ -134,7 +151,7 @@ export function CropCanvas({
         vid.currentTime = Math.max(0, sourceTime);
       }
     }
-  }, [isPlaying, sourceTime, proxyUrl, segment]);
+  }, [isPlaying, isVideoFrozen, sourceTime, proxyUrl, segment]);
 
   // Sync synthesized voiceover <audio> playback with segment playhead
   useEffect(() => {
@@ -396,7 +413,7 @@ export function CropCanvas({
                 className="h-full w-full object-contain"
                 playsInline
                 onTimeUpdate={(e) => {
-                  if (isPlaying) {
+                  if (isPlaying && !isProjectPlaying) {
                     onSourceTimeChange(e.currentTarget.currentTime);
                   }
                 }}

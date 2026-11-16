@@ -22,11 +22,13 @@ interface TimelineProps {
   selection: TimelineSelection;
   tailPaddingSec: number;
   sourceTime: number;
+  segTime?: number | null;
   isModalOpen: boolean;
   isProjectPlaying: boolean;
   onSelectSegment: (segId: string) => void;
   onSelectItem: (sel: TimelineSelection) => void;
   onSourceTimeChange: (t: number) => void;
+  onSegTimeChange?: (t: number) => void;
   onAddSegment: (videoIn: number, videoOut: number) => void;
   onUpdateSegment: (updated: SegmentInput) => void;
   onToggleProjectPlayback: () => void;
@@ -65,11 +67,13 @@ export function Timeline({
   selection,
   tailPaddingSec,
   sourceTime,
+  segTime = null,
   isModalOpen,
   isProjectPlaying,
   onSelectSegment,
   onSelectItem,
   onSourceTimeChange,
+  onSegTimeChange,
   onAddSegment,
   onUpdateSegment,
   onToggleProjectPlayback,
@@ -135,9 +139,14 @@ export function Timeline({
     );
     const totalDur = Math.max(0.1, plan.finalDur);
     const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    onSourceTimeChange(
-      selectedSegment.video_in + Math.min(plan.rawVideoDur, ratio * totalDur)
-    );
+    const nextSegTime = Math.max(0, Math.min(totalDur, ratio * totalDur));
+    if (onSegTimeChange) {
+      onSegTimeChange(nextSegTime);
+    } else {
+      onSourceTimeChange(
+        selectedSegment.video_in + Math.min(plan.movingSourceDur, nextSegTime)
+      );
+    }
   };
 
   useEffect(() => {
@@ -387,7 +396,10 @@ export function Timeline({
         const totalFrames = plan.frameCount;
         const segRelTime = Math.max(
           0,
-          Math.min(totalDur, sourceTime - selectedSegment.video_in)
+          Math.min(
+            totalDur,
+            segTime != null ? segTime : sourceTime - selectedSegment.video_in
+          )
         );
         const currentFrame = Math.min(totalFrames, Math.round(segRelTime * 30));
         const playheadPct = Math.max(0, Math.min(100, (segRelTime / totalDur) * 100));
