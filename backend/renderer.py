@@ -401,16 +401,14 @@ def render_segment_stage1(
         height=source_metadata.height,
         duration=crop_duration,
         fps=output_settings.fps,
+        output_width=output_settings.width,
+        output_height=output_settings.height,
     )
 
     video_chain_parts = [
         "[0:v]setpts=PTS-STARTPTS",
         crop_filter,
     ]
-    if output_settings.width != 1080 or output_settings.height != 1920:
-        video_chain_parts.append(
-            f"scale={output_settings.width}:{output_settings.height}:flags=lanczos,setsar=1"
-        )
     if plan.freeze_frame or plan.final_dur > plan.moving_source_dur:
         video_chain_parts.append(f"tpad=stop_mode=clone:stop_duration={plan.freeze_dur + 0.25:.6f}")
     else:
@@ -653,7 +651,14 @@ def render_segment_preview(
         ass_path.unlink(missing_ok=True)
 
 
-def verify_concat_compatibility(segment_paths: Sequence[Path], ffprobe_path: Path) -> None:
+def verify_concat_compatibility(
+    segment_paths: Sequence[Path],
+    ffprobe_path: Path,
+    *,
+    expected_width: int = 1080,
+    expected_height: int = 1920,
+    expected_fps: int = 30,
+) -> None:
     """Verify all ordered Stage 1 segment MP4s share identical stream parameters before concat."""
     if not segment_paths:
         raise RenderError("No segment paths provided for concat compatibility check")
@@ -665,9 +670,9 @@ def verify_concat_compatibility(segment_paths: Sequence[Path], ffprobe_path: Pat
         info = probe_rendered_video(
             seg_path,
             ffprobe_path,
-            expected_width=1080,
-            expected_height=1920,
-            expected_fps=30,
+            expected_width=expected_width,
+            expected_height=expected_height,
+            expected_fps=expected_fps,
             require_audio=True,
         )
         if baseline is None:
@@ -768,7 +773,13 @@ def render_final_export(
         offset_sec += plan.final_dur
         total_frames += plan.frame_count
 
-    verify_concat_compatibility(stage1_paths, ffprobe_bin)
+    verify_concat_compatibility(
+        stage1_paths,
+        ffprobe_bin,
+        expected_width=project.output_settings.width,
+        expected_height=project.output_settings.height,
+        expected_fps=project.output_settings.fps,
+    )
 
     unique_tag = uuid.uuid4().hex[:8]
     master_ass_path = tmp_dir / f"{project.project_id}_master_{unique_tag}.ass"

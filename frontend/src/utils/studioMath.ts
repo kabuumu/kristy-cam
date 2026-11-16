@@ -13,16 +13,44 @@ export interface IdealCropDimensions {
   maxNormY: number;
 }
 
+export function formatAspectRatio(width: number, height: number): string {
+  const w = Math.max(1, Math.round(width));
+  const h = Math.max(1, Math.round(height));
+  const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+  const d = gcd(w, h);
+  const rw = w / d;
+  const rh = h / d;
+  if (rw <= 32 && rh <= 32) {
+    return `${rw}:${rh}`;
+  }
+  return `${(w / h).toFixed(2)}:1`;
+}
+
 export function computeIdealCrop(
   sourceWidth: number,
   sourceHeight: number,
-  zoom: number
+  zoom: number,
+  outputWidth = 1080,
+  outputHeight = 1920
 ): IdealCropDimensions {
   const safeW = Math.max(1, sourceWidth);
   const safeH = Math.max(1, sourceHeight);
+  const safeOutW = Math.max(2, outputWidth);
+  const safeOutH = Math.max(2, outputHeight);
   const clampedZoom = Math.min(3.0, Math.max(1.0, zoom));
-  const baseCropH = safeH;
-  const baseCropW = safeH * (9 / 16);
+  const targetAspect = safeOutW / safeOutH;
+  const sourceAspect = safeW / safeH;
+
+  let baseCropW: number;
+  let baseCropH: number;
+  if (sourceAspect >= targetAspect) {
+    baseCropH = safeH;
+    baseCropW = safeH * targetAspect;
+  } else {
+    baseCropW = safeW;
+    baseCropH = safeW / targetAspect;
+  }
+
   const idealCropH = baseCropH / clampedZoom;
   const idealCropW = baseCropW / clampedZoom;
   const maxNormX = Math.max(0, (safeW - idealCropW) / safeW);
@@ -42,13 +70,17 @@ export function clampCropPosition(
   y: number,
   zoom: number,
   sourceWidth: number,
-  sourceHeight: number
+  sourceHeight: number,
+  outputWidth = 1080,
+  outputHeight = 1920
 ): { x: number; y: number; zoom: number } {
   const clampedZoom = Math.min(3.0, Math.max(1.0, zoom));
   const { maxNormX, maxNormY } = computeIdealCrop(
     sourceWidth,
     sourceHeight,
-    clampedZoom
+    clampedZoom,
+    outputWidth,
+    outputHeight
   );
   return {
     x: Math.min(maxNormX, Math.max(0, Number.isFinite(x) ? x : 0)),
@@ -61,10 +93,20 @@ export function evaluateCropAt(
   keyframes: CropKeyframe[],
   t: number,
   sourceWidth: number,
-  sourceHeight: number
+  sourceHeight: number,
+  outputWidth = 1080,
+  outputHeight = 1920
 ): { x: number; y: number; zoom: number } {
   if (!keyframes.length) {
-    return clampCropPosition(0.28, 0, 1.0, sourceWidth, sourceHeight);
+    return clampCropPosition(
+      0.28,
+      0,
+      1.0,
+      sourceWidth,
+      sourceHeight,
+      outputWidth,
+      outputHeight
+    );
   }
   const sorted = [...keyframes].sort((a, b) => a.t - b.t);
   if (t <= sorted[0].t) {
@@ -73,7 +115,9 @@ export function evaluateCropAt(
       sorted[0].y,
       sorted[0].zoom,
       sourceWidth,
-      sourceHeight
+      sourceHeight,
+      outputWidth,
+      outputHeight
     );
   }
   const last = sorted[sorted.length - 1];
@@ -83,7 +127,9 @@ export function evaluateCropAt(
       last.y,
       last.zoom,
       sourceWidth,
-      sourceHeight
+      sourceHeight,
+      outputWidth,
+      outputHeight
     );
   }
   for (let i = 0; i < sorted.length - 1; i++) {
@@ -95,10 +141,26 @@ export function evaluateCropAt(
       const x = a.x + (b.x - a.x) * alpha;
       const y = a.y + (b.y - a.y) * alpha;
       const zoom = a.zoom + (b.zoom - a.zoom) * alpha;
-      return clampCropPosition(x, y, zoom, sourceWidth, sourceHeight);
+      return clampCropPosition(
+        x,
+        y,
+        zoom,
+        sourceWidth,
+        sourceHeight,
+        outputWidth,
+        outputHeight
+      );
     }
   }
-  return clampCropPosition(last.x, last.y, last.zoom, sourceWidth, sourceHeight);
+  return clampCropPosition(
+    last.x,
+    last.y,
+    last.zoom,
+    sourceWidth,
+    sourceHeight,
+    outputWidth,
+    outputHeight
+  );
 }
 
 export interface DurationPlan {

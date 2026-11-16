@@ -295,12 +295,6 @@ def probe_and_validate_media(
     if width <= 0 or height <= 0:
         raise MediaValidationError(f"Invalid video dimensions ({width}x{height}) in {media_path}.")
 
-    aspect = width / height
-    if aspect < 1.77 or aspect > 1.78:
-        raise MediaValidationError(
-            f"Unsupported aspect ratio {aspect:.4f} ({width}x{height}); 16:9 landscape (1.77-1.78) is required."
-        )
-
     fps = _parse_fraction(vstream.get("avg_frame_rate")) or _parse_fraction(vstream.get("r_frame_rate"))
     if fps is None:
         raise MediaValidationError(f"Could not determine valid video frame rate for {media_path}.")

@@ -290,12 +290,12 @@ def test_media_validation_rejects_hdr_rotated_aspect_sar_and_corrupt(
         with pytest.raises(MediaValidationError, match="Rotated"):
             probe_and_validate_media(rot_path, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
 
-    # Non-16:9 (4:3)
+    # Non-16:9 (4:3) is supported
     non_16_9 = _make_cfr_video(
         ffmpeg_path, tmp_path / "four_three.mp4", width=640, height=480, duration=1.0, with_audio=False
     )
-    with pytest.raises(MediaValidationError, match="16:9"):
-        probe_and_validate_media(non_16_9, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+    meta_4_3 = probe_and_validate_media(non_16_9, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+    assert (meta_4_3.width, meta_4_3.height) == (640, 480)
 
     # Non-1:1 SAR
     bad_sar = _make_cfr_video(

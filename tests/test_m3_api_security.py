@@ -366,13 +366,15 @@ def test_media_select_json_multipart_and_invalid_rejected(
     assert data_multi["media_id"].startswith("src_")
     assert Path(data_multi["path"]).is_file()
 
-    # 3. Invalid media (non-16:9) -> 422
-    r_bad_aspect = client.post(
+    # 3. Non-16:9 media (4:3) is accepted -> 200
+    r_4x3 = client.post(
         "/api/media/select",
         headers=_auth_headers(client),
         json={"path": str(invalid_4x3)},
     )
-    assert r_bad_aspect.status_code == 422
+    assert r_4x3.status_code == 200, r_4x3.text
+    assert r_4x3.json()["metadata"]["width"] == 640
+    assert r_4x3.json()["metadata"]["height"] == 480
 
     # 4. Relative / traversal / missing paths -> 422
     for bad_path in ("relative/clip.mp4", "/tmp/../etc/passwd", str(tmp_path / "missing.mp4")):

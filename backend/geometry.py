@@ -35,15 +35,32 @@ def round_even(value: float) -> int:
     return max(2, int(round(value / 2.0)) * 2)
 
 
-def compute_ideal_crop_size(width: int, height: int, zoom: float) -> tuple[float, float]:
-    """Compute ideal (unrounded) 9:16 crop dimensions in source pixels for a given zoom."""
+def compute_ideal_crop_size(
+    width: int,
+    height: int,
+    zoom: float,
+    output_width: int = 1080,
+    output_height: int = 1920,
+) -> tuple[float, float]:
+    """Compute ideal (unrounded) crop dimensions in source pixels for target output aspect and zoom."""
     if width <= 0 or height <= 0:
         raise GeometryValidationError(f"Source dimensions must be positive, got {width}x{height}")
+    if output_width <= 0 or output_height <= 0:
+        raise GeometryValidationError(
+            f"Output dimensions must be positive, got {output_width}x{output_height}"
+        )
     if not math.isfinite(zoom) or zoom < 1.0 or zoom > 3.0:
         raise GeometryValidationError(f"zoom must be finite and in [1.0, 3.0], got {zoom!r}")
 
-    base_crop_h = float(height)
-    base_crop_w = float(height) * 9.0 / 16.0
+    target_aspect = float(output_width) / float(output_height)
+    source_aspect = float(width) / float(height)
+    if source_aspect >= target_aspect:
+        base_crop_h = float(height)
+        base_crop_w = float(height) * target_aspect
+    else:
+        base_crop_w = float(width)
+        base_crop_h = float(width) / target_aspect
+
     ideal_crop_h = base_crop_h / zoom
     ideal_crop_w = base_crop_w / zoom
     return ideal_crop_w, ideal_crop_h
@@ -55,9 +72,13 @@ def clamp_normalized_coords(
     zoom: float,
     width: int,
     height: int,
+    output_width: int = 1080,
+    output_height: int = 1920,
 ) -> tuple[float, float]:
-    """Clamp normalized top-left (x, y) so the 9:16 crop box stays inside [0, W] x [0, H]."""
-    ideal_w, ideal_h = compute_ideal_crop_size(width, height, zoom)
+    """Clamp normalized top-left (x, y) so the crop box stays inside [0, W] x [0, H]."""
+    ideal_w, ideal_h = compute_ideal_crop_size(
+        width, height, zoom, output_width=output_width, output_height=output_height
+    )
     max_x_px = max(0.0, float(width) - ideal_w)
     max_y_px = max(0.0, float(height) - ideal_h)
 
@@ -71,12 +92,18 @@ def validate_keyframes(
     duration: float,
     width: int,
     height: int,
+    output_width: int = 1080,
+    output_height: int = 1920,
 ) -> None:
     """Validate keyframe timestamps, zoom range, and persisted normalized top-left bounds."""
     if not math.isfinite(duration) or duration <= 0.0:
         raise GeometryValidationError(f"duration must be finite and > 0, got {duration!r}")
     if width <= 0 or height <= 0:
         raise GeometryValidationError(f"Source dimensions must be positive, got {width}x{height}")
+    if output_width <= 0 or output_height <= 0:
+        raise GeometryValidationError(
+            f"Output dimensions must be positive, got {output_width}x{output_height}"
+        )
     if not keyframes:
         raise GeometryValidationError("keyframes must be non-empty")
 
@@ -102,7 +129,9 @@ def validate_keyframes(
         if not (math.isfinite(kf.x) and math.isfinite(kf.y) and math.isfinite(kf.zoom)):
             raise GeometryValidationError(f"Keyframe {idx} has non-finite coordinates or zoom")
 
-        ideal_w, ideal_h = compute_ideal_crop_size(width, height, kf.zoom)
+        ideal_w, ideal_h = compute_ideal_crop_size(
+            width, height, kf.zoom, output_width=output_width, output_height=output_height
+        )
         max_x_norm = max(0.0, (float(width) - ideal_w) / float(width))
         max_y_norm = max(0.0, (float(height) - ideal_h) / float(height))
 
@@ -121,6 +150,8 @@ def evaluate_crop_at(
     t: float,
     width: int,
     height: int,
+    output_width: int = 1080,
+    output_height: int = 1920,
 ) -> CropBox:
     """Linearly interpolate (x, y, zoom) at timestamp t, clamping t <= 0 and holding final keyframe."""
     if not keyframes:
@@ -145,7 +176,9 @@ def evaluate_crop_at(
                 zoom = k0.zoom + (k1.zoom - k0.zoom) * alpha
                 break
 
-    ideal_w, ideal_h = compute_ideal_crop_size(width, height, zoom)
+    ideal_w, ideal_h = compute_ideal_crop_size(
+        width, height, zoom, output_width=output_width, output_height=output_height
+    )
     max_x_px = max(0.0, float(width) - ideal_w)
     max_y_px = max(0.0, float(height) - ideal_h)
 
@@ -196,19 +229,32 @@ def build_crop_filter(
     height: int,
     duration: float,
     fps: int = 30,
+    output_width: int = 1080,
+    output_height: int = 1920,
 ) -> str:
-    """Build an FFmpeg video filtergraph string for static or animated 9:16 crop/zoom."""
-    validate_keyframes(keyframes, duration=duration, width=width, height=height)
+    """Build an FFmpeg video filtergraph string for static or animated crop/zoom to output_width x output_height."""
+    validate_keyframes(
+        keyframes,
+        duration=duration,
+        width=width,
+        height=height,
+        output_width=output_width,
+        output_height=output_height,
+    )
     if fps <= 0:
         raise GeometryValidationError(f"fps must be positive, got {fps}")
 
+    out_w = round_even(float(output_width))
+    out_h = round_even(float(output_height))
     constant_zoom = all(abs(kf.zoom - keyframes[0].zoom) < 1e-9 for kf in keyframes)
 
     if constant_zoom:
         zoom = keyframes[0].zoom
-        ideal_w, ideal_h = compute_ideal_crop_size(width, height, zoom)
-        crop_w = round_even(ideal_w)
-        crop_h = round_even(ideal_h)
+        ideal_w, ideal_h = compute_ideal_crop_size(
+            width, height, zoom, output_width=out_w, output_height=out_h
+        )
+        crop_w = min(width, round_even(ideal_w))
+        crop_h = min(height, round_even(ideal_h))
         max_x = max(0.0, float(width - crop_w))
         max_y = max(0.0, float(height - crop_h))
 
@@ -223,13 +269,21 @@ def build_crop_filter(
             y_expr = f"clip({_piecewise_linear_expr(times, ys, 't')},0,{max_y:.4f})"
             crop_part = f"crop=w={crop_w}:h={crop_h}:x='{x_expr}':y='{y_expr}'"
 
-        return f"{crop_part},scale=1080:1920:flags=lanczos,setsar=1,fps={fps}"
+        return f"{crop_part},scale={out_w}:{out_h}:flags=lanczos,setsar=1,fps={fps}"
 
-    # Animated zoom: pad to 9:16 aspect canvas so zoompan preserves 9:16 with zero aspect distortion
+    # Animated zoom: pad to target aspect canvas so zoompan preserves output aspect with zero distortion
     # while allowing full horizontal and vertical panning across the (W, H) source frame.
-    pad_w = round_even(float(width))
-    pad_h = round_even(float(width) * 16.0 / 9.0)
-    base_crop_w = float(height) * 9.0 / 16.0
+    target_aspect = float(out_w) / float(out_h)
+    source_aspect = float(width) / float(height)
+    if source_aspect >= target_aspect:
+        pad_w = round_even(float(width))
+        pad_h = max(height, round_even(float(width) / target_aspect))
+        base_crop_w = float(height) * target_aspect
+    else:
+        pad_h = round_even(float(height))
+        pad_w = max(width, round_even(float(height) * target_aspect))
+        base_crop_w = float(width)
+
     zoom_scale = float(pad_w) / base_crop_w
 
     times = [kf.t for kf in keyframes]
@@ -246,6 +300,6 @@ def build_crop_filter(
     return (
         f"fps={fps},"
         f"pad=w={pad_w}:h={pad_h}:x=0:y=0:color=black,"
-        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1:fps={fps}:s=1080x1920,"
+        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1:fps={fps}:s={out_w}x{out_h},"
         f"setsar=1"
     )

@@ -25,6 +25,7 @@ import {
   computeDurationPlan,
   computeIdealCrop,
   evaluateCropAt,
+  formatAspectRatio,
   formatTimecode,
 } from "../utils/studioMath";
 
@@ -33,6 +34,8 @@ interface CropCanvasProps {
   segment: SegmentInput | null;
   manifest: ArtifactManifest;
   captionSettings: CaptionSettings;
+  outputWidth: number;
+  outputHeight: number;
   tailPaddingSec: number;
   sourceTime: number;
   isPlaying: boolean;
@@ -55,6 +58,8 @@ export function CropCanvas({
   segment,
   manifest,
   captionSettings,
+  outputWidth,
+  outputHeight,
   tailPaddingSec,
   sourceTime,
   isPlaying,
@@ -76,6 +81,7 @@ export function CropCanvas({
   const srcW = manifest.source_metadata?.width ?? 1920;
   const srcH = manifest.source_metadata?.height ?? 1080;
   const srcDur = manifest.source_metadata?.duration ?? 0;
+  const aspectLabel = formatAspectRatio(outputWidth, outputHeight);
 
   const proxyReady =
     manifest.proxy.status === "ready" && Boolean(manifest.proxy.artifact_id);
@@ -122,10 +128,10 @@ export function CropCanvas({
 
   // Evaluated crop at current segment time
   const currentCrop = segment
-    ? evaluateCropAt(segment.crop_keyframes, segRelTime, srcW, srcH)
-    : clampCropPosition(0.28, 0, 1.0, srcW, srcH);
+    ? evaluateCropAt(segment.crop_keyframes, segRelTime, srcW, srcH, outputWidth, outputHeight)
+    : clampCropPosition(0.28, 0, 1.0, srcW, srcH, outputWidth, outputHeight);
 
-  const ideal = computeIdealCrop(srcW, srcH, currentCrop.zoom);
+  const ideal = computeIdealCrop(srcW, srcH, currentCrop.zoom, outputWidth, outputHeight);
   const boxLeftPct = (currentCrop.x * 100);
   const boxTopPct = (currentCrop.y * 100);
   const boxWidthPct = (ideal.idealCropW / srcW) * 100;
@@ -143,7 +149,7 @@ export function CropCanvas({
     zoom: number
   ) => {
     if (!segment) return;
-    const clamped = clampCropPosition(x, y, zoom, srcW, srcH);
+    const clamped = clampCropPosition(x, y, zoom, srcW, srcH, outputWidth, outputHeight);
     const roundedT = Number(Math.max(0, t).toFixed(3));
     const existingIdx = segment.crop_keyframes.findIndex(
       (kf) => Math.abs(kf.t - roundedT) < 0.05
@@ -274,10 +280,10 @@ export function CropCanvas({
                 ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200"
                 : "border-zinc-700 bg-zinc-800/60 text-zinc-300"
             }`}
-            title="Toggle 9:16 crop mask"
+            title={`Toggle ${aspectLabel} crop mask`}
           >
             {showMask ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
-            9:16 Mask
+            {aspectLabel} Mask
           </button>
 
           <button
@@ -288,7 +294,7 @@ export function CropCanvas({
                 ? "border-sky-500/40 bg-sky-500/15 text-sky-200"
                 : "border-zinc-700 bg-zinc-800/60 text-zinc-300"
             }`}
-            title="Toggle 1080x1920 caption safe-area guide"
+            title={`Toggle ${outputWidth}x${outputHeight} caption safe-area guide`}
           >
             <Grid className="h-3.5 w-3.5" />
             Safe Area
@@ -358,7 +364,14 @@ export function CropCanvas({
       <div className="relative flex flex-1 items-center justify-center bg-[#0b0d11] p-3 overflow-hidden">
         <div
           ref={stageRef}
-          className="relative aspect-video w-full max-h-full max-w-[780px] overflow-hidden rounded-lg border border-zinc-800 bg-black select-none"
+          className="relative overflow-hidden rounded-lg border border-zinc-800 bg-black select-none"
+          style={{
+            aspectRatio: `${srcW} / ${srcH}`,
+            width: srcW >= srcH ? "min(100%, 780px)" : "auto",
+            height: srcW < srcH ? "100%" : "auto",
+            maxWidth: "100%",
+            maxHeight: "100%",
+          }}
         >
           {proxyUrl ? (
             <video
@@ -393,7 +406,7 @@ export function CropCanvas({
             </div>
           )}
 
-          {/* 9:16 Crop Overlay */}
+          {/* Crop Overlay */}
           {segment && (
             <div
               className="absolute border-2 border-emerald-400 cursor-move"
@@ -415,18 +428,18 @@ export function CropCanvas({
                 });
               }}
             >
-              {/* Safe-Area & Caption Guide (1080x1920) */}
+              {/* Safe-Area & Caption Guide */}
               {showSafeGuide && (
                 <div className="pointer-events-none absolute inset-0">
                   <div className="absolute inset-x-[6%] top-[10%] bottom-[18%] border border-dashed border-sky-400/50" />
                   <div
                     className="absolute inset-x-[5%] flex items-center justify-center rounded border border-amber-400/60 bg-amber-500/10 text-[10px] font-medium text-amber-200"
                     style={{
-                      bottom: `${Math.min(40, (captionSettings.margin_v / 1920) * 100)}%`,
+                      bottom: `${Math.min(40, (captionSettings.margin_v / Math.max(1, outputHeight)) * 100)}%`,
                       height: "10%",
                     }}
                   >
-                    Caption Safe Zone (1080×1920)
+                    Caption Safe Zone ({outputWidth}×{outputHeight})
                   </div>
                 </div>
               )}
@@ -603,7 +616,7 @@ export function CropCanvas({
           <div className="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-xl border border-zinc-700 bg-[#151821] shadow-2xl">
             <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5">
               <span className="text-sm font-semibold text-zinc-100">
-                Full-Res Segment Preview (1080×1920)
+                Full-Res Segment Preview ({outputWidth}×{outputHeight})
               </span>
               <button
                 type="button"

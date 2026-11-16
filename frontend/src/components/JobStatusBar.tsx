@@ -3,12 +3,18 @@ import type { JobState } from "../types/studio";
 
 interface JobStatusBarProps {
   activeJob: JobState | null;
+  outputWidth?: number;
+  outputHeight?: number;
+  outputFps?: number;
   onCancel: (jobId: string) => void;
   onDismiss: () => void;
 }
 
 export function JobStatusBar({
   activeJob,
+  outputWidth = 1080,
+  outputHeight = 1920,
+  outputFps = 30,
   onCancel,
   onDismiss,
 }: JobStatusBarProps) {
@@ -19,7 +25,9 @@ export function JobStatusBar({
           <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
           <span>Studio Ready — Local CPU Engine</span>
         </div>
-        <span className="text-zinc-500">1080×1920 • 30fps CFR • 48kHz AAC</span>
+        <span className="text-zinc-500">
+          {outputWidth}×{outputHeight} • {outputFps}fps CFR • 48kHz AAC
+        </span>
       </footer>
     );
   }

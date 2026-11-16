@@ -28,9 +28,20 @@ import type {
   SourceStatus,
 } from "./types/studio";
 import {
+  clampCropPosition,
   computeClientTtsSignature,
   computeDurationPlan,
+  computeIdealCrop,
+  formatAspectRatio,
 } from "./utils/studioMath";
+
+const OUTPUT_ASPECT_PRESETS = [
+  { label: "9:16 (1080×1920)", width: 1080, height: 1920 },
+  { label: "16:9 (1920×1080)", width: 1920, height: 1080 },
+  { label: "1:1 (1080×1080)", width: 1080, height: 1080 },
+  { label: "4:5 (1080×1350)", width: 1080, height: 1350 },
+  { label: "4:3 (1440×1080)", width: 1440, height: 1080 },
+] as const;
 
 export default function App() {
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
@@ -74,6 +85,7 @@ export default function App() {
 
   const [previewModalOpen, setPreviewModalOpen] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [customResolutionMode, setCustomResolutionMode] = useState(false);
 
   const projectRef = useRef<ProjectInput | null>(null);
   projectRef.current = project;
@@ -391,6 +403,45 @@ export default function App() {
     }
   };
 
+  // Output resolution / aspect ratio change (re-clamps existing keyframes)
+  const handleChangeOutputResolution = (rawW: number, rawH: number) => {
+    if (!project) return;
+    const nextW = Math.max(2, Math.round(rawW / 2) * 2);
+    const nextH = Math.max(2, Math.round(rawH / 2) * 2);
+    if (!Number.isFinite(nextW) || !Number.isFinite(nextH)) return;
+    const srcW = manifest?.source_metadata?.width ?? 1920;
+    const srcH = manifest?.source_metadata?.height ?? 1080;
+
+    handleUpdateProject((prev) => ({
+      ...prev,
+      output_settings: {
+        ...prev.output_settings,
+        width: nextW,
+        height: nextH,
+      },
+      segments: prev.segments.map((seg) => ({
+        ...seg,
+        crop_keyframes: seg.crop_keyframes.map((kf) => {
+          const clamped = clampCropPosition(
+            kf.x,
+            kf.y,
+            kf.zoom,
+            srcW,
+            srcH,
+            nextW,
+            nextH
+          );
+          return {
+            ...kf,
+            x: Number(clamped.x.toFixed(4)),
+            y: Number(clamped.y.toFixed(4)),
+            zoom: Number(clamped.zoom.toFixed(3)),
+          };
+        }),
+      })),
+    }));
+  };
+
   // Segment CRUD
   const handleAddSegment = (videoIn: number, videoOut: number) => {
     if (!project) return;
@@ -398,6 +449,17 @@ export default function App() {
     let n = project.segments.length + 1;
     while (existing.has(`seg_${String(n).padStart(2, "0")}`)) n += 1;
     const id = `seg_${String(n).padStart(2, "0")}`;
+    const srcW = manifest?.source_metadata?.width ?? 1920;
+    const srcH = manifest?.source_metadata?.height ?? 1080;
+    const ideal = computeIdealCrop(
+      srcW,
+      srcH,
+      1.0,
+      project.output_settings.width,
+      project.output_settings.height
+    );
+    const initialX = Number((ideal.maxNormX / 2).toFixed(4));
+    const initialY = Number((ideal.maxNormY / 2).toFixed(4));
     const newSeg: SegmentInput = {
       id,
       video_in: videoIn,
@@ -405,7 +467,7 @@ export default function App() {
       duration_mode: "preserve_video",
       source_audio_volume: project.output_settings.default_source_volume,
       speed: 1.0,
-      crop_keyframes: [{ t: 0.0, x: 0.28, y: 0.0, zoom: 1.0 }],
+      crop_keyframes: [{ t: 0.0, x: initialX, y: initialY, zoom: 1.0 }],
       clauses: [],
     };
     handleUpdateProject((prev) => ({
@@ -594,6 +656,83 @@ export default function App() {
         <div className="flex items-center gap-2">
           {project && (
             <>
+              <div className="flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-800/80 px-2 py-0.5 text-xs">
+                <span className="text-[11px] text-zinc-400">Output</span>
+                <select
+                  aria-label="Output Aspect Ratio"
+                  value={
+                    customResolutionMode
+                      ? "custom"
+                      : (OUTPUT_ASPECT_PRESETS.find(
+                          (p) =>
+                            p.width === project.output_settings.width &&
+                            p.height === project.output_settings.height
+                        )?.label ?? "custom")
+                  }
+                  onChange={(e) => {
+                    if (e.target.value === "custom") {
+                      setCustomResolutionMode(true);
+                      return;
+                    }
+                    const preset = OUTPUT_ASPECT_PRESETS.find(
+                      (p) => p.label === e.target.value
+                    );
+                    if (preset) {
+                      setCustomResolutionMode(false);
+                      handleChangeOutputResolution(preset.width, preset.height);
+                    }
+                  }}
+                  className="bg-transparent text-xs text-zinc-100 focus:outline-none"
+                >
+                  {OUTPUT_ASPECT_PRESETS.map((p) => (
+                    <option key={p.label} value={p.label} className="bg-zinc-900">
+                      {p.label}
+                    </option>
+                  ))}
+                  <option value="custom" className="bg-zinc-900">
+                    Custom ({project.output_settings.width}×{project.output_settings.height})
+                  </option>
+                </select>
+                {(customResolutionMode ||
+                  !OUTPUT_ASPECT_PRESETS.some(
+                    (p) =>
+                      p.width === project.output_settings.width &&
+                      p.height === project.output_settings.height
+                  )) && (
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="number"
+                      min={2}
+                      step={2}
+                      aria-label="Custom Output Width"
+                      value={project.output_settings.width}
+                      onChange={(e) =>
+                        handleChangeOutputResolution(
+                          Number(e.target.value) || 2,
+                          project.output_settings.height
+                        )
+                      }
+                      className="w-14 rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 font-mono text-[11px] text-zinc-100"
+                    />
+                    <span className="text-zinc-500">×</span>
+                    <input
+                      type="number"
+                      min={2}
+                      step={2}
+                      aria-label="Custom Output Height"
+                      value={project.output_settings.height}
+                      onChange={(e) =>
+                        handleChangeOutputResolution(
+                          project.output_settings.width,
+                          Number(e.target.value) || 2
+                        )
+                      }
+                      className="w-14 rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 font-mono text-[11px] text-zinc-100"
+                    />
+                  </div>
+                )}
+              </div>
+
               <span className="hidden sm:inline text-[11px] font-mono text-zinc-400">
                 rev {project.revision}
                 {dirty ? " • unsaved" : ""}
@@ -635,7 +774,7 @@ export default function App() {
                 className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Download className="h-3.5 w-3.5" />
-                Export 9:16 MP4
+                Export {formatAspectRatio(project.output_settings.width, project.output_settings.height)} MP4
               </button>
             </>
           )}
@@ -707,8 +846,8 @@ export default function App() {
               No Project Loaded
             </h1>
             <p className="max-w-md text-xs text-zinc-400">
-              Import a 16:9 Sims 4 gameplay recording to start slicing vertical
-              segments, animating 9:16 crop keyframes, and synthesizing offline
+              Import a gameplay recording of any aspect ratio to start slicing
+              segments, animating crop keyframes, and synthesizing offline
               Kokoro voiceovers.
             </p>
           </div>
@@ -730,6 +869,8 @@ export default function App() {
               segment={selectedSegment}
               manifest={manifest}
               captionSettings={project.caption_settings}
+              outputWidth={project.output_settings.width}
+              outputHeight={project.output_settings.height}
               tailPaddingSec={project.output_settings.tail_padding_sec}
               sourceTime={sourceTime}
               isPlaying={isPlaying}
@@ -796,6 +937,9 @@ export default function App() {
       {/* Bottom JobStatusBar */}
       <JobStatusBar
         activeJob={activeJob}
+        outputWidth={project?.output_settings.width}
+        outputHeight={project?.output_settings.height}
+        outputFps={project?.output_settings.fps}
         onCancel={handleCancelJob}
         onDismiss={() => setActiveJob(null)}
       />
@@ -811,7 +955,7 @@ export default function App() {
           <div className="w-full max-w-lg rounded-xl border border-zinc-700 bg-[#151821] p-5 shadow-2xl space-y-4">
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-zinc-100">
-                Create New Vertical Project
+                Create New Project
               </h2>
               <button
                 type="button"
@@ -828,7 +972,7 @@ export default function App() {
             <div className="space-y-3 text-xs">
               <div className="space-y-1.5">
                 <span className="block font-medium text-zinc-300">
-                  1. Select 16:9 Gameplay Recording
+                  1. Select Gameplay Recording
                 </span>
                 <input
                   ref={newProjectFileInputRef}
@@ -1008,7 +1152,7 @@ export default function App() {
           <div className="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-xl border border-zinc-700 bg-[#151821] shadow-2xl">
             <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5">
               <span className="text-sm font-semibold text-zinc-100">
-                Export Ready (1080×1920 MP4)
+                Export Ready ({project.output_settings.width}×{project.output_settings.height} MP4)
               </span>
               <button
                 type="button"

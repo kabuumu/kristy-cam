@@ -50,6 +50,13 @@ class OutputSettings(BaseModel):
     tail_padding_sec: float = Field(default=0.4, ge=0.0)
     inter_clause_pause_ms: int = Field(default=120, ge=0)
 
+    @field_validator("width", "height")
+    @classmethod
+    def _validate_even_dimension(cls, v: int, info: Any) -> int:
+        if v < 2 or v % 2 != 0:
+            raise ValueError(f"{info.field_name} must be an even integer >= 2, got {v}")
+        return v
+
     @field_validator("default_source_volume", "tail_padding_sec")
     @classmethod
     def _validate_finite_floats(cls, v: float, info: Any) -> float:

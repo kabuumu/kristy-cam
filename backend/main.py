@@ -710,7 +710,13 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
         for seg in project.segments:
             for idx, kf in enumerate(seg.crop_keyframes):
                 try:
-                    ideal_w, ideal_h = compute_ideal_crop_size(src_w, src_h, kf.zoom)
+                    ideal_w, ideal_h = compute_ideal_crop_size(
+                        src_w,
+                        src_h,
+                        kf.zoom,
+                        output_width=project.output_settings.width,
+                        output_height=project.output_settings.height,
+                    )
                 except GeometryValidationError as exc:
                     raise HTTPException(status_code=422, detail=str(exc)) from exc
                 max_x_norm = max(0.0, (float(src_w) - ideal_w) / float(src_w))
