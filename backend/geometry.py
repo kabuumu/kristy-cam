@@ -1,0 +1,251 @@
+"""Crop coordinate math, bounds clamping, keyframe interpolation, and FFmpeg filter builders."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Sequence
+
+from backend.schemas import CropKeyframe
+
+COORD_EPSILON = 1e-6
+
+
+class GeometryValidationError(ValueError):
+    """Raised when crop keyframes or geometry parameters violate bounds or ordering."""
+
+
+@dataclass(frozen=True)
+class CropBox:
+    """Evaluated pixel-space 9:16 crop box at a given timestamp."""
+
+    x_px: float
+    y_px: float
+    w_px: float
+    h_px: float
+    zoom: float
+
+    def even_size(self) -> tuple[int, int]:
+        """Return even integer (width, height) aligned for yuv420p chroma subsampling."""
+        return round_even(self.w_px), round_even(self.h_px)
+
+
+def round_even(value: float) -> int:
+    """Round a positive dimension to the nearest even integer >= 2."""
+    return max(2, int(round(value / 2.0)) * 2)
+
+
+def compute_ideal_crop_size(width: int, height: int, zoom: float) -> tuple[float, float]:
+    """Compute ideal (unrounded) 9:16 crop dimensions in source pixels for a given zoom."""
+    if width <= 0 or height <= 0:
+        raise GeometryValidationError(f"Source dimensions must be positive, got {width}x{height}")
+    if not math.isfinite(zoom) or zoom < 1.0 or zoom > 3.0:
+        raise GeometryValidationError(f"zoom must be finite and in [1.0, 3.0], got {zoom!r}")
+
+    base_crop_h = float(height)
+    base_crop_w = float(height) * 9.0 / 16.0
+    ideal_crop_h = base_crop_h / zoom
+    ideal_crop_w = base_crop_w / zoom
+    return ideal_crop_w, ideal_crop_h
+
+
+def clamp_normalized_coords(
+    x: float,
+    y: float,
+    zoom: float,
+    width: int,
+    height: int,
+) -> tuple[float, float]:
+    """Clamp normalized top-left (x, y) so the 9:16 crop box stays inside [0, W] x [0, H]."""
+    ideal_w, ideal_h = compute_ideal_crop_size(width, height, zoom)
+    max_x_px = max(0.0, float(width) - ideal_w)
+    max_y_px = max(0.0, float(height) - ideal_h)
+
+    x_px = min(max(float(x) * float(width), 0.0), max_x_px)
+    y_px = min(max(float(y) * float(height), 0.0), max_y_px)
+    return x_px / float(width), y_px / float(height)
+
+
+def validate_keyframes(
+    keyframes: Sequence[CropKeyframe],
+    duration: float,
+    width: int,
+    height: int,
+) -> None:
+    """Validate keyframe timestamps, zoom range, and persisted normalized top-left bounds."""
+    if not math.isfinite(duration) or duration <= 0.0:
+        raise GeometryValidationError(f"duration must be finite and > 0, got {duration!r}")
+    if width <= 0 or height <= 0:
+        raise GeometryValidationError(f"Source dimensions must be positive, got {width}x{height}")
+    if not keyframes:
+        raise GeometryValidationError("keyframes must be non-empty")
+
+    if not math.isfinite(keyframes[0].t) or keyframes[0].t != 0.0:
+        raise GeometryValidationError(
+            f"First keyframe must be at t == 0.0, got {keyframes[0].t!r}"
+        )
+
+    prev_t: float | None = None
+    for idx, kf in enumerate(keyframes):
+        if not math.isfinite(kf.t):
+            raise GeometryValidationError(f"Keyframe {idx} timestamp t is not finite: {kf.t!r}")
+        if prev_t is not None and kf.t <= prev_t:
+            raise GeometryValidationError(
+                f"Keyframe timestamps must be strictly increasing (index {idx}: {kf.t} <= {prev_t})"
+            )
+        if kf.t > duration + COORD_EPSILON:
+            raise GeometryValidationError(
+                f"Keyframe {idx} timestamp t={kf.t} exceeds segment duration {duration}"
+            )
+        prev_t = kf.t
+
+        if not (math.isfinite(kf.x) and math.isfinite(kf.y) and math.isfinite(kf.zoom)):
+            raise GeometryValidationError(f"Keyframe {idx} has non-finite coordinates or zoom")
+
+        ideal_w, ideal_h = compute_ideal_crop_size(width, height, kf.zoom)
+        max_x_norm = max(0.0, (float(width) - ideal_w) / float(width))
+        max_y_norm = max(0.0, (float(height) - ideal_h) / float(height))
+
+        if kf.x < -COORD_EPSILON or kf.x > max_x_norm + COORD_EPSILON:
+            raise GeometryValidationError(
+                f"Keyframe {idx} x={kf.x} out of bounds [0.0, {max_x_norm:.6f}] for zoom={kf.zoom}"
+            )
+        if kf.y < -COORD_EPSILON or kf.y > max_y_norm + COORD_EPSILON:
+            raise GeometryValidationError(
+                f"Keyframe {idx} y={kf.y} out of bounds [0.0, {max_y_norm:.6f}] for zoom={kf.zoom}"
+            )
+
+
+def evaluate_crop_at(
+    keyframes: Sequence[CropKeyframe],
+    t: float,
+    width: int,
+    height: int,
+) -> CropBox:
+    """Linearly interpolate (x, y, zoom) at timestamp t, clamping t <= 0 and holding final keyframe."""
+    if not keyframes:
+        raise GeometryValidationError("keyframes must be non-empty")
+    if width <= 0 or height <= 0:
+        raise GeometryValidationError(f"Source dimensions must be positive, got {width}x{height}")
+
+    if t <= keyframes[0].t:
+        x_norm, y_norm, zoom = keyframes[0].x, keyframes[0].y, keyframes[0].zoom
+    elif t >= keyframes[-1].t:
+        x_norm, y_norm, zoom = keyframes[-1].x, keyframes[-1].y, keyframes[-1].zoom
+    else:
+        x_norm, y_norm, zoom = keyframes[-1].x, keyframes[-1].y, keyframes[-1].zoom
+        for idx in range(len(keyframes) - 1):
+            k0 = keyframes[idx]
+            k1 = keyframes[idx + 1]
+            if k0.t <= t <= k1.t:
+                dt = k1.t - k0.t
+                alpha = 0.0 if dt <= 0.0 else (t - k0.t) / dt
+                x_norm = k0.x + (k1.x - k0.x) * alpha
+                y_norm = k0.y + (k1.y - k0.y) * alpha
+                zoom = k0.zoom + (k1.zoom - k0.zoom) * alpha
+                break
+
+    ideal_w, ideal_h = compute_ideal_crop_size(width, height, zoom)
+    max_x_px = max(0.0, float(width) - ideal_w)
+    max_y_px = max(0.0, float(height) - ideal_h)
+
+    x_px = min(max(x_norm * float(width), 0.0), max_x_px)
+    y_px = min(max(y_norm * float(height), 0.0), max_y_px)
+    return CropBox(x_px=x_px, y_px=y_px, w_px=ideal_w, h_px=ideal_h, zoom=zoom)
+
+
+def detect_trim_out_of_range(
+    keyframes: Sequence[CropKeyframe],
+    new_duration: float,
+) -> list[int]:
+    """Return indices of keyframes whose timestamps exceed new_duration (never silently discarding)."""
+    return [idx for idx, kf in enumerate(keyframes) if kf.t > new_duration]
+
+
+def _piecewise_linear_expr(
+    times: Sequence[float],
+    values: Sequence[float],
+    time_var: str = "t",
+) -> str:
+    """Build a nested FFmpeg piecewise-linear expression over `time_var` with final hold."""
+    if len(values) == 1:
+        return f"{values[0]:.6f}"
+
+    expr = f"{values[-1]:.6f}"
+    for idx in range(len(values) - 2, -1, -1):
+        t0 = times[idx]
+        t1 = times[idx + 1]
+        v0 = values[idx]
+        v1 = values[idx + 1]
+        dt = t1 - t0
+        if dt <= 0.0:
+            seg_expr = f"{v0:.6f}"
+        elif abs(v1 - v0) < 1e-12:
+            seg_expr = f"{v0:.6f}"
+        else:
+            dv = v1 - v0
+            seg_expr = f"({v0:.6f}+({dv:.6f})*({time_var}-{t0:.6f})/{dt:.6f})"
+        expr = f"if(lt({time_var},{t1:.6f}),{seg_expr},{expr})"
+
+    return expr
+
+
+def build_crop_filter(
+    keyframes: Sequence[CropKeyframe],
+    width: int,
+    height: int,
+    duration: float,
+    fps: int = 30,
+) -> str:
+    """Build an FFmpeg video filtergraph string for static or animated 9:16 crop/zoom."""
+    validate_keyframes(keyframes, duration=duration, width=width, height=height)
+    if fps <= 0:
+        raise GeometryValidationError(f"fps must be positive, got {fps}")
+
+    constant_zoom = all(abs(kf.zoom - keyframes[0].zoom) < 1e-9 for kf in keyframes)
+
+    if constant_zoom:
+        zoom = keyframes[0].zoom
+        ideal_w, ideal_h = compute_ideal_crop_size(width, height, zoom)
+        crop_w = round_even(ideal_w)
+        crop_h = round_even(ideal_h)
+        max_x = max(0.0, float(width - crop_w))
+        max_y = max(0.0, float(height - crop_h))
+
+        times = [kf.t for kf in keyframes]
+        xs = [min(max(kf.x * float(width), 0.0), max_x) for kf in keyframes]
+        ys = [min(max(kf.y * float(height), 0.0), max_y) for kf in keyframes]
+
+        if len(keyframes) == 1:
+            crop_part = f"crop=w={crop_w}:h={crop_h}:x={xs[0]:.4f}:y={ys[0]:.4f}"
+        else:
+            x_expr = f"clip({_piecewise_linear_expr(times, xs, 't')},0,{max_x:.4f})"
+            y_expr = f"clip({_piecewise_linear_expr(times, ys, 't')},0,{max_y:.4f})"
+            crop_part = f"crop=w={crop_w}:h={crop_h}:x='{x_expr}':y='{y_expr}'"
+
+        return f"{crop_part},scale=1080:1920:flags=lanczos,setsar=1,fps={fps}"
+
+    # Animated zoom: pad to 9:16 aspect canvas so zoompan preserves 9:16 with zero aspect distortion
+    # while allowing full horizontal and vertical panning across the (W, H) source frame.
+    pad_w = round_even(float(width))
+    pad_h = round_even(float(width) * 16.0 / 9.0)
+    base_crop_w = float(height) * 9.0 / 16.0
+    zoom_scale = float(pad_w) / base_crop_w
+
+    times = [kf.t for kf in keyframes]
+    zooms = [kf.zoom for kf in keyframes]
+    xs = [kf.x * float(width) for kf in keyframes]
+    ys = [kf.y * float(height) for kf in keyframes]
+
+    z_expr = f"({zoom_scale:.8f})*({_piecewise_linear_expr(times, zooms, 'it')})"
+    x_raw = _piecewise_linear_expr(times, xs, "it")
+    y_raw = _piecewise_linear_expr(times, ys, "it")
+    x_expr = f"clip({x_raw},0,max(0,{width}-iw/zoom))"
+    y_expr = f"clip({y_raw},0,max(0,{height}-ih/zoom))"
+
+    return (
+        f"fps={fps},"
+        f"pad=w={pad_w}:h={pad_h}:x=0:y=0:color=black,"
+        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1:fps={fps}:s=1080x1920,"
+        f"setsar=1"
+    )

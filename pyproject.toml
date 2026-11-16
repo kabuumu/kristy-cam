@@ -1,0 +1,31 @@
+[project]
+name = "sims-vertical-studio"
+version = "0.1.0"
+description = "Local-first Sims 4 9:16 vertical video studio"
+requires-python = "==3.12.*"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "kokoro-onnx>=0.6.1",
+    "onnxruntime>=1.20.1",
+    "espeakng-loader>=0.2.4",
+    "phonemizer>=3.4.0",
+    "soundfile>=0.12.1",
+    "numpy>=2.0.2",
+    "static-ffmpeg==3.0",
+    "httpx>=0.28.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[tool.uv]
+package = false
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]

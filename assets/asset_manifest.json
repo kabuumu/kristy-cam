@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "version": "1.0.0",
+  "runtime_binaries": {
+    "provider": "static-ffmpeg",
+    "version": "3.0",
+    "binaries": [
+      "ffmpeg",
+      "ffprobe"
+    ],
+    "required_encoders": [
+      "libx264",
+      "aac"
+    ],
+    "required_filters": [
+      "ass",
+      "subtitles"
+    ],
+    "platforms": [
+      "linux-x86_64",
+      "darwin-arm64",
+      "win32-AMD64"
+    ]
+  },
+  "models": {
+    "kokoro-v1.0.onnx": {
+      "url": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx",
+      "size_bytes": 325532387,
+      "sha256": "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5"
+    },
+    "voices-v1.0.bin": {
+      "url": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
+      "size_bytes": 28214398,
+      "sha256": "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d"
+    }
+  },
+  "bundled_fonts": {
+    "Montserrat-ExtraBold.ttf": {
+      "path": "assets/fonts/Montserrat-ExtraBold.ttf",
+      "size_bytes": 455468,
+      "sha256": "d3ac6a843d3ba6d5cafd44cf39e437055c8aed7e261010f595f57d3c7b3e2c1b",
+      "license": "SIL OFL 1.1"
+    },
+    "OFL.txt": {
+      "path": "assets/fonts/OFL.txt",
+      "size_bytes": 4400,
+      "sha256": "8b7141c03fa4f8d44e6345d5d4931709290f0f67875e452e95ac1fd3a027802e",
+      "license": "SIL OFL 1.1"
+    }
+  }
+}

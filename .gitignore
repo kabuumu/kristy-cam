@@ -1,0 +1,9 @@
+.venv/
+frontend/node_modules/
+/dist/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.agents/
+.DS_Store
+*.log

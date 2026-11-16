@@ -1,0 +1,1235 @@
+"""FastAPI loopback server, security middleware, REST endpoints, Range streaming, and static UI."""
+
+from __future__ import annotations
+
+import hmac
+import html
+import json
+import re
+import secrets
+import shutil
+import threading
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from email.parser import BytesParser
+from email.policy import default as default_email_policy
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
+
+from backend.bootstrap import REPO_ROOT, get_data_dir, is_offline_env, verify_ffmpeg, verify_font
+from backend.geometry import COORD_EPSILON, GeometryValidationError, compute_ideal_crop_size
+from backend.jobs import JobCancelledError, JobContext, JobManager
+from backend.media import (
+    MediaSelectionCancelled,
+    MediaValidationError,
+    import_uploaded_media,
+    probe_and_validate_media,
+    select_media_native,
+)
+from backend.proxy import generate_proxy
+from backend.renderer import (
+    RenderCancelledError,
+    RenderError,
+    compute_render_hash,
+    render_final_export,
+    render_segment_preview,
+    render_segment_stage1,
+)
+from backend.schemas import (
+    ArtifactManifest,
+    ProjectInput,
+    ProxyState,
+    SegmentArtifactState,
+    SourceMediaRef,
+    SourceMetadata,
+)
+from backend.storage import (
+    ProjectNotFoundError,
+    RevisionConflictError,
+    StorageError,
+    UnsupportedSchemaVersionError,
+    check_source_media,
+    compute_file_fingerprint,
+    create_project,
+    get_project_dir,
+    load_global_pronunciations,
+    load_manifest,
+    load_project,
+    relink_source_media,
+    save_global_pronunciations,
+    save_manifest,
+    save_project,
+)
+from backend.tts import compute_tts_hash, list_voices, synthesize_segment_tts
+
+APP_VERSION = "0.1.0"
+ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "testserver"})
+ALLOWED_ORIGINS = frozenset({"127.0.0.1", "localhost"})
+MUTATING_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+FRONTEND_DIST_DIR = REPO_ROOT / "frontend" / "dist"
+STREAM_CHUNK_SIZE = 64 * 1024
+
+_STATE_INIT_LOCK = threading.Lock()
+
+
+def _extract_hostname(host_header: str) -> str:
+    val = host_header.strip().lower()
+    if not val:
+        return ""
+    if val.startswith("["):
+        end = val.find("]")
+        if end == -1:
+            return ""
+        return val[1:end]
+    if ":" in val:
+        return val.split(":", 1)[0]
+    return val
+
+
+def _ensure_state_initialized(target_app: FastAPI) -> None:
+    with _STATE_INIT_LOCK:
+        if not hasattr(target_app.state, "data_dir") or target_app.state.data_dir is None:
+            target_app.state.data_dir = get_data_dir()
+        if not hasattr(target_app.state, "session_token") or not target_app.state.session_token:
+            target_app.state.session_token = secrets.token_urlsafe(32)
+        if not hasattr(target_app.state, "media_registry") or target_app.state.media_registry is None:
+            target_app.state.media_registry = {}
+        if not hasattr(target_app.state, "manifest_locks_guard") or target_app.state.manifest_locks_guard is None:
+            target_app.state.manifest_locks_guard = threading.Lock()
+        if not hasattr(target_app.state, "manifest_locks") or target_app.state.manifest_locks is None:
+            target_app.state.manifest_locks = {}
+        if not hasattr(target_app.state, "job_manager") or target_app.state.job_manager is None:
+            jm = JobManager(data_dir=target_app.state.data_dir)
+            jm.recover_on_startup()
+            target_app.state.job_manager = jm
+
+
+def _get_data_dir(request: Request) -> Path:
+    _ensure_state_initialized(request.app)
+    return Path(request.app.state.data_dir)
+
+
+def _get_job_manager(request: Request) -> JobManager:
+    _ensure_state_initialized(request.app)
+    return request.app.state.job_manager
+
+
+def _get_manifest_lock(target_app: FastAPI, project_id: str) -> threading.Lock:
+    _ensure_state_initialized(target_app)
+    with target_app.state.manifest_locks_guard:
+        lock = target_app.state.manifest_locks.get(project_id)
+        if lock is None:
+            lock = threading.Lock()
+            target_app.state.manifest_locks[project_id] = lock
+        return lock
+
+
+@asynccontextmanager
+async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
+    """Initialize data dir, recover interrupted jobs, generate session token, and shut down cleanly."""
+    data_dir = get_data_dir()
+    job_manager = JobManager(data_dir=data_dir)
+    job_manager.recover_on_startup()
+
+    target_app.state.data_dir = data_dir
+    target_app.state.job_manager = job_manager
+    target_app.state.session_token = secrets.token_urlsafe(32)
+    target_app.state.media_registry = {}
+    target_app.state.manifest_locks_guard = threading.Lock()
+    target_app.state.manifest_locks = {}
+    try:
+        yield
+    finally:
+        job_manager.shutdown(wait=False)
+
+
+app = FastAPI(title="Sims 4 Vertical Video Studio", lifespan=lifespan)
+app.state.session_token = secrets.token_urlsafe(32)
+app.state.media_registry = {}
+
+
+@app.middleware("http")
+async def loopback_security_middleware(request: Request, call_next: Any) -> Response:
+    """Enforce loopback Host/Origin checks and X-Session-Token on mutating endpoints."""
+    _ensure_state_initialized(request.app)
+
+    host_header = request.headers.get("host", "")
+    hostname = _extract_hostname(host_header)
+    if hostname not in ALLOWED_HOSTS:
+        return JSONResponse(status_code=403, content={"detail": "Forbidden Host header"})
+
+    origin_header = request.headers.get("origin")
+    if origin_header is not None and origin_header.strip():
+        parsed = urlparse(origin_header.strip())
+        origin_host = (parsed.hostname or "").lower()
+        origin_scheme = (parsed.scheme or "").lower()
+        if origin_host not in ALLOWED_ORIGINS or (origin_scheme and origin_scheme not in {"http", "https"}):
+            return JSONResponse(status_code=403, content={"detail": "Forbidden Origin header"})
+
+    if request.method.upper() in MUTATING_METHODS:
+        provided_token = request.headers.get("x-session-token")
+        expected_token: str = request.app.state.session_token
+        if not provided_token:
+            return JSONResponse(status_code=401, content={"detail": "Missing X-Session-Token header"})
+        if not hmac.compare_digest(provided_token, expected_token):
+            return JSONResponse(status_code=403, content={"detail": "Invalid X-Session-Token header"})
+
+    return await call_next(request)
+
+
+def _validate_manual_media_path(raw_path: Any) -> Path:
+    if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
+        raise MediaValidationError("Media path must be a non-empty string.")
+    candidate = Path(raw_path.strip())
+    if not candidate.is_absolute():
+        raise MediaValidationError(f"Media path must be absolute: {raw_path!r}")
+    if ".." in candidate.parts:
+        raise MediaValidationError(f"Media path must not contain '..': {raw_path!r}")
+    return candidate
+
+
+def _parse_multipart_file(content_type: str, body: bytes) -> tuple[str, bytes]:
+    header_block = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("latin-1")
+    msg = BytesParser(policy=default_email_policy).parsebytes(header_block + body)
+    if not msg.is_multipart():
+        raise MediaValidationError("Invalid multipart/form-data payload.")
+    for part in msg.iter_parts():
+        disp_name = part.get_param("name", header="content-disposition")
+        filename = part.get_filename()
+        if disp_name == "file" or filename:
+            if not filename:
+                raise MediaValidationError("Uploaded multipart part is missing a filename.")
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                raw = part.get_payload(decode=False)
+                payload = raw.encode("utf-8") if isinstance(raw, str) else b""
+            return filename, payload
+    raise MediaValidationError("No file field found in multipart/form-data request.")
+
+
+def _validate_relative_artifact_path(project_dir: Path, rel_path: str) -> Path:
+    if not rel_path or "\x00" in rel_path:
+        raise HTTPException(status_code=403, detail="Invalid artifact path")
+    candidate_rel = Path(rel_path)
+    if candidate_rel.is_absolute() or ".." in candidate_rel.parts:
+        raise HTTPException(status_code=403, detail="Path traversal rejected")
+    project_root = project_dir.resolve()
+    resolved = (project_root / candidate_rel).resolve()
+    if not resolved.is_relative_to(project_root):
+        raise HTTPException(status_code=403, detail="Artifact path escapes project directory")
+    return resolved
+
+
+def _resolve_artifact_path(manifest: ArtifactManifest, project_dir: Path, artifact_id: str) -> Path | None:
+    rel_path: str | None = None
+    if artifact_id == "art_proxy" or manifest.proxy.artifact_id == artifact_id:
+        rel_path = manifest.proxy.path
+    elif manifest.latest_export_artifact_id == artifact_id:
+        rel_path = manifest.latest_export_path
+    else:
+        for seg_state in manifest.segments.values():
+            if seg_state.audio_artifact_id == artifact_id:
+                rel_path = seg_state.audio_path
+                break
+            if seg_state.segment_artifact_id == artifact_id:
+                rel_path = seg_state.rendered_segment_path
+                break
+            if seg_state.preview_artifact_id == artifact_id:
+                rel_path = seg_state.preview_path
+                break
+
+    if not rel_path:
+        return None
+    return _validate_relative_artifact_path(project_dir, rel_path)
+
+
+def _parse_byte_range(range_header: str, file_size: int) -> tuple[int, int] | None:
+    """Parse HTTP Range: bytes=... header. Returns (start, end) inclusive, or None if invalid/unsatisfiable."""
+    if file_size <= 0:
+        return None
+    raw = range_header.strip()
+    if not raw.lower().startswith("bytes="):
+        return None
+    spec = raw[6:].strip()
+    if not spec or "," in spec or "-" not in spec:
+        return None
+
+    start_str, end_str = spec.split("-", 1)
+    start_str = start_str.strip()
+    end_str = end_str.strip()
+
+    if not start_str and not end_str:
+        return None
+
+    try:
+        if not start_str:
+            suffix_len = int(end_str)
+            if suffix_len <= 0:
+                return None
+            start = max(0, file_size - suffix_len)
+            end = file_size - 1
+            return start, end
+
+        start = int(start_str)
+        if start < 0 or start >= file_size:
+            return None
+
+        if not end_str:
+            end = file_size - 1
+        else:
+            end = int(end_str)
+            if end < start:
+                return None
+            end = min(end, file_size - 1)
+        return start, end
+    except ValueError:
+        return None
+
+
+def _iter_file_range(path: Path, start: int, end: int) -> Iterator[bytes]:
+    remaining = end - start + 1
+    with path.open("rb") as f:
+        f.seek(start)
+        while remaining > 0:
+            chunk = f.read(min(STREAM_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+def _media_content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".mp4":
+        return "video/mp4"
+    if suffix == ".wav":
+        return "audio/wav"
+    return "application/octet-stream"
+
+
+def _ensure_segment_tts(
+    target_app: FastAPI,
+    project: ProjectInput,
+    seg_id: str,
+    project_dir: Path,
+    data_dir: Path,
+    manifest: ArtifactManifest,
+) -> SegmentArtifactState:
+    segment = next((s for s in project.segments if s.id == seg_id), None)
+    if segment is None:
+        raise ValueError(f"Segment {seg_id!r} not found")
+
+    expected_hash = compute_tts_hash(
+        segment=segment,
+        pronunciations=project.pronunciations,
+        voice=project.voice,
+        language=project.language,
+        inter_clause_pause_ms=project.output_settings.inter_clause_pause_ms,
+    )
+
+    existing = manifest.segments.get(seg_id)
+    if existing is not None and existing.tts_hash == expected_hash:
+        if not segment.clauses:
+            return existing
+        if existing.audio_path:
+            audio_abs = project_dir / existing.audio_path
+            if audio_abs.is_file():
+                return existing
+
+    res = synthesize_segment_tts(
+        segment=segment,
+        pronunciations=project.pronunciations,
+        voice=project.voice,
+        language=project.language,
+        inter_clause_pause_ms=project.output_settings.inter_clause_pause_ms,
+        output_dir=project_dir / "artifacts",
+    )
+
+    rel_audio = res.audio_path.relative_to(project_dir).as_posix() if res.audio_path is not None else None
+    audio_art_id = f"art_tts_{seg_id}" if res.audio_path is not None else None
+
+    lock = _get_manifest_lock(target_app, project.project_id)
+    with lock:
+        latest_manifest = load_manifest(project.project_id, data_dir=data_dir)
+        seg_state = latest_manifest.segments.get(seg_id, SegmentArtifactState())
+        seg_state.tts_hash = res.tts_hash
+        seg_state.audio_artifact_id = audio_art_id
+        seg_state.audio_path = rel_audio
+        seg_state.sample_rate = res.sample_rate
+        seg_state.total_samples = res.total_samples
+        seg_state.audio_duration = res.audio_duration
+        seg_state.clause_timings = list(res.clause_timings)
+        latest_manifest.segments[seg_id] = seg_state
+        save_manifest(latest_manifest, data_dir=data_dir)
+
+    manifest.segments[seg_id] = seg_state.model_copy(deep=True)
+    return seg_state
+
+
+# --- REST Endpoints (F37) ---
+
+
+@app.get("/api/health")
+def api_health() -> dict[str, str]:
+    """Liveness and app identity check."""
+    return {"status": "ok", "app": "sims-vertical-studio", "version": APP_VERSION}
+
+
+@app.get("/api/capabilities")
+def api_capabilities(request: Request) -> dict[str, Any]:
+    """Return FFmpeg, libass, font, and Kokoro readiness plus available voices."""
+    data_dir = _get_data_dir(request)
+    offline = is_offline_env()
+    errors: list[str] = []
+
+    ffmpeg_ready = False
+    libass_ready = False
+    try:
+        verify_ffmpeg(data_dir=data_dir, offline=offline)
+        ffmpeg_ready = True
+        libass_ready = True
+    except Exception as exc:
+        errors.append(f"ffmpeg: {exc}")
+
+    font_ready = False
+    try:
+        verify_font()
+        font_ready = True
+    except Exception as exc:
+        errors.append(f"font: {exc}")
+
+    kokoro_ready = False
+    voices: list[str] = []
+    try:
+        voices = list_voices(data_dir=data_dir, offline=offline)
+        kokoro_ready = True
+    except Exception as exc:
+        errors.append(f"kokoro: {exc}")
+
+    return {
+        "ffmpeg_ready": ffmpeg_ready,
+        "libass_ready": libass_ready,
+        "kokoro_ready": kokoro_ready,
+        "ffmpeg_ok": ffmpeg_ready,
+        "libass_ok": libass_ready,
+        "kokoro_ok": kokoro_ready,
+        "font_ready": font_ready,
+        "voices": voices,
+        "errors": errors,
+    }
+
+
+@app.post("/api/media/select")
+async def api_media_select(request: Request) -> dict[str, Any]:
+    """Select and validate source media via JSON path, multipart upload, or native OS picker."""
+    data_dir = _get_data_dir(request)
+    content_type = request.headers.get("content-type", "")
+    raw_body = await request.body()
+
+    try:
+        if "multipart/form-data" in content_type.lower():
+            filename, file_bytes = _parse_multipart_file(content_type, raw_body)
+            media_path = import_uploaded_media(filename, file_bytes, data_dir / "uploads")
+        elif raw_body.strip():
+            try:
+                payload = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+            if payload.get("path") is not None:
+                media_path = _validate_manual_media_path(payload["path"])
+            else:
+                selected = select_media_native()
+                if selected is None:
+                    raise MediaSelectionCancelled("Media selection cancelled by user")
+                media_path = selected
+        else:
+            selected = select_media_native()
+            if selected is None:
+                raise MediaSelectionCancelled("Media selection cancelled by user")
+            media_path = selected
+
+        metadata = probe_and_validate_media(media_path, data_dir=data_dir)
+        resolved_path = media_path.resolve()
+        fingerprint = compute_file_fingerprint(resolved_path)
+    except MediaValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except MediaSelectionCancelled as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    media_id = f"src_{uuid.uuid4().hex[:8]}"
+    meta_dict = metadata.model_dump(mode="json")
+    entry = {
+        "media_id": media_id,
+        "path": str(resolved_path),
+        "fingerprint": fingerprint,
+        "metadata": meta_dict,
+    }
+    request.app.state.media_registry[media_id] = entry
+    return entry
+
+
+@app.get("/api/projects")
+def api_list_projects(request: Request) -> dict[str, list[dict[str, Any]]]:
+    """Scan data_dir/projects for valid project.json files."""
+    data_dir = _get_data_dir(request)
+    projects_root = data_dir / "projects"
+    items: list[dict[str, Any]] = []
+    if projects_root.is_dir():
+        for entry in projects_root.iterdir():
+            if not entry.is_dir():
+                continue
+            try:
+                proj = load_project(entry.name, data_dir=data_dir)
+            except Exception:
+                continue
+            items.append(
+                {
+                    "project_id": proj.project_id,
+                    "title": proj.title,
+                    "revision": proj.revision,
+                    "updated_at": proj.updated_at,
+                    "segment_count": len(proj.segments),
+                }
+            )
+    items.sort(key=lambda p: p["updated_at"], reverse=True)
+    return {"projects": items}
+
+
+@app.post("/api/projects")
+async def api_create_project(request: Request) -> JSONResponse:
+    """Create a new project from a registered media_id and enqueue proxy generation (202)."""
+    data_dir = _get_data_dir(request)
+    job_manager = _get_job_manager(request)
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+
+    title = payload.get("title")
+    media_id = payload.get("media_id")
+    if not isinstance(title, str) or not title.strip():
+        raise HTTPException(status_code=422, detail="'title' must be a non-empty string")
+    if not isinstance(media_id, str) or not media_id.strip():
+        raise HTTPException(status_code=422, detail="'media_id' must be a non-empty string")
+
+    media_entry = request.app.state.media_registry.get(media_id)
+    if media_entry is None:
+        raise HTTPException(status_code=404, detail=f"Registered media_id {media_id!r} not found")
+
+    project_id = payload.get("project_id") or f"proj_{uuid.uuid4().hex[:8]}"
+    if not isinstance(project_id, str):
+        raise HTTPException(status_code=422, detail="'project_id' must be a string")
+
+    voice = payload.get("voice") or "bf_emma"
+    language = payload.get("language") or "en-gb"
+    copy_source = bool(payload.get("copy_source", payload.get("copy_to_project", False)))
+
+    try:
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except StorageError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    src_path = Path(media_entry["path"])
+    final_src_path = src_path
+    fingerprint = media_entry["fingerprint"]
+    copied = False
+    if copy_source:
+        source_dir = project_dir / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = (source_dir / src_path.name).resolve()
+        if dest_path != src_path.resolve():
+            shutil.copy2(src_path, dest_path)
+        final_src_path = dest_path
+        fingerprint = compute_file_fingerprint(final_src_path)
+        copied = True
+
+    source_ref = SourceMediaRef(
+        media_id=media_id,
+        path=str(final_src_path),
+        fingerprint=fingerprint,
+        copied_to_project=copied,
+    )
+
+    try:
+        project = create_project(
+            project_id=project_id,
+            title=title.strip(),
+            source_media=source_ref,
+            voice=str(voice),
+            language=str(language),
+            data_dir=data_dir,
+        )
+    except StorageError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=json.loads(exc.json())) from exc
+
+    source_meta = SourceMetadata.model_validate(media_entry["metadata"])
+    manifest_lock = _get_manifest_lock(request.app, project_id)
+    with manifest_lock:
+        manifest = load_manifest(project_id, data_dir=data_dir)
+        manifest.source_metadata = source_meta
+        manifest.proxy = ProxyState(status="pending")
+        save_manifest(manifest, data_dir=data_dir)
+
+    proxy_output = project_dir / "artifacts" / "proxy.mp4"
+    target_app = request.app
+
+    def _proxy_worker(ctx: JobContext) -> dict[str, Any]:
+        with manifest_lock:
+            m = load_manifest(project_id, data_dir=data_dir)
+            m.proxy = ProxyState(status="running")
+            save_manifest(m, data_dir=data_dir)
+        try:
+            generate_proxy(
+                source_path=final_src_path,
+                output_path=proxy_output,
+                project_id=None,
+                source_duration=source_meta.duration,
+                data_dir=data_dir,
+                on_progress=ctx.update_progress,
+                on_process_start=ctx.register_process,
+                cancel_event=ctx.cancel_event,
+            )
+        except JobCancelledError:
+            raise
+        except Exception as exc:
+            with manifest_lock:
+                m = load_manifest(project_id, data_dir=data_dir)
+                m.proxy = ProxyState(status="failed", artifact_id=None, path=None, error=str(exc))
+                save_manifest(m, data_dir=data_dir)
+            raise
+
+        with manifest_lock:
+            m = load_manifest(project_id, data_dir=data_dir)
+            m.proxy = ProxyState(
+                status="ready",
+                artifact_id="art_proxy",
+                path="artifacts/proxy.mp4",
+                error=None,
+            )
+            save_manifest(m, data_dir=data_dir)
+
+        _ = target_app
+        return {"artifact_id": "art_proxy", "path": "artifacts/proxy.mp4"}
+
+    job = job_manager.submit_job(project_id, "proxy", _proxy_worker)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job.job_id,
+            "project": project.model_dump(mode="json"),
+            "manifest": manifest.model_dump(mode="json"),
+        },
+    )
+
+
+@app.get("/api/projects/{project_id}")
+def api_get_project(project_id: str, request: Request) -> dict[str, Any]:
+    """Load project.json, manifest.json, and source media status."""
+    data_dir = _get_data_dir(request)
+    try:
+        project = load_project(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    manifest = load_manifest(project_id, data_dir=data_dir)
+    source_status = check_source_media(project.source_media)
+    return {
+        "project": project.model_dump(mode="json"),
+        "manifest": manifest.model_dump(mode="json"),
+        "source_status": source_status,
+    }
+
+
+@app.put("/api/projects/{project_id}")
+async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
+    """Validate and atomically persist ProjectInput with optimistic revision locking."""
+    data_dir = _get_data_dir(request)
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+
+    expected_rev_param = request.query_params.get("expected_revision")
+    if "project" in payload and isinstance(payload["project"], dict):
+        project_dict = dict(payload["project"])
+        raw_expected = payload.get("expected_revision", expected_rev_param)
+    else:
+        project_dict = dict(payload)
+        raw_expected = project_dict.pop("expected_revision", expected_rev_param)
+
+    if raw_expected is None or isinstance(raw_expected, bool):
+        raise HTTPException(status_code=422, detail="expected_revision is required")
+    try:
+        expected_revision = int(raw_expected)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="expected_revision must be an integer") from exc
+
+    try:
+        project = ProjectInput.model_validate(project_dict)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=json.loads(exc.json())) from exc
+
+    if project.project_id != project_id:
+        raise HTTPException(status_code=422, detail="project_id in body does not match URL path")
+
+    try:
+        manifest = load_manifest(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if manifest.source_metadata is not None:
+        src_w = manifest.source_metadata.width
+        src_h = manifest.source_metadata.height
+        for seg in project.segments:
+            for idx, kf in enumerate(seg.crop_keyframes):
+                try:
+                    ideal_w, ideal_h = compute_ideal_crop_size(src_w, src_h, kf.zoom)
+                except GeometryValidationError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                max_x_norm = max(0.0, (float(src_w) - ideal_w) / float(src_w))
+                max_y_norm = max(0.0, (float(src_h) - ideal_h) / float(src_h))
+                if kf.x < -COORD_EPSILON or kf.x > max_x_norm + COORD_EPSILON:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Segment {seg.id!r} keyframe {idx} x={kf.x} out of bounds "
+                            f"[0.0, {max_x_norm:.6f}] for zoom={kf.zoom}"
+                        ),
+                    )
+                if kf.y < -COORD_EPSILON or kf.y > max_y_norm + COORD_EPSILON:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Segment {seg.id!r} keyframe {idx} y={kf.y} out of bounds "
+                            f"[0.0, {max_y_norm:.6f}] for zoom={kf.zoom}"
+                        ),
+                    )
+
+    try:
+        saved = save_project(project, expected_revision=expected_revision, data_dir=data_dir)
+    except RevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    manifest = load_manifest(project_id, data_dir=data_dir)
+    return {
+        "project": saved.model_dump(mode="json"),
+        "manifest": manifest.model_dump(mode="json"),
+    }
+
+
+@app.post("/api/projects/{project_id}/source/relink")
+async def api_relink_source(project_id: str, request: Request) -> dict[str, Any]:
+    """Validate and rebind a project's source recording."""
+    data_dir = _get_data_dir(request)
+    try:
+        load_project(project_id, data_dir=data_dir)
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    content_type = request.headers.get("content-type", "")
+    raw_body = await request.body()
+    copy_to_project = False
+
+    try:
+        if "multipart/form-data" in content_type.lower():
+            filename, file_bytes = _parse_multipart_file(content_type, raw_body)
+            media_path = import_uploaded_media(filename, file_bytes, project_dir / "source")
+        elif raw_body.strip():
+            try:
+                payload = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+            copy_to_project = bool(payload.get("copy_to_project", False))
+            if payload.get("path") is not None:
+                media_path = _validate_manual_media_path(payload["path"])
+            else:
+                selected = select_media_native()
+                if selected is None:
+                    raise MediaSelectionCancelled("Media selection cancelled by user")
+                media_path = selected
+        else:
+            selected = select_media_native()
+            if selected is None:
+                raise MediaSelectionCancelled("Media selection cancelled by user")
+            media_path = selected
+
+        source_meta = probe_and_validate_media(media_path, data_dir=data_dir)
+    except MediaValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except MediaSelectionCancelled as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    new_media_id = f"src_{uuid.uuid4().hex[:8]}"
+    updated_project = relink_source_media(
+        project_id=project_id,
+        new_path=media_path,
+        media_id=new_media_id,
+        copy_to_project=copy_to_project,
+        data_dir=data_dir,
+    )
+
+    lock = _get_manifest_lock(request.app, project_id)
+    with lock:
+        manifest = load_manifest(project_id, data_dir=data_dir)
+        manifest.source_metadata = source_meta
+        save_manifest(manifest, data_dir=data_dir)
+
+    source_status = check_source_media(updated_project.source_media)
+    return {
+        "project": updated_project.model_dump(mode="json"),
+        "manifest": manifest.model_dump(mode="json"),
+        "source_status": source_status,
+    }
+
+
+@app.post("/api/projects/{project_id}/segments/{seg_id}/tts")
+def api_segment_tts(project_id: str, seg_id: str, request: Request) -> JSONResponse:
+    """Enqueue CPU Kokoro TTS synthesis for a segment (202)."""
+    data_dir = _get_data_dir(request)
+    job_manager = _get_job_manager(request)
+
+    try:
+        project = load_project(project_id, data_dir=data_dir)
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    segment = next((s for s in project.segments if s.id == seg_id), None)
+    if segment is None:
+        raise HTTPException(status_code=404, detail=f"Segment {seg_id!r} not found")
+
+    project_snap = project.model_copy(deep=True)
+    target_app = request.app
+
+    def _tts_worker(ctx: JobContext) -> dict[str, Any]:
+        ctx.update_progress(10, "Synthesizing narration")
+        manifest_snap = load_manifest(project_id, data_dir=data_dir)
+        seg_state = _ensure_segment_tts(
+            target_app=target_app,
+            project=project_snap,
+            seg_id=seg_id,
+            project_dir=project_dir,
+            data_dir=data_dir,
+            manifest=manifest_snap,
+        )
+        ctx.update_progress(100, "Narration ready")
+        return {
+            "tts_hash": seg_state.tts_hash,
+            "audio_artifact_id": seg_state.audio_artifact_id,
+            "audio_duration": seg_state.audio_duration,
+        }
+
+    job = job_manager.submit_job(project_id, "tts", _tts_worker, seg_id=seg_id)
+    return JSONResponse(status_code=202, content={"job_id": job.job_id})
+
+
+@app.post("/api/projects/{project_id}/segments/{seg_id}/preview")
+def api_segment_preview(project_id: str, seg_id: str, request: Request) -> JSONResponse:
+    """Enqueue single-segment 1080x1920 captioned preview render (202)."""
+    data_dir = _get_data_dir(request)
+    job_manager = _get_job_manager(request)
+
+    try:
+        project = load_project(project_id, data_dir=data_dir)
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    segment = next((s for s in project.segments if s.id == seg_id), None)
+    if segment is None:
+        raise HTTPException(status_code=404, detail=f"Segment {seg_id!r} not found")
+
+    project_snap = project.model_copy(deep=True)
+    segment_snap = segment.model_copy(deep=True)
+    manifest_snap = load_manifest(project_id, data_dir=data_dir).model_copy(deep=True)
+    target_app = request.app
+
+    def _preview_worker(ctx: JobContext) -> dict[str, Any]:
+        ctx.update_progress(5, "Preparing segment preview")
+        src_meta = manifest_snap.source_metadata
+        if src_meta is None:
+            src_meta = probe_and_validate_media(project_snap.source_media.path, data_dir=data_dir)
+
+        ctx.update_progress(20, "Checking narration audio")
+        seg_state = _ensure_segment_tts(
+            target_app=target_app,
+            project=project_snap,
+            seg_id=seg_id,
+            project_dir=project_dir,
+            data_dir=data_dir,
+            manifest=manifest_snap,
+        )
+
+        audio_path: Path | None = None
+        if seg_state.audio_path:
+            audio_path = project_dir / seg_state.audio_path
+
+        ctx.update_progress(45, "Rendering segment preview")
+        try:
+            preview_path = render_segment_preview(
+                segment=segment_snap,
+                source_media=project_snap.source_media,
+                source_metadata=src_meta,
+                output_settings=project_snap.output_settings,
+                caption_settings=project_snap.caption_settings,
+                project_dir=project_dir,
+                tts_hash=seg_state.tts_hash or "",
+                audio_path=audio_path,
+                audio_duration=seg_state.audio_duration,
+                clause_timings=seg_state.clause_timings,
+                cancel_event=ctx.cancel_event,
+                on_process_start=ctx.register_process,
+            )
+        except RenderCancelledError as exc:
+            raise JobCancelledError(str(exc)) from exc
+
+        ctx.check_cancelled()
+        render_hash = compute_render_hash(
+            segment=segment_snap,
+            source_media=project_snap.source_media,
+            tts_hash=seg_state.tts_hash or "",
+            output_settings=project_snap.output_settings,
+        )
+        stage1_path = project_dir / "artifacts" / f"seg_{seg_id}_{render_hash}.mp4"
+        preview_rel = preview_path.relative_to(project_dir).as_posix()
+        preview_art_id = f"art_preview_{seg_id}"
+
+        lock = _get_manifest_lock(target_app, project_id)
+        with lock:
+            latest_manifest = load_manifest(project_id, data_dir=data_dir)
+            s_state = latest_manifest.segments.get(seg_id, SegmentArtifactState())
+            s_state.render_hash = render_hash
+            if stage1_path.is_file():
+                s_state.segment_artifact_id = f"art_seg_{seg_id}"
+                s_state.rendered_segment_path = stage1_path.relative_to(project_dir).as_posix()
+            s_state.preview_artifact_id = preview_art_id
+            s_state.preview_path = preview_rel
+            latest_manifest.segments[seg_id] = s_state
+            save_manifest(latest_manifest, data_dir=data_dir)
+
+        ctx.update_progress(100, "Preview ready")
+        return {"preview_artifact_id": preview_art_id, "preview_path": preview_rel}
+
+    job = job_manager.submit_job(project_id, "preview", _preview_worker, seg_id=seg_id)
+    return JSONResponse(status_code=202, content={"job_id": job.job_id})
+
+
+@app.post("/api/projects/{project_id}/export")
+def api_project_export(project_id: str, request: Request) -> JSONResponse:
+    """Enqueue immutable project snapshot render + concat + .ass burn-in (202)."""
+    data_dir = _get_data_dir(request)
+    job_manager = _get_job_manager(request)
+
+    try:
+        project = load_project(project_id, data_dir=data_dir)
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not project.segments:
+        raise HTTPException(status_code=422, detail="Project has no segments to export")
+
+    project_snap = project.model_copy(deep=True)
+    manifest_snap = load_manifest(project_id, data_dir=data_dir).model_copy(deep=True)
+    target_app = request.app
+
+    def _export_worker(ctx: JobContext) -> dict[str, Any]:
+        ctx.update_progress(5, "Preparing export")
+        src_meta = manifest_snap.source_metadata
+        if src_meta is None:
+            src_meta = probe_and_validate_media(project_snap.source_media.path, data_dir=data_dir)
+
+        total_segs = len(project_snap.segments)
+        for idx, seg in enumerate(project_snap.segments):
+            ctx.check_cancelled()
+            pct = 10 + int((idx / max(1, total_segs)) * 55)
+            ctx.update_progress(pct, f"Preparing segment {idx + 1}/{total_segs}")
+
+            seg_state = _ensure_segment_tts(
+                target_app=target_app,
+                project=project_snap,
+                seg_id=seg.id,
+                project_dir=project_dir,
+                data_dir=data_dir,
+                manifest=manifest_snap,
+            )
+            audio_path = (project_dir / seg_state.audio_path) if seg_state.audio_path else None
+            try:
+                seg_mp4 = render_segment_stage1(
+                    segment=seg,
+                    source_media=project_snap.source_media,
+                    source_metadata=src_meta,
+                    output_settings=project_snap.output_settings,
+                    project_dir=project_dir,
+                    tts_hash=seg_state.tts_hash or "",
+                    audio_path=audio_path,
+                    audio_duration=seg_state.audio_duration,
+                    cancel_event=ctx.cancel_event,
+                    on_process_start=ctx.register_process,
+                )
+            except RenderCancelledError as exc:
+                raise JobCancelledError(str(exc)) from exc
+
+            render_hash = compute_render_hash(
+                segment=seg,
+                source_media=project_snap.source_media,
+                tts_hash=seg_state.tts_hash or "",
+                output_settings=project_snap.output_settings,
+            )
+            seg_rel = seg_mp4.relative_to(project_dir).as_posix()
+            lock = _get_manifest_lock(target_app, project_id)
+            with lock:
+                latest_manifest = load_manifest(project_id, data_dir=data_dir)
+                s_state = latest_manifest.segments.get(seg.id, SegmentArtifactState())
+                s_state.render_hash = render_hash
+                s_state.segment_artifact_id = f"art_seg_{seg.id}"
+                s_state.rendered_segment_path = seg_rel
+                latest_manifest.segments[seg.id] = s_state
+                save_manifest(latest_manifest, data_dir=data_dir)
+            manifest_snap.segments[seg.id] = s_state.model_copy(deep=True)
+
+        ctx.update_progress(70, "Concatenating and burning captions")
+        try:
+            export_path = render_final_export(
+                project=project_snap,
+                source_metadata=src_meta,
+                manifest=manifest_snap,
+                project_dir=project_dir,
+                cancel_event=ctx.cancel_event,
+                on_process_start=ctx.register_process,
+            )
+        except RenderCancelledError as exc:
+            raise JobCancelledError(str(exc)) from exc
+        except RenderError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        ctx.check_cancelled()
+        export_rel = export_path.relative_to(project_dir).as_posix()
+        lock = _get_manifest_lock(target_app, project_id)
+        with lock:
+            latest_manifest = load_manifest(project_id, data_dir=data_dir)
+            latest_manifest.latest_export_artifact_id = "art_export_latest"
+            latest_manifest.latest_export_path = export_rel
+            save_manifest(latest_manifest, data_dir=data_dir)
+
+        ctx.update_progress(100, "Export complete")
+        return {"export_artifact_id": "art_export_latest", "export_path": export_rel}
+
+    job = job_manager.submit_job(project_id, "export", _export_worker)
+    return JSONResponse(status_code=202, content={"job_id": job.job_id})
+
+
+@app.get("/api/jobs/{job_id}")
+def api_get_job(job_id: str, request: Request) -> dict[str, Any]:
+    """Return JobState for a background job."""
+    job_manager = _get_job_manager(request)
+    job = job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
+    return job.model_dump(mode="json")
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def api_cancel_job(job_id: str, request: Request) -> dict[str, Any]:
+    """Request cancellation of a background job."""
+    job_manager = _get_job_manager(request)
+    job = job_manager.cancel_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
+    return job.model_dump(mode="json")
+
+
+@app.get("/api/projects/{project_id}/media/{artifact_id}")
+def api_stream_media(project_id: str, artifact_id: str, request: Request) -> Response:
+    """Stream a registered project artifact with HTTP 206 Range and 416 handling (F38)."""
+    data_dir = _get_data_dir(request)
+    try:
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not project_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"Project {project_id!r} not found")
+
+    manifest = load_manifest(project_id, data_dir=data_dir)
+    target_path = _resolve_artifact_path(manifest, project_dir, artifact_id)
+    if target_path is None or not target_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Artifact {artifact_id!r} not found")
+
+    file_size = target_path.stat().st_size
+    media_type = _media_content_type(target_path)
+    range_header = request.headers.get("range")
+
+    if not range_header:
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+        }
+        return StreamingResponse(
+            _iter_file_range(target_path, 0, max(0, file_size - 1)) if file_size > 0 else iter(()),
+            status_code=200,
+            media_type=media_type,
+            headers=headers,
+        )
+
+    parsed_range = _parse_byte_range(range_header, file_size)
+    if parsed_range is None:
+        return Response(
+            status_code=416,
+            headers={"Content-Range": f"bytes */{file_size}"},
+        )
+
+    start, end = parsed_range
+    chunk_len = end - start + 1
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(chunk_len),
+    }
+    return StreamingResponse(
+        _iter_file_range(target_path, start, end),
+        status_code=206,
+        media_type=media_type,
+        headers=headers,
+    )
+
+
+@app.get("/api/pronunciations")
+def api_get_pronunciations(request: Request) -> dict[str, dict[str, str]]:
+    """Read global pronunciation dictionary."""
+    data_dir = _get_data_dir(request)
+    return {"pronunciations": load_global_pronunciations(data_dir=data_dir)}
+
+
+@app.put("/api/pronunciations")
+async def api_put_pronunciations(request: Request) -> dict[str, dict[str, str]]:
+    """Update global pronunciation dictionary."""
+    data_dir = _get_data_dir(request)
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+
+    raw_prons = payload.get("pronunciations") if "pronunciations" in payload and isinstance(payload["pronunciations"], dict) else payload
+    if not isinstance(raw_prons, dict):
+        raise HTTPException(status_code=422, detail="'pronunciations' must be a JSON object")
+
+    cleaned = {str(k): str(v) for k, v in raw_prons.items() if str(k).strip()}
+    saved = save_global_pronunciations(cleaned, data_dir=data_dir)
+    return {"pronunciations": saved}
+
+
+# --- Static Frontend Serving (F38) ---
+
+
+def _render_index_html(session_token: str) -> HTMLResponse:
+    index_path = FRONTEND_DIST_DIR / "index.html"
+    if not index_path.is_file():
+        return HTMLResponse(
+            content=(
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                f"<meta name=\"session-token\" content=\"{html.escape(session_token, quote=True)}\">"
+                "<title>Sims 4 Vertical Video Studio</title></head>"
+                "<body><div id='root'>Frontend build not found (frontend/dist/index.html).</div></body></html>"
+            ),
+            status_code=200,
+        )
+
+    raw_html = index_path.read_text(encoding="utf-8")
+    meta_tag = f'<meta name="session-token" content="{html.escape(session_token, quote=True)}">'
+    placeholder_re = re.compile(r'<meta\s+name=["\']session-token["\'][^>]*>', flags=re.IGNORECASE)
+    if placeholder_re.search(raw_html):
+        injected = placeholder_re.sub(meta_tag, raw_html, count=1)
+    elif re.search(r"</head>", raw_html, flags=re.IGNORECASE):
+        injected = re.sub(r"</head>", f"  {meta_tag}\n</head>", raw_html, count=1, flags=re.IGNORECASE)
+    else:
+        injected = meta_tag + "\n" + raw_html
+    return HTMLResponse(content=injected)
+
+
+if (FRONTEND_DIST_DIR / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST_DIR / "assets")), name="assets")
+
+
+@app.get("/")
+def serve_root(request: Request) -> HTMLResponse:
+    """Serve index.html with injected per-launch session-token meta tag."""
+    _ensure_state_initialized(request.app)
+    return _render_index_html(request.app.state.session_token)
+
+
+@app.get("/{full_path:path}")
+def serve_spa_fallback(full_path: str, request: Request) -> Response:
+    """Serve static frontend files or SPA index.html fallback for non-/api/ routes."""
+    if full_path == "api" or full_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    _ensure_state_initialized(request.app)
+    if FRONTEND_DIST_DIR.is_dir() and full_path and "\x00" not in full_path:
+        dist_root = FRONTEND_DIST_DIR.resolve()
+        candidate = (dist_root / full_path).resolve()
+        if candidate.is_relative_to(dist_root) and candidate.is_file():
+            return FileResponse(path=candidate)
+
+    return _render_index_html(request.app.state.session_token)
+
+
+if __name__ == "__main__":
+    uvicorn.run("backend.main:app", host="127.0.0.1", port=8420)
