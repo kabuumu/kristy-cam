@@ -35,6 +35,13 @@ def _escape_powershell_single_quoted(value: str) -> str:
     return value.replace("'", "''")
 
 
+def _default_sims_recordings_dir() -> Path | None:
+    candidate = Path.home() / "Documents" / "Electronic Arts" / "The Sims 4" / "Recorded Videos"
+    if candidate.is_dir():
+        return candidate
+    return None
+
+
 def select_media_native(dialog_title: str = "Select Sims 4 Gameplay Recording") -> Path | None:
     """Open an OS-native file picker via subprocess without a shell.
 
@@ -44,7 +51,15 @@ def select_media_native(dialog_title: str = "Select Sims 4 Gameplay Recording") 
     """
     if sys.platform == "darwin":
         escaped_title = _escape_applescript_string(dialog_title)
-        script = f'POSIX path of (choose file with prompt "{escaped_title}")'
+        default_dir = _default_sims_recordings_dir()
+        location_clause = ""
+        if default_dir is not None:
+            escaped_dir = _escape_applescript_string(str(default_dir))
+            location_clause = f' default location (POSIX file "{escaped_dir}")'
+        script = (
+            "activate\n"
+            f'POSIX path of (choose file of type {{"public.movie"}} with prompt "{escaped_title}"{location_clause})'
+        )
         res = subprocess.run(
             ["osascript", "-e", script],
             shell=False,
@@ -66,13 +81,24 @@ def select_media_native(dialog_title: str = "Select Sims 4 Gameplay Recording") 
         escaped_title = _escape_powershell_single_quoted(dialog_title)
         ps_script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
+            "$owner = New-Object System.Windows.Forms.Form; "
+            "$owner.TopMost = $true; "
+            "$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual; "
+            "$owner.Location = New-Object System.Drawing.Point(-32000, -32000); "
+            "$owner.Size = New-Object System.Drawing.Size(1, 1); "
+            "$owner.ShowInTaskbar = $false; "
             "$dlg = New-Object System.Windows.Forms.OpenFileDialog; "
             f"$dlg.Title = '{escaped_title}'; "
             "$dlg.Filter = 'Video Files|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v|All Files|*.*'; "
             "$dlg.Multiselect = $false; "
-            "if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+            "$simsDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Electronic Arts\\The Sims 4\\Recorded Videos'; "
+            "if (Test-Path -LiteralPath $simsDir) { $dlg.InitialDirectory = $simsDir }; "
+            "try { "
+            "$owner.Show(); $owner.Activate(); "
+            "if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { "
             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-            "Write-Output $dlg.FileName }"
+            "Write-Output $dlg.FileName } "
+            "} finally { $dlg.Dispose(); $owner.Dispose() }"
         )
         res = subprocess.run(
             ["powershell", "-NoProfile", "-STA", "-Command", ps_script],
