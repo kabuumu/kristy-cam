@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertCircle,
   AlertTriangle,
@@ -51,6 +51,128 @@ interface ContextualInspectorProps {
   onSplitSegment?: () => void;
   onReorderSegment?: (fromIndex: number, toIndex: number) => void;
   onSelectItem: (sel: TimelineSelection) => void;
+}
+
+interface BufferedNumberInputProps {
+  value: number;
+  min?: number;
+  max?: number;
+  step?: number;
+  precision?: number;
+  strictGreaterThanMin?: boolean;
+  strictLessThanMax?: boolean;
+  onCommit: (val: number) => void;
+  className?: string;
+}
+
+function BufferedNumberInput({
+  value,
+  min,
+  max,
+  step = 0.1,
+  precision = 2,
+  strictGreaterThanMin = false,
+  strictLessThanMax = false,
+  onCommit,
+  className,
+}: BufferedNumberInputProps) {
+  const factor = 10 ** precision;
+  const formatVal = (v: number) => String(Number(v.toFixed(precision)));
+  const [focused, setFocused] = useState(false);
+  const [draft, setDraft] = useState(() => formatVal(value));
+
+  useEffect(() => {
+    if (!focused) {
+      setDraft(formatVal(value));
+    }
+  }, [value, focused, precision]);
+
+  const isInRange = (val: number) => {
+    if (min !== undefined && (strictGreaterThanMin ? val <= min : val < min)) return false;
+    if (max !== undefined && (strictLessThanMax ? val >= max : val > max)) return false;
+    return true;
+  };
+
+  const clampVal = (val: number) => {
+    let next = val;
+    if (min !== undefined) {
+      const floorMin = strictGreaterThanMin ? min + 1 / factor : min;
+      next = Math.max(floorMin, next);
+    }
+    if (max !== undefined) {
+      const ceilMax = strictLessThanMax ? max - 1 / factor : max;
+      next = Math.min(ceilMax, next);
+    }
+    let rounded = Number(next.toFixed(precision));
+    if (max !== undefined && (strictLessThanMax ? rounded >= max : rounded > max)) {
+      rounded = Math.floor((strictLessThanMax ? max - 1 / factor : max) * factor) / factor;
+    }
+    if (min !== undefined && (strictGreaterThanMin ? rounded <= min : rounded < min)) {
+      rounded = Math.ceil((strictGreaterThanMin ? min + 1 / factor : min) * factor) / factor;
+    }
+    return rounded;
+  };
+
+  const commitDraft = () => {
+    const parsed = parseFloat(draft);
+    if (!Number.isFinite(parsed)) {
+      setDraft(formatVal(value));
+      return;
+    }
+    const clamped = clampVal(parsed);
+    if (isInRange(clamped)) {
+      onCommit(clamped);
+      setDraft(formatVal(clamped));
+    } else {
+      setDraft(formatVal(value));
+    }
+  };
+
+  const minAttr =
+    min !== undefined
+      ? Math.ceil((strictGreaterThanMin ? min + 0.1 : min) * factor) / factor
+      : undefined;
+  const maxAttr =
+    max !== undefined
+      ? Math.floor((strictLessThanMax ? max - 0.1 : max) * factor) / factor
+      : undefined;
+
+  return (
+    <input
+      type="number"
+      step={step}
+      min={minAttr}
+      max={maxAttr !== undefined && minAttr !== undefined ? Math.max(minAttr, maxAttr) : maxAttr}
+      value={focused ? draft : formatVal(value)}
+      onFocus={() => {
+        setFocused(true);
+        setDraft(formatVal(value));
+      }}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setDraft(raw);
+        const parsed = parseFloat(raw);
+        if (Number.isFinite(parsed) && isInRange(parsed)) {
+          onCommit(Number(parsed.toFixed(precision)));
+        }
+      }}
+      onBlur={() => {
+        setFocused(false);
+        commitDraft();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          commitDraft();
+          e.currentTarget.blur();
+        } else if (e.key === "Escape") {
+          setDraft(formatVal(value));
+          setFocused(false);
+          e.currentTarget.blur();
+        }
+      }}
+      className={className}
+    />
+  );
 }
 
 export function ContextualInspector({
@@ -171,36 +293,26 @@ export function ContextualInspector({
       <div className="grid grid-cols-2 gap-2.5 rounded-lg border border-zinc-800 bg-[#11141b] p-3">
         <label className="flex flex-col gap-1">
           <span className="text-zinc-400">Clip Start (s)</span>
-          <input
-            type="number"
+          <BufferedNumberInput
             step={0.1}
             min={0}
-            max={Math.max(0, seg.video_out - 0.1)}
-            value={Number(seg.video_in.toFixed(2))}
-            onChange={(e) => {
-              const val = parseFloat(e.target.value);
-              if (Number.isFinite(val) && val >= 0 && val < seg.video_out) {
-                onUpdateSegment({ ...seg, video_in: Number(val.toFixed(2)) });
-              }
-            }}
+            max={seg.video_out}
+            strictLessThanMax
+            value={seg.video_in}
+            onCommit={(val) => onUpdateSegment({ ...seg, video_in: val })}
             className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
           />
         </label>
 
         <label className="flex flex-col gap-1">
           <span className="text-zinc-400">Clip End (s)</span>
-          <input
-            type="number"
+          <BufferedNumberInput
             step={0.1}
-            min={seg.video_in + 0.1}
+            min={seg.video_in}
             max={srcDur}
-            value={Number(seg.video_out.toFixed(2))}
-            onChange={(e) => {
-              const val = parseFloat(e.target.value);
-              if (Number.isFinite(val) && val > seg.video_in && val <= srcDur) {
-                onUpdateSegment({ ...seg, video_out: Number(val.toFixed(2)) });
-              }
-            }}
+            strictGreaterThanMin
+            value={seg.video_out}
+            onCommit={(val) => onUpdateSegment({ ...seg, video_out: val })}
             className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
           />
         </label>
@@ -388,15 +500,11 @@ export function ContextualInspector({
           {kfIndex > 0 && (
             <label className="flex flex-col gap-1">
               <span className="text-zinc-400">Project Time (s)</span>
-              <input
-                type="number"
+              <BufferedNumberInput
                 step={0.05}
                 min={0.05}
-                value={Number(kf.t.toFixed(2))}
-                onChange={(e) => {
-                  const v = parseFloat(e.target.value);
-                  if (Number.isFinite(v) && v >= 0.05) updateKf({ t: v });
-                }}
+                value={kf.t}
+                onCommit={(v) => updateKf({ t: v })}
                 className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
               />
             </label>
@@ -602,34 +710,22 @@ export function ContextualInspector({
           <div className="grid grid-cols-2 gap-2.5">
             <label className="flex flex-col gap-1">
               <span className="text-zinc-400">Start Point (s)</span>
-              <input
-                type="number"
+              <BufferedNumberInput
                 step={0.1}
                 min={0}
-                value={Number(effectiveStart.toFixed(2))}
-                onChange={(e) => {
-                  const val = parseFloat(e.target.value);
-                  if (Number.isFinite(val) && val >= 0) {
-                    updateClause({ start_sec: Number(val.toFixed(2)) });
-                  }
-                }}
+                value={effectiveStart}
+                onCommit={(val) => updateClause({ start_sec: val })}
                 className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
               />
             </label>
 
             <label className="flex flex-col gap-1">
               <span className="text-zinc-400">Length (s)</span>
-              <input
-                type="number"
+              <BufferedNumberInput
                 step={0.1}
                 min={0.2}
-                value={Number(effectiveDur.toFixed(2))}
-                onChange={(e) => {
-                  const val = parseFloat(e.target.value);
-                  if (Number.isFinite(val) && val >= 0.2) {
-                    updateClause({ duration_sec: Number(val.toFixed(2)) });
-                  }
-                }}
+                value={effectiveDur}
+                onCommit={(val) => updateClause({ duration_sec: val })}
                 className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
               />
             </label>
