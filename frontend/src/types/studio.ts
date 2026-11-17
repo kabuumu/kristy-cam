@@ -164,6 +164,8 @@ export interface Capabilities {
   libass_ready: boolean;
   kokoro_ready: boolean;
   font_ready: boolean;
+  native_picker_supported?: boolean;
+  nvenc_ready?: boolean;
   voices: string[];
   errors: string[];
 }

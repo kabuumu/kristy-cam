@@ -64,6 +64,33 @@ class CorruptProjectError(StorageError):
     """Raised when both project.json and project.json.bak are corrupt or invalid."""
 
 
+class InsufficientDiskSpaceError(StorageError):
+    """Raised when free disk space is insufficient for copying or proxy generation."""
+
+    def __init__(self, target_path: Path, required_bytes: int, available_bytes: int) -> None:
+        self.target_path = target_path
+        self.required_bytes = required_bytes
+        self.available_bytes = available_bytes
+        req_gb = required_bytes / (1024 ** 3)
+        avail_gb = available_bytes / (1024 ** 3)
+        super().__init__(
+            f"Insufficient free disk space at {target_path}: "
+            f"need {req_gb:.2f} GB, only {avail_gb:.2f} GB available."
+        )
+
+
+def ensure_free_disk_space(target_path: str | Path, required_bytes: int) -> None:
+    """Verify at least required_bytes are free on the filesystem containing target_path."""
+    if required_bytes <= 0:
+        return
+    probe_path = Path(target_path)
+    while not probe_path.exists() and probe_path.parent != probe_path:
+        probe_path = probe_path.parent
+    usage = shutil.disk_usage(probe_path)
+    if usage.free < required_bytes:
+        raise InsufficientDiskSpaceError(probe_path, required_bytes, usage.free)
+
+
 def _resolve_data_dir(data_dir: Path | None = None) -> Path:
     return data_dir if data_dir is not None else get_data_dir()
 

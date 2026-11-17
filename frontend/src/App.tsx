@@ -3,13 +3,13 @@ import {
   AlertTriangle,
   Download,
   Film,
+  FolderOpen,
   FolderPlus,
   Link2,
   Loader2,
   RefreshCw,
   Save,
   ScrollText,
-  Upload,
   X,
 } from "lucide-react";
 import { ApiError, apiClient } from "./api/client";
@@ -879,9 +879,59 @@ export default function App() {
     );
   };
 
-  // New Project Media Upload
+  // New Project Media Selection (native OS picker primary, browser file fallback)
+  const handleSelectMediaNative = async () => {
+    usageLogger.logIntention("Select gameplay recording", "media.select.native", {});
+    setMediaSelectBusy(true);
+    setNewProjectError(null);
+    try {
+      const res = await apiClient.selectMedia({ copyToProject });
+      setSelectedMedia(res);
+      if (!newTitle.trim()) {
+        const base =
+          res.path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") ||
+          "New Sims Project";
+        setNewTitle(base);
+      }
+      usageLogger.logActionOutput(
+        "Select and validate gameplay recording",
+        "media.select.native",
+        {
+          media_id: res.media_id,
+          width: res.metadata.width,
+          height: res.metadata.height,
+          fps: res.metadata.fps,
+          duration: res.metadata.duration,
+        }
+      );
+    } catch (err) {
+      const isCancelled =
+        err instanceof ApiError &&
+        err.status === 400 &&
+        err.detail.toLowerCase().includes("cancel");
+      if (isCancelled) {
+        usageLogger.logActionOutput(
+          "Cancelled recording selection",
+          "media.select.cancelled",
+          {}
+        );
+      } else {
+        setNewProjectError(
+          err instanceof Error ? err.message : "Media selection failed"
+        );
+        usageLogger.logError(
+          "Select gameplay recording",
+          "media.select_failed",
+          err
+        );
+      }
+    } finally {
+      setMediaSelectBusy(false);
+    }
+  };
+
   const handleUploadMedia = async (file: File) => {
-    usageLogger.logIntention("Upload gameplay media", "media.upload", {
+    usageLogger.logIntention("Import gameplay recording", "media.upload", {
       input: { name: file.name, size: file.size, type: file.type },
     });
     setMediaSelectBusy(true);
@@ -901,7 +951,7 @@ export default function App() {
         setNewTitle(base);
       }
       usageLogger.logActionOutput(
-        "Upload and validate gameplay media",
+        "Import and validate gameplay recording",
         "media.upload",
         {
           media_id: res.media_id,
@@ -913,9 +963,9 @@ export default function App() {
       );
     } catch (err) {
       setNewProjectError(
-        err instanceof Error ? err.message : "Media upload failed"
+        err instanceof Error ? err.message : "Media import failed"
       );
-      usageLogger.logError("Upload gameplay media", "media.upload_failed", err, {
+      usageLogger.logError("Import gameplay recording", "media.upload_failed", err, {
         input: { name: file.name, size: file.size },
       });
     } finally {
@@ -1476,31 +1526,43 @@ export default function App() {
                 <span className="block font-medium text-zinc-300">
                   1. Select Gameplay Recording
                 </span>
-                <input
-                  ref={newProjectFileInputRef}
-                  type="file"
-                  accept="video/mp4,video/*"
-                  className="hidden"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    e.target.value = "";
-                    if (file) {
-                      void handleUploadMedia(file);
-                    }
-                  }}
-                />
+                {!capabilities?.native_picker_supported && (
+                  <input
+                    ref={newProjectFileInputRef}
+                    type="file"
+                    accept="video/mp4,video/*"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = "";
+                      if (file) {
+                        void handleUploadMedia(file);
+                      }
+                    }}
+                  />
+                )}
                 <button
                   type="button"
                   disabled={mediaSelectBusy}
-                  onClick={() => newProjectFileInputRef.current?.click()}
+                  onClick={() => {
+                    if (capabilities?.native_picker_supported) {
+                      void handleSelectMediaNative();
+                    } else {
+                      newProjectFileInputRef.current?.click();
+                    }
+                  }}
                   className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-1.5 font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
                 >
                   {mediaSelectBusy ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   ) : (
-                    <Upload className="h-3.5 w-3.5" />
+                    <FolderOpen className="h-3.5 w-3.5" />
                   )}
-                  {mediaSelectBusy ? "Uploading..." : "Upload File"}
+                  {mediaSelectBusy
+                    ? capabilities?.native_picker_supported
+                      ? "Waiting for file picker…"
+                      : "Importing…"
+                    : "Select Recording"}
                 </button>
               </div>
 

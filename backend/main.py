@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -24,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from backend.usage_log import UsageLogger, get_usage_logger
 
@@ -37,7 +39,7 @@ from backend.media import (
     probe_and_validate_media,
     select_media_native,
 )
-from backend.proxy import generate_proxy
+from backend.proxy import generate_proxy, probe_nvenc_support
 from backend.renderer import (
     RenderCancelledError,
     RenderError,
@@ -55,6 +57,7 @@ from backend.schemas import (
     SourceMetadata,
 )
 from backend.storage import (
+    InsufficientDiskSpaceError,
     ProjectNotFoundError,
     RevisionConflictError,
     StorageError,
@@ -62,6 +65,7 @@ from backend.storage import (
     check_source_media,
     compute_file_fingerprint,
     create_project,
+    ensure_free_disk_space,
     get_project_dir,
     load_global_pronunciations,
     load_manifest,
@@ -507,17 +511,19 @@ def api_health() -> dict[str, str]:
 
 @app.get("/api/capabilities")
 def api_capabilities(request: Request) -> dict[str, Any]:
-    """Return FFmpeg, libass, font, and Kokoro readiness plus available voices."""
+    """Return FFmpeg, libass, font, Kokoro, native picker, and NVENC readiness."""
     data_dir = _get_data_dir(request)
     offline = is_offline_env()
     errors: list[str] = []
 
     ffmpeg_ready = False
     libass_ready = False
+    nvenc_ready = False
     try:
-        verify_ffmpeg(data_dir=data_dir, offline=offline)
+        verified_ffmpeg, _ = verify_ffmpeg(data_dir=data_dir, offline=offline)
         ffmpeg_ready = True
         libass_ready = True
+        nvenc_ready = probe_nvenc_support(verified_ffmpeg)
     except Exception as exc:
         errors.append(f"ffmpeg: {exc}")
 
@@ -536,6 +542,8 @@ def api_capabilities(request: Request) -> dict[str, Any]:
     except Exception as exc:
         errors.append(f"kokoro: {exc}")
 
+    native_picker_supported = sys.platform in {"darwin", "win32"}
+
     return {
         "ffmpeg_ready": ffmpeg_ready,
         "libass_ready": libass_ready,
@@ -544,6 +552,8 @@ def api_capabilities(request: Request) -> dict[str, Any]:
         "libass_ok": libass_ready,
         "kokoro_ok": kokoro_ready,
         "font_ready": font_ready,
+        "native_picker_supported": native_picker_supported,
+        "nvenc_ready": nvenc_ready,
         "voices": voices,
         "errors": errors,
     }
@@ -559,7 +569,7 @@ async def api_media_select(request: Request) -> dict[str, Any]:
     try:
         if "multipart/form-data" in content_type.lower():
             filename, file_bytes = _parse_multipart_file(content_type, raw_body)
-            media_path = import_uploaded_media(filename, file_bytes, data_dir / "uploads")
+            media_path = await run_in_threadpool(import_uploaded_media, filename, file_bytes, data_dir / "uploads")
         elif raw_body.strip():
             try:
                 payload = json.loads(raw_body.decode("utf-8"))
@@ -570,19 +580,19 @@ async def api_media_select(request: Request) -> dict[str, Any]:
             if payload.get("path") is not None:
                 media_path = _validate_manual_media_path(payload["path"])
             else:
-                selected = select_media_native()
+                selected = await run_in_threadpool(select_media_native)
                 if selected is None:
                     raise MediaSelectionCancelled("Media selection cancelled by user")
                 media_path = selected
         else:
-            selected = select_media_native()
+            selected = await run_in_threadpool(select_media_native)
             if selected is None:
                 raise MediaSelectionCancelled("Media selection cancelled by user")
             media_path = selected
 
-        metadata = probe_and_validate_media(media_path, data_dir=data_dir)
+        metadata = await run_in_threadpool(probe_and_validate_media, media_path, data_dir=data_dir)
         resolved_path = media_path.resolve()
-        fingerprint = compute_file_fingerprint(resolved_path)
+        fingerprint = await run_in_threadpool(compute_file_fingerprint, resolved_path)
     except MediaValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except MediaSelectionCancelled as exc:
@@ -685,15 +695,14 @@ async def api_create_project(request: Request) -> JSONResponse:
     final_src_path = src_path
     fingerprint = media_entry["fingerprint"]
     copied = False
-    if copy_source:
-        source_dir = project_dir / "source"
-        source_dir.mkdir(parents=True, exist_ok=True)
-        dest_path = (source_dir / src_path.name).resolve()
-        if dest_path != src_path.resolve():
-            shutil.copy2(src_path, dest_path)
-        final_src_path = dest_path
-        fingerprint = compute_file_fingerprint(final_src_path)
-        copied = True
+
+    try:
+        src_size = src_path.stat().st_size if src_path.is_file() else 0
+        proxy_headroom = min(max(src_size // 4, 256 * 1024 * 1024), 1024 * 1024 * 1024)
+        required_bytes = proxy_headroom + (src_size if copy_source else 0)
+        ensure_free_disk_space(project_dir, required_bytes)
+    except InsufficientDiskSpaceError as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
 
     source_ref = SourceMediaRef(
         media_id=media_id,
@@ -732,15 +741,42 @@ async def api_create_project(request: Request) -> JSONResponse:
             m = load_manifest(project_id, data_dir=data_dir)
             m.proxy = ProxyState(status="running")
             save_manifest(m, data_dir=data_dir)
+
+        active_src_path = final_src_path
+        if copy_source:
+            ctx.update_progress(2, "Copying source recording")
+            source_dir = project_dir / "source"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = (source_dir / src_path.name).resolve()
+            if dest_path != src_path.resolve():
+                shutil.copy2(src_path, dest_path)
+            active_src_path = dest_path
+            copied_fp = compute_file_fingerprint(active_src_path)
+            cur_proj = load_project(project_id, data_dir=data_dir)
+            updated_ref = SourceMediaRef(
+                media_id=media_id,
+                path=str(active_src_path),
+                fingerprint=copied_fp,
+                copied_to_project=True,
+            )
+            save_project(
+                cur_proj.model_copy(update={"source_media": updated_ref}),
+                expected_revision=cur_proj.revision,
+                data_dir=data_dir,
+            )
+
+        selected_encoders: list[str] = []
         try:
             generate_proxy(
-                source_path=final_src_path,
+                source_path=active_src_path,
                 output_path=proxy_output,
                 project_id=None,
                 source_duration=source_meta.duration,
+                source_metadata=source_meta,
                 data_dir=data_dir,
                 on_progress=ctx.update_progress,
                 on_process_start=ctx.register_process,
+                on_encoder_selected=selected_encoders.append,
                 cancel_event=ctx.cancel_event,
             )
         except JobCancelledError:
@@ -763,7 +799,11 @@ async def api_create_project(request: Request) -> JSONResponse:
             save_manifest(m, data_dir=data_dir)
 
         _ = target_app
-        return {"artifact_id": "art_proxy", "path": "artifacts/proxy.mp4"}
+        return {
+            "artifact_id": "art_proxy",
+            "path": "artifacts/proxy.mp4",
+            "encoder": selected_encoders[-1] if selected_encoders else "libx264",
+        }
 
     job = job_manager.submit_job(project_id, "proxy", _proxy_worker)
     _get_usage_logger(request).log_event(
@@ -934,7 +974,7 @@ async def api_relink_source(project_id: str, request: Request) -> dict[str, Any]
     try:
         if "multipart/form-data" in content_type.lower():
             filename, file_bytes = _parse_multipart_file(content_type, raw_body)
-            media_path = import_uploaded_media(filename, file_bytes, project_dir / "source")
+            media_path = await run_in_threadpool(import_uploaded_media, filename, file_bytes, project_dir / "source")
         elif raw_body.strip():
             try:
                 payload = json.loads(raw_body.decode("utf-8"))
@@ -946,17 +986,17 @@ async def api_relink_source(project_id: str, request: Request) -> dict[str, Any]
             if payload.get("path") is not None:
                 media_path = _validate_manual_media_path(payload["path"])
             else:
-                selected = select_media_native()
+                selected = await run_in_threadpool(select_media_native)
                 if selected is None:
                     raise MediaSelectionCancelled("Media selection cancelled by user")
                 media_path = selected
         else:
-            selected = select_media_native()
+            selected = await run_in_threadpool(select_media_native)
             if selected is None:
                 raise MediaSelectionCancelled("Media selection cancelled by user")
             media_path = selected
 
-        source_meta = probe_and_validate_media(media_path, data_dir=data_dir)
+        source_meta = await run_in_threadpool(probe_and_validate_media, media_path, data_dir=data_dir)
     except MediaValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except MediaSelectionCancelled as exc:
@@ -965,7 +1005,8 @@ async def api_relink_source(project_id: str, request: Request) -> dict[str, Any]
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     new_media_id = f"src_{uuid.uuid4().hex[:8]}"
-    updated_project = relink_source_media(
+    updated_project = await run_in_threadpool(
+        relink_source_media,
         project_id=project_id,
         new_path=media_path,
         media_id=new_media_id,
