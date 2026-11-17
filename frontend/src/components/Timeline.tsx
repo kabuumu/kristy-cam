@@ -46,8 +46,10 @@ interface TimelineProps {
   onSourceTimeChange: (t: number) => void;
   onAddSegment: (videoIn: number, videoOut: number) => void;
   onDeleteSegment: (segId: string) => void;
-  onUpdateSegment: (updated: SegmentInput) => void;
-  onUpdateCameraKeyframes: (keyframes: CropKeyframe[]) => void;
+  onUpdateSegment: (updated: SegmentInput, meta?: { label?: string; coalesceKey?: string }) => void;
+  onUpdateCameraKeyframes: (keyframes: CropKeyframe[], meta?: { label?: string; coalesceKey?: string }) => void;
+  onBeginHistoryTransaction?: (label: string) => void;
+  onEndHistoryTransaction?: () => void;
   onReorderSegments: (fromIndex: number, toIndex: number) => void;
   onSplitSegment: (segId: string, localTime: number) => void;
   onToggleProjectPlayback: () => void;
@@ -120,6 +122,8 @@ export function Timeline({
   onDeleteSegment,
   onUpdateSegment,
   onUpdateCameraKeyframes,
+  onBeginHistoryTransaction,
+  onEndHistoryTransaction,
   onReorderSegments,
   onSplitSegment,
   onToggleProjectPlayback,
@@ -133,6 +137,23 @@ export function Timeline({
   const [drag, setDrag] = useState<DragAction>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const trackLaneRef = useRef<HTMLDivElement | null>(null);
+
+  const startDrag = (action: NonNullable<DragAction>) => {
+    const txLabels: Partial<Record<NonNullable<DragAction>["type"], string>> = {
+      "keyframe-move": "Move camera keyframe",
+      "video-slip": "Slip clip media",
+      "video-left": "Trim clip start",
+      "video-right": "Trim clip end",
+      "clause-move": "Move caption block",
+      "clause-left": "Trim caption start",
+      "clause-right": "Trim caption end",
+    };
+    const label = txLabels[action.type];
+    if (label) {
+      onBeginHistoryTransaction?.(label);
+    }
+    setDrag(action);
+  };
 
   const layout = computeTimelineLayout(
     segments,
@@ -440,6 +461,16 @@ export function Timeline({
         if (adjustedTarget !== fromIndex && adjustedTarget >= 0) {
           onReorderSegments(fromIndex, adjustedTarget);
         }
+      } else if (
+        drag.type === "keyframe-move" ||
+        drag.type === "video-slip" ||
+        drag.type === "video-left" ||
+        drag.type === "video-right" ||
+        drag.type === "clause-move" ||
+        drag.type === "clause-left" ||
+        drag.type === "clause-right"
+      ) {
+        onEndHistoryTransaction?.();
       }
       setDrag(null);
     };
@@ -779,7 +810,7 @@ export function Timeline({
                 title="DAW Zoom: Drag down to zoom in, up to zoom out, left/right to pan"
                 onMouseDown={(e) => {
                   e.preventDefault();
-                  setDrag({
+                  startDrag({
                     type: "zoom-drag",
                     startX: e.clientX,
                     startY: e.clientY,
@@ -804,7 +835,7 @@ export function Timeline({
                   <div
                     data-log-intent="Scrub timeline ruler"
                     onMouseDown={(e) => {
-                      setDrag({ type: "scrub" });
+                      startDrag({ type: "scrub" });
                       scrubAtClientX(e.clientX);
                     }}
                     className="relative h-4 cursor-pointer border-b border-zinc-800/80 text-[9px] font-mono text-zinc-500"
@@ -860,7 +891,7 @@ export function Timeline({
                             onSelectSegment(clip.seg.id);
                             onSelectItem({ type: "video", segId: clip.seg.id });
                             if (e.altKey) {
-                              setDrag({
+                              startDrag({
                                 type: "video-slip",
                                 segId: clip.seg.id,
                                 startX: e.clientX,
@@ -869,7 +900,7 @@ export function Timeline({
                                 totalDur,
                               });
                             } else {
-                              setDrag({
+                              startDrag({
                                 type: "clip-reorder",
                                 fromIndex: clip.index,
                                 targetIndex: clip.index,
@@ -902,7 +933,7 @@ export function Timeline({
                               e.stopPropagation();
                               onSelectSegment(clip.seg.id);
                               onSelectItem({ type: "video", segId: clip.seg.id });
-                              setDrag({
+                              startDrag({
                                 type: "video-left",
                                 segId: clip.seg.id,
                                 startX: e.clientX,
@@ -943,7 +974,7 @@ export function Timeline({
                               e.stopPropagation();
                               onSelectSegment(clip.seg.id);
                               onSelectItem({ type: "video", segId: clip.seg.id });
-                              setDrag({
+                              startDrag({
                                 type: "video-right",
                                 segId: clip.seg.id,
                                 startX: e.clientX,
@@ -1001,7 +1032,7 @@ export function Timeline({
                             });
                             onProjectTimeChange(kf.t);
                             if (idx > 0) {
-                              setDrag({
+                              startDrag({
                                 type: "keyframe-move",
                                 index: idx,
                                 startX: e.clientX,
@@ -1116,7 +1147,7 @@ export function Timeline({
                                   index: i,
                                 });
                                 onProjectTimeChange(globalStart);
-                                setDrag({
+                                startDrag({
                                   type: "clause-move",
                                   segId: clip.seg.id,
                                   index: i,
@@ -1143,7 +1174,7 @@ export function Timeline({
                                     segId: clip.seg.id,
                                     index: i,
                                   });
-                                  setDrag({
+                                  startDrag({
                                     type: "clause-left",
                                     segId: clip.seg.id,
                                     index: i,
@@ -1184,7 +1215,7 @@ export function Timeline({
                                     segId: clip.seg.id,
                                     index: i,
                                   });
-                                  setDrag({
+                                  startDrag({
                                     type: "clause-right",
                                     segId: clip.seg.id,
                                     index: i,

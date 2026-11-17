@@ -48,6 +48,8 @@ interface CropCanvasProps {
   onSourceTimeChange: (t: number) => void;
   onUpdateSegment: (updated: SegmentInput) => void;
   onUpdateCameraKeyframes?: (keyframes: CropKeyframe[]) => void;
+  onBeginHistoryTransaction?: (label: string) => void;
+  onEndHistoryTransaction?: () => void;
   onRenderPreview: () => void;
   canPreview?: boolean;
   previewBusy: boolean;
@@ -80,6 +82,8 @@ export function CropCanvas({
   onSourceTimeChange,
   onUpdateSegment,
   onUpdateCameraKeyframes,
+  onBeginHistoryTransaction,
+  onEndHistoryTransaction,
   onRenderPreview,
   canPreview = false,
   previewBusy,
@@ -469,6 +473,7 @@ export function CropCanvas({
 
     const handleMouseUp = () => {
       setDragMode(null);
+      onEndHistoryTransaction?.();
     };
 
     window.addEventListener("mousemove", handleMouseMove);
@@ -667,6 +672,7 @@ export function CropCanvas({
               }}
               onMouseDown={(e) => {
                 e.preventDefault();
+                onBeginHistoryTransaction?.("Move camera crop");
                 setDragMode({
                   type: "move",
                   startClientX: e.clientX,
@@ -699,6 +705,7 @@ export function CropCanvas({
                   onMouseDown={(e) => {
                     e.stopPropagation();
                     e.preventDefault();
+                    onBeginHistoryTransaction?.("Zoom camera crop");
                     setDragMode({
                       type: "zoom",
                       corner,

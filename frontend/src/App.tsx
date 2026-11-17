@@ -7,9 +7,11 @@ import {
   FolderPlus,
   Link2,
   Loader2,
+  Redo2,
   RefreshCw,
   Save,
   ScrollText,
+  Undo2,
   X,
 } from "lucide-react";
 import { ApiError, apiClient } from "./api/client";
@@ -43,6 +45,18 @@ import {
   splitSegmentAt,
   toProjectTime,
 } from "./utils/studioMath";
+import {
+  beginHistoryTransaction,
+  createInitialHistoryState,
+  endHistoryTransaction,
+  recordHistoryUpdate,
+  serializeProjectContent,
+  stepRedo,
+  stepUndo,
+  type HistorySnapshot,
+  type UndoHistoryState,
+  type UpdateMeta,
+} from "./utils/undoHistory";
 import { usageLogger } from "./utils/usageLogger";
 
 const OUTPUT_ASPECT_PRESETS = [
@@ -106,12 +120,20 @@ export default function App() {
   const [logModalOpen, setLogModalOpen] = useState(false);
   const [customResolutionMode, setCustomResolutionMode] = useState(false);
 
+  const [historyState, setHistoryState] = useState<UndoHistoryState>(() =>
+    createInitialHistoryState()
+  );
+  const historyRef = useRef<UndoHistoryState>(historyState);
+  const savedBaselineRef = useRef<string | null>(null);
+
   const projectRef = useRef<ProjectInput | null>(null);
   projectRef.current = project;
   const manifestRef = useRef<ArtifactManifest | null>(null);
   manifestRef.current = manifest;
   const selectedSegIdRef = useRef<string | null>(null);
   selectedSegIdRef.current = selectedSegId;
+  const selectionRef = useRef<TimelineSelection>(null);
+  selectionRef.current = selection;
 
   useEffect(() => {
     usageLogger.init(() => ({
@@ -120,82 +142,93 @@ export default function App() {
     }));
   }, []);
 
-  const applyBundle = useCallback((bundle: ProjectBundle) => {
-    let normalizedProject = bundle.project;
-    if (
-      (!normalizedProject.camera_keyframes ||
-        normalizedProject.camera_keyframes.length === 0) &&
-      normalizedProject.segments.length > 0
-    ) {
-      const srcDur = bundle.manifest.source_metadata?.duration ?? 0;
-      const layout = computeTimelineLayout(
-        normalizedProject.segments,
-        bundle.manifest,
-        srcDur,
-        normalizedProject.output_settings.tail_padding_sec
-      );
-      const migrated: CropKeyframe[] = [];
-      for (const clip of layout.clips) {
-        for (const kf of clip.seg.crop_keyframes) {
-          const globalT = Number((clip.startSec + kf.t).toFixed(2));
-          if (
-            migrated.length === 0 ||
-            globalT > migrated[migrated.length - 1].t + 1e-4
-          ) {
-            migrated.push({
-              ...kf,
-              t: migrated.length === 0 ? 0.0 : globalT,
-            });
+  const applyBundle = useCallback(
+    (bundle: ProjectBundle, options?: { resetHistory?: boolean }) => {
+      const resetHistory = options?.resetHistory ?? true;
+      let normalizedProject = bundle.project;
+      if (
+        (!normalizedProject.camera_keyframes ||
+          normalizedProject.camera_keyframes.length === 0) &&
+        normalizedProject.segments.length > 0
+      ) {
+        const srcDur = bundle.manifest.source_metadata?.duration ?? 0;
+        const layout = computeTimelineLayout(
+          normalizedProject.segments,
+          bundle.manifest,
+          srcDur,
+          normalizedProject.output_settings.tail_padding_sec
+        );
+        const migrated: CropKeyframe[] = [];
+        for (const clip of layout.clips) {
+          for (const kf of clip.seg.crop_keyframes) {
+            const globalT = Number((clip.startSec + kf.t).toFixed(2));
+            if (
+              migrated.length === 0 ||
+              globalT > migrated[migrated.length - 1].t + 1e-4
+            ) {
+              migrated.push({
+                ...kf,
+                t: migrated.length === 0 ? 0.0 : globalT,
+              });
+            }
           }
         }
+        if (migrated.length > 0) {
+          normalizedProject = {
+            ...normalizedProject,
+            camera_keyframes: migrated,
+          };
+        }
       }
-      if (migrated.length > 0) {
-        normalizedProject = {
-          ...normalizedProject,
-          camera_keyframes: migrated,
-        };
+      projectRef.current = normalizedProject;
+      setProject(normalizedProject);
+      setManifest(bundle.manifest);
+      setSourceStatus(bundle.source_status ?? null);
+      savedBaselineRef.current = serializeProjectContent(normalizedProject);
+      setDirty(false);
+      setRevisionConflict(false);
+      if (resetHistory) {
+        const fresh = createInitialHistoryState();
+        historyRef.current = fresh;
+        setHistoryState(fresh);
       }
-    }
-    setProject(normalizedProject);
-    setManifest(bundle.manifest);
-    setSourceStatus(bundle.source_status ?? null);
-    setDirty(false);
-    setRevisionConflict(false);
-    setSelectedSegId((prev) => {
-      if (
-        prev &&
-        normalizedProject.segments.some((s) => s.id === prev)
-      ) {
-        return prev;
+      setSelectedSegId((prev) => {
+        if (
+          prev &&
+          normalizedProject.segments.some((s) => s.id === prev)
+        ) {
+          return prev;
+        }
+        return normalizedProject.segments[0]?.id ?? null;
+      });
+      const staleSet = new Set(bundle.stale_tts_segments ?? []);
+      const sigs: Record<string, string> = {};
+      for (const seg of normalizedProject.segments) {
+        if (
+          !staleSet.has(seg.id) &&
+          bundle.manifest.segments[seg.id]?.audio_artifact_id
+        ) {
+          sigs[seg.id] = computeClientTtsSignature(
+            seg,
+            normalizedProject.pronunciations,
+            normalizedProject.voice,
+            normalizedProject.language,
+            normalizedProject.output_settings.inter_clause_pause_ms
+          );
+        }
       }
-      return normalizedProject.segments[0]?.id ?? null;
-    });
-    const staleSet = new Set(bundle.stale_tts_segments ?? []);
-    const sigs: Record<string, string> = {};
-    for (const seg of normalizedProject.segments) {
-      if (
-        !staleSet.has(seg.id) &&
-        bundle.manifest.segments[seg.id]?.audio_artifact_id
-      ) {
-        sigs[seg.id] = computeClientTtsSignature(
-          seg,
-          normalizedProject.pronunciations,
-          normalizedProject.voice,
-          normalizedProject.language,
-          normalizedProject.output_settings.inter_clause_pause_ms
+      setLastSynthesizedSignatures(sigs);
+      if (bundle.manifest.latest_preview_artifact_id) {
+        setLastRenderedProjectPreviewSignature(
+          (prev) =>
+            prev ?? computeClientProjectPreviewSignature(normalizedProject)
         );
+      } else {
+        setLastRenderedProjectPreviewSignature(null);
       }
-    }
-    setLastSynthesizedSignatures(sigs);
-    if (bundle.manifest.latest_preview_artifact_id) {
-      setLastRenderedProjectPreviewSignature(
-        (prev) =>
-          prev ?? computeClientProjectPreviewSignature(normalizedProject)
-      );
-    } else {
-      setLastRenderedProjectPreviewSignature(null);
-    }
-  }, []);
+    },
+    []
+  );
 
   const loadProject = useCallback(
     async (projectId: string) => {
@@ -441,34 +474,205 @@ export default function App() {
     return project.segments.find((s) => s.id === selectedSegId) ?? null;
   }, [project, selectedSegId]);
 
-  const handleUpdateProject = (
-    updater: (prev: ProjectInput) => ProjectInput
-  ) => {
-    setProject((prev) => (prev ? updater(prev) : prev));
-    setDirty(true);
-  };
+  const isModalOpenRef = useRef(false);
 
-  const handleUpdateSegment = (updated: SegmentInput) => {
-    handleUpdateProject((prev) => ({
-      ...prev,
-      segments: prev.segments.map((s) => (s.id === updated.id ? updated : s)),
-    }));
-  };
+  const handleUpdateProject = useCallback(
+    (
+      updater: (prev: ProjectInput) => ProjectInput,
+      meta?: UpdateMeta,
+      nextSel?: { selectedSegId?: string | null; selection?: TimelineSelection }
+    ) => {
+      const prevProject = projectRef.current;
+      if (!prevProject) return;
+      const nextProject = updater(prevProject);
+      const prevSnapshot: HistorySnapshot = {
+        project: prevProject,
+        selectedSegId: selectedSegIdRef.current,
+        selection: selectionRef.current,
+      };
+      const nextSelectedSegId =
+        nextSel?.selectedSegId !== undefined
+          ? nextSel.selectedSegId
+          : selectedSegIdRef.current;
+      const nextSelection =
+        nextSel?.selection !== undefined
+          ? nextSel.selection
+          : selectionRef.current;
+      const nextSnapshot: HistorySnapshot = {
+        project: nextProject,
+        selectedSegId: nextSelectedSegId,
+        selection: nextSelection,
+      };
 
-  const handleUpdateCameraKeyframes = (keyframes: CropKeyframe[]) => {
-    handleUpdateProject((prev) => ({
-      ...prev,
-      camera_keyframes: keyframes,
-    }));
-  };
+      projectRef.current = nextProject;
+      selectedSegIdRef.current = nextSelectedSegId;
+      selectionRef.current = nextSelection;
+      setProject(nextProject);
+      if (nextSel?.selectedSegId !== undefined) {
+        setSelectedSegId(nextSelectedSegId);
+      }
+      if (nextSel?.selection !== undefined) {
+        setSelection(nextSelection);
+      }
+
+      const nextHistory = recordHistoryUpdate(
+        historyRef.current,
+        prevSnapshot,
+        nextSnapshot,
+        meta
+      );
+      if (nextHistory !== historyRef.current) {
+        historyRef.current = nextHistory;
+        setHistoryState(nextHistory);
+      }
+
+      const nextDirty =
+        savedBaselineRef.current !== null
+          ? serializeProjectContent(nextProject) !== savedBaselineRef.current
+          : true;
+      setDirty(nextDirty);
+    },
+    []
+  );
+
+  const handleUpdateSegment = useCallback(
+    (updated: SegmentInput, meta?: UpdateMeta) => {
+      handleUpdateProject(
+        (prev) => ({
+          ...prev,
+          segments: prev.segments.map((s) => (s.id === updated.id ? updated : s)),
+        }),
+        meta ?? { label: "Edit clip" }
+      );
+    },
+    [handleUpdateProject]
+  );
+
+  const handleUpdateCameraKeyframes = useCallback(
+    (keyframes: CropKeyframe[], meta?: UpdateMeta) => {
+      handleUpdateProject(
+        (prev) => ({
+          ...prev,
+          camera_keyframes: keyframes,
+        }),
+        meta ?? { label: "Edit camera keyframes" }
+      );
+    },
+    [handleUpdateProject]
+  );
+
+  const handleBeginHistoryTransaction = useCallback((label: string) => {
+    const cur = projectRef.current;
+    if (!cur) return;
+    const nextHistory = beginHistoryTransaction(
+      historyRef.current,
+      {
+        project: cur,
+        selectedSegId: selectedSegIdRef.current,
+        selection: selectionRef.current,
+      },
+      label
+    );
+    historyRef.current = nextHistory;
+    setHistoryState(nextHistory);
+  }, []);
+
+  const handleEndHistoryTransaction = useCallback(() => {
+    const cur = projectRef.current;
+    if (!cur) return;
+    const nextHistory = endHistoryTransaction(historyRef.current, {
+      project: cur,
+      selectedSegId: selectedSegIdRef.current,
+      selection: selectionRef.current,
+    });
+    if (nextHistory !== historyRef.current) {
+      historyRef.current = nextHistory;
+      setHistoryState(nextHistory);
+    }
+  }, []);
+
+  const handleUndo = useCallback(() => {
+    const cur = projectRef.current;
+    if (!cur) return;
+    const res = stepUndo(historyRef.current, cur);
+    if (!res) return;
+    historyRef.current = res.state;
+    setHistoryState(res.state);
+    projectRef.current = res.restored.project;
+    selectedSegIdRef.current = res.restored.selectedSegId;
+    selectionRef.current = res.restored.selection;
+    setProject(res.restored.project);
+    setSelectedSegId(res.restored.selectedSegId);
+    setSelection(res.restored.selection);
+    const nextDirty =
+      savedBaselineRef.current !== null
+        ? serializeProjectContent(res.restored.project) !== savedBaselineRef.current
+        : true;
+    setDirty(nextDirty);
+    usageLogger.logActionOutput(
+      `Undo: ${res.entry.label}`,
+      "project.undo",
+      { label: res.entry.label, remaining_undo: res.state.past.length },
+      { projectId: res.restored.project.project_id }
+    );
+  }, []);
+
+  const handleRedo = useCallback(() => {
+    const cur = projectRef.current;
+    if (!cur) return;
+    const res = stepRedo(historyRef.current, cur);
+    if (!res) return;
+    historyRef.current = res.state;
+    setHistoryState(res.state);
+    projectRef.current = res.restored.project;
+    selectedSegIdRef.current = res.restored.selectedSegId;
+    selectionRef.current = res.restored.selection;
+    setProject(res.restored.project);
+    setSelectedSegId(res.restored.selectedSegId);
+    setSelection(res.restored.selection);
+    const nextDirty =
+      savedBaselineRef.current !== null
+        ? serializeProjectContent(res.restored.project) !== savedBaselineRef.current
+        : true;
+    setDirty(nextDirty);
+    usageLogger.logActionOutput(
+      `Redo: ${res.entry.label}`,
+      "project.redo",
+      { label: res.entry.label, remaining_redo: res.state.future.length },
+      { projectId: res.restored.project.project_id }
+    );
+  }, []);
+
+  // Global Undo/Redo keyboard shortcuts (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!projectRef.current || isModalOpenRef.current) return;
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      const key = e.key.toLowerCase();
+      if (key === "z") {
+        e.preventDefault();
+        if (e.shiftKey) {
+          handleRedo();
+        } else {
+          handleUndo();
+        }
+      } else if (key === "y" && !e.shiftKey) {
+        e.preventDefault();
+        handleRedo();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [handleUndo, handleRedo]);
 
   const handleSave = async (): Promise<ProjectInput | null> => {
-    if (!project) return null;
+    const current = projectRef.current;
+    if (!current) return null;
     usageLogger.logIntention("Save project", "project.save", {
-      projectId: project.project_id,
+      projectId: current.project_id,
       input: {
-        expected_revision: project.revision,
-        segment_count: project.segments.length,
+        expected_revision: current.revision,
+        segment_count: current.segments.length,
       },
     });
     setSaving(true);
@@ -476,11 +680,11 @@ export default function App() {
     setRevisionConflict(false);
     try {
       const bundle = await apiClient.saveProject(
-        project.project_id,
-        project,
-        project.revision
+        current.project_id,
+        current,
+        current.revision
       );
-      applyBundle(bundle);
+      applyBundle(bundle, { resetHistory: false });
       await refreshProjectList();
       usageLogger.logActionOutput(
         "Save project",
@@ -504,8 +708,8 @@ export default function App() {
         );
       }
       usageLogger.logError("Save project", "project.save_failed", err, {
-        projectId: project.project_id,
-        context: { expected_revision: project.revision },
+        projectId: current.project_id,
+        context: { expected_revision: current.revision },
       });
       return null;
     } finally {
@@ -716,7 +920,11 @@ export default function App() {
   };
 
   // Output resolution / aspect ratio change (re-clamps existing keyframes)
-  const handleChangeOutputResolution = (rawW: number, rawH: number) => {
+  const handleChangeOutputResolution = (
+    rawW: number,
+    rawH: number,
+    coalesceKey?: string
+  ) => {
     if (!project) return;
     const nextW = Math.max(2, Math.round(rawW / 2) * 2);
     const nextH = Math.max(2, Math.round(rawH / 2) * 2);
@@ -724,33 +932,15 @@ export default function App() {
     const srcW = manifest?.source_metadata?.width ?? 1920;
     const srcH = manifest?.source_metadata?.height ?? 1080;
 
-    handleUpdateProject((prev) => ({
-      ...prev,
-      output_settings: {
-        ...prev.output_settings,
-        width: nextW,
-        height: nextH,
-      },
-      camera_keyframes: (prev.camera_keyframes ?? []).map((kf) => {
-        const clamped = clampCropPosition(
-          kf.x,
-          kf.y,
-          kf.zoom,
-          srcW,
-          srcH,
-          nextW,
-          nextH
-        );
-        return {
-          ...kf,
-          x: Number(clamped.x.toFixed(4)),
-          y: Number(clamped.y.toFixed(4)),
-          zoom: Number(clamped.zoom.toFixed(3)),
-        };
-      }),
-      segments: prev.segments.map((seg) => ({
-        ...seg,
-        crop_keyframes: seg.crop_keyframes.map((kf) => {
+    handleUpdateProject(
+      (prev) => ({
+        ...prev,
+        output_settings: {
+          ...prev.output_settings,
+          width: nextW,
+          height: nextH,
+        },
+        camera_keyframes: (prev.camera_keyframes ?? []).map((kf) => {
           const clamped = clampCropPosition(
             kf.x,
             kf.y,
@@ -767,8 +957,32 @@ export default function App() {
             zoom: Number(clamped.zoom.toFixed(3)),
           };
         }),
-      })),
-    }));
+        segments: prev.segments.map((seg) => ({
+          ...seg,
+          crop_keyframes: seg.crop_keyframes.map((kf) => {
+            const clamped = clampCropPosition(
+              kf.x,
+              kf.y,
+              kf.zoom,
+              srcW,
+              srcH,
+              nextW,
+              nextH
+            );
+            return {
+              ...kf,
+              x: Number(clamped.x.toFixed(4)),
+              y: Number(clamped.y.toFixed(4)),
+              zoom: Number(clamped.zoom.toFixed(3)),
+            };
+          }),
+        })),
+      }),
+      {
+        label: `Change output resolution (${nextW}×${nextH})`,
+        coalesceKey,
+      }
+    );
     usageLogger.logActionOutput(
       "Change output resolution",
       "project.resolution_change",
@@ -805,16 +1019,18 @@ export default function App() {
       crop_keyframes: [{ t: 0.0, x: initialX, y: initialY, zoom: 1.0 }],
       clauses: [],
     };
-    handleUpdateProject((prev) => ({
-      ...prev,
-      camera_keyframes:
-        prev.camera_keyframes && prev.camera_keyframes.length > 0
-          ? prev.camera_keyframes
-          : [{ t: 0.0, x: initialX, y: initialY, zoom: 1.0, transition: "tween" }],
-      segments: [...prev.segments, newSeg],
-    }));
-    setSelectedSegId(id);
-    setSelection({ type: "video", segId: id });
+    handleUpdateProject(
+      (prev) => ({
+        ...prev,
+        camera_keyframes:
+          prev.camera_keyframes && prev.camera_keyframes.length > 0
+            ? prev.camera_keyframes
+            : [{ t: 0.0, x: initialX, y: initialY, zoom: 1.0, transition: "tween" }],
+        segments: [...prev.segments, newSeg],
+      }),
+      { label: `Add clip ${id}` },
+      { selectedSegId: id, selection: { type: "video", segId: id } }
+    );
     setMonitorMode("timeline");
     setProjectTime(timelineLayout.totalDuration);
     setSourceTime(videoIn);
@@ -839,12 +1055,15 @@ export default function App() {
       crop_keyframes: orig.crop_keyframes.map((k) => ({ ...k })),
       clauses: orig.clauses.map((c) => ({ ...c })),
     };
-    handleUpdateProject((prev) => {
-      const next = [...prev.segments];
-      next.splice(index + 1, 0, copy);
-      return { ...prev, segments: next };
-    });
-    setSelectedSegId(newId);
+    handleUpdateProject(
+      (prev) => {
+        const next = [...prev.segments];
+        next.splice(index + 1, 0, copy);
+        return { ...prev, segments: next };
+      },
+      { label: `Duplicate clip ${orig.id}` },
+      { selectedSegId: newId, selection: { type: "video", segId: newId } }
+    );
     usageLogger.logActionOutput(
       "Duplicate segment",
       "segment.duplicate",
@@ -857,11 +1076,17 @@ export default function App() {
     if (!project) return;
     const removed = project.segments[index];
     const next = project.segments.filter((_, i) => i !== index);
-    handleUpdateProject((prev) => ({ ...prev, segments: next }));
-    if (selectedSegId === removed.id) {
-      setSelectedSegId(next[Math.max(0, index - 1)]?.id ?? null);
-      setSelection(null);
-    }
+    const nextSelId =
+      selectedSegId === removed.id
+        ? next[Math.max(0, index - 1)]?.id ?? null
+        : selectedSegId;
+    const nextSel: TimelineSelection =
+      selectedSegId === removed.id ? null : selection;
+    handleUpdateProject(
+      (prev) => ({ ...prev, segments: next }),
+      { label: `Delete clip ${removed.id}` },
+      { selectedSegId: nextSelId, selection: nextSel }
+    );
     usageLogger.logActionOutput(
       "Delete segment",
       "segment.delete",
@@ -882,16 +1107,18 @@ export default function App() {
       return;
     }
     const moved = project.segments[fromIndex];
-    handleUpdateProject((prev) => {
-      const next = [...prev.segments];
-      const [item] = next.splice(fromIndex, 1);
-      next.splice(toIndex, 0, item);
-      return { ...prev, segments: next };
-    });
-    if (moved) {
-      setSelectedSegId(moved.id);
-      setSelection({ type: "video", segId: moved.id });
-    }
+    handleUpdateProject(
+      (prev) => {
+        const next = [...prev.segments];
+        const [item] = next.splice(fromIndex, 1);
+        next.splice(toIndex, 0, item);
+        return { ...prev, segments: next };
+      },
+      { label: `Reorder clip ${moved?.id ?? ""}`.trim() },
+      moved
+        ? { selectedSegId: moved.id, selection: { type: "video", segId: moved.id } }
+        : undefined
+    );
     usageLogger.logActionOutput(
       "Reorder timeline clips",
       "segment.reorder",
@@ -923,13 +1150,15 @@ export default function App() {
     );
     if (!split) return;
     const [firstSeg, secondSeg] = split;
-    handleUpdateProject((prev) => {
-      const next = [...prev.segments];
-      next.splice(idx, 1, firstSeg, secondSeg);
-      return { ...prev, segments: next };
-    });
-    setSelectedSegId(secondSeg.id);
-    setSelection({ type: "video", segId: secondSeg.id });
+    handleUpdateProject(
+      (prev) => {
+        const next = [...prev.segments];
+        next.splice(idx, 1, firstSeg, secondSeg);
+        return { ...prev, segments: next };
+      },
+      { label: `Split clip ${segId}` },
+      { selectedSegId: secondSeg.id, selection: { type: "video", segId: secondSeg.id } }
+    );
     usageLogger.logActionOutput(
       "Split clip at playhead",
       "segment.split",
@@ -1129,9 +1358,17 @@ export default function App() {
     previewModalOpen ||
     exportModalOpen ||
     logModalOpen;
+  isModalOpenRef.current = isModalOpen;
   const sourceBroken =
     sourceStatus &&
     (sourceStatus.status === "missing" || sourceStatus.status === "modified");
+
+  const canUndo = historyState.past.length > 0;
+  const canRedo = historyState.future.length > 0;
+  const lastUndoLabel = canUndo
+    ? historyState.past[historyState.past.length - 1].label
+    : null;
+  const nextRedoLabel = canRedo ? historyState.future[0].label : null;
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#0f1115] text-zinc-100">
@@ -1239,7 +1476,8 @@ export default function App() {
                       onChange={(e) =>
                         handleChangeOutputResolution(
                           Number(e.target.value) || 2,
-                          project.output_settings.height
+                          project.output_settings.height,
+                          "output-width"
                         )
                       }
                       className="w-14 rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 font-mono text-[11px] text-zinc-100"
@@ -1254,13 +1492,47 @@ export default function App() {
                       onChange={(e) =>
                         handleChangeOutputResolution(
                           project.output_settings.width,
-                          Number(e.target.value) || 2
+                          Number(e.target.value) || 2,
+                          "output-height"
                         )
                       }
                       className="w-14 rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 font-mono text-[11px] text-zinc-100"
                     />
                   </div>
                 )}
+              </div>
+
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  aria-label="Undo"
+                  disabled={!canUndo}
+                  onClick={handleUndo}
+                  title={
+                    lastUndoLabel
+                      ? `Undo: ${lastUndoLabel} (Ctrl+Z)`
+                      : "Nothing to undo (Ctrl+Z)"
+                  }
+                  className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs font-medium text-zinc-200 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Undo2 className="h-3.5 w-3.5" />
+                  <span className="hidden md:inline">Undo</span>
+                </button>
+                <button
+                  type="button"
+                  aria-label="Redo"
+                  disabled={!canRedo}
+                  onClick={handleRedo}
+                  title={
+                    nextRedoLabel
+                      ? `Redo: ${nextRedoLabel} (Ctrl+Shift+Z)`
+                      : "Nothing to redo (Ctrl+Shift+Z)"
+                  }
+                  className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs font-medium text-zinc-200 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Redo2 className="h-3.5 w-3.5" />
+                  <span className="hidden md:inline">Redo</span>
+                </button>
               </div>
 
               <span className="hidden sm:inline text-[11px] font-mono text-zinc-400">
@@ -1443,6 +1715,8 @@ export default function App() {
                     }}
                     onUpdateSegment={handleUpdateSegment}
                     onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
+                    onBeginHistoryTransaction={handleBeginHistoryTransaction}
+                    onEndHistoryTransaction={handleEndHistoryTransaction}
                     onRenderPreview={handleRenderPreview}
                     canPreview={project.segments.length > 0}
                     previewBusy={
@@ -1544,6 +1818,8 @@ export default function App() {
             }}
             onUpdateSegment={handleUpdateSegment}
             onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
+            onBeginHistoryTransaction={handleBeginHistoryTransaction}
+            onEndHistoryTransaction={handleEndHistoryTransaction}
             onReorderSegments={handleReorderSegments}
             onSplitSegment={handleSplitSegment}
             onToggleProjectPlayback={handleToggleProjectPlayback}

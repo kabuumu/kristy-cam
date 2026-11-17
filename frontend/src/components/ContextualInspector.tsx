@@ -44,8 +44,14 @@ interface ContextualInspectorProps {
   voices: string[];
   ttsError: string | null;
   lastSynthesizedSignatures: Record<string, string>;
-  onUpdateProject: (updater: (prev: ProjectInput) => ProjectInput) => void;
-  onUpdateSegment: (updated: SegmentInput) => void;
+  onUpdateProject: (
+    updater: (prev: ProjectInput) => ProjectInput,
+    meta?: { label?: string; coalesceKey?: string }
+  ) => void;
+  onUpdateSegment: (
+    updated: SegmentInput,
+    meta?: { label?: string; coalesceKey?: string }
+  ) => void;
   onDuplicateSegment: (segId: string) => void;
   onDeleteSegment: (segId: string) => void;
   onSplitSegment?: () => void;
@@ -258,20 +264,26 @@ export function ContextualInspector({
     const k = newPronKey.trim();
     const v = newPronVal.trim();
     if (!k || !v) return;
-    onUpdateProject((prev) => ({
-      ...prev,
-      pronunciations: { ...prev.pronunciations, [k]: v },
-    }));
+    onUpdateProject(
+      (prev) => ({
+        ...prev,
+        pronunciations: { ...prev.pronunciations, [k]: v },
+      }),
+      { label: `Add pronunciation "${k}"` }
+    );
     setNewPronKey("");
     setNewPronVal("");
   };
 
   const handleDeletePronunciation = (key: string) => {
-    onUpdateProject((prev) => {
-      const next = { ...prev.pronunciations };
-      delete next[key];
-      return { ...prev, pronunciations: next };
-    });
+    onUpdateProject(
+      (prev) => {
+        const next = { ...prev.pronunciations };
+        delete next[key];
+        return { ...prev, pronunciations: next };
+      },
+      { label: `Delete pronunciation "${key}"` }
+    );
   };
 
   const renderVideoInspector = (seg: SegmentInput) => {
@@ -299,7 +311,12 @@ export function ContextualInspector({
             max={seg.video_out}
             strictLessThanMax
             value={seg.video_in}
-            onCommit={(val) => onUpdateSegment({ ...seg, video_in: val })}
+            onCommit={(val) =>
+              onUpdateSegment(
+                { ...seg, video_in: val },
+                { label: "Edit clip start", coalesceKey: `video-in-${seg.id}` }
+              )
+            }
             className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
           />
         </label>
@@ -312,7 +329,12 @@ export function ContextualInspector({
             max={srcDur}
             strictGreaterThanMin
             value={seg.video_out}
-            onCommit={(val) => onUpdateSegment({ ...seg, video_out: val })}
+            onCommit={(val) =>
+              onUpdateSegment(
+                { ...seg, video_out: val },
+                { label: "Edit clip end", coalesceKey: `video-out-${seg.id}` }
+              )
+            }
             className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
           />
         </label>
@@ -323,10 +345,13 @@ export function ContextualInspector({
             aria-label="Duration Mode"
             value={seg.duration_mode}
             onChange={(e) =>
-              onUpdateSegment({
-                ...seg,
-                duration_mode: e.target.value as DurationMode,
-              })
+              onUpdateSegment(
+                {
+                  ...seg,
+                  duration_mode: e.target.value as DurationMode,
+                },
+                { label: "Change clip length mode" }
+              )
             }
             className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-zinc-100 focus:border-emerald-500 focus:outline-none"
           >
@@ -353,10 +378,13 @@ export function ContextualInspector({
             step={0.05}
             value={seg.source_audio_volume}
             onChange={(e) =>
-              onUpdateSegment({
-                ...seg,
-                source_audio_volume: parseFloat(e.target.value),
-              })
+              onUpdateSegment(
+                {
+                  ...seg,
+                  source_audio_volume: parseFloat(e.target.value),
+                },
+                { label: "Adjust game audio volume", coalesceKey: `volume-${seg.id}` }
+              )
             }
           />
         </label>
@@ -603,11 +631,17 @@ export function ContextualInspector({
       clause.duration_sec ??
       (timing ? Math.max(0.2, timing.end_sec - timing.start_sec) : 1.5);
 
-    const updateClause = (patch: Partial<ClauseInput>) => {
+    const updateClause = (
+      patch: Partial<ClauseInput>,
+      meta?: { label?: string; coalesceKey?: string }
+    ) => {
       const next = seg.clauses.map((c, i) =>
         i === idx ? { ...c, ...patch } : c
       );
-      onUpdateSegment({ ...seg, clauses: next });
+      onUpdateSegment(
+        { ...seg, clauses: next },
+        meta ?? { label: `Edit caption ${clause.id}` }
+      );
     };
 
     const handleSplit = () => {
@@ -641,7 +675,10 @@ export function ContextualInspector({
         ...newClauses,
         ...seg.clauses.slice(idx + 1),
       ];
-      onUpdateSegment({ ...seg, clauses: next });
+      onUpdateSegment(
+        { ...seg, clauses: next },
+        { label: `Split caption ${clause.id}` }
+      );
     };
 
     const resolvedSpoken = resolveClauseSpokenText(clause, project.pronunciations);
@@ -664,7 +701,10 @@ export function ContextualInspector({
                 type="button"
                 onClick={() => {
                   const next = seg.clauses.filter((_, i) => i !== idx);
-                  onUpdateSegment({ ...seg, clauses: next });
+                  onUpdateSegment(
+                    { ...seg, clauses: next },
+                    { label: `Delete caption ${clause.id}` }
+                  );
                   onSelectItem({ type: "video", segId: seg.id });
                 }}
                 className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] text-rose-300 hover:bg-rose-500/20"
@@ -680,7 +720,15 @@ export function ContextualInspector({
             <textarea
               rows={2}
               value={clause.display_text}
-              onChange={(e) => updateClause({ display_text: e.target.value })}
+              onChange={(e) =>
+                updateClause(
+                  { display_text: e.target.value },
+                  {
+                    label: "Edit caption text",
+                    coalesceKey: `clause-display-${seg.id}-${clause.id}`,
+                  }
+                )
+              }
               placeholder="On-screen caption..."
               className="w-full rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-zinc-100 focus:border-emerald-500 focus:outline-none"
             />
@@ -692,10 +740,16 @@ export function ContextualInspector({
               type="text"
               value={clause.spoken_text_override ?? ""}
               onChange={(e) =>
-                updateClause({
-                  spoken_text_override:
-                    e.target.value.length > 0 ? e.target.value : null,
-                })
+                updateClause(
+                  {
+                    spoken_text_override:
+                      e.target.value.length > 0 ? e.target.value : null,
+                  },
+                  {
+                    label: "Edit alternate narration",
+                    coalesceKey: `clause-spoken-${seg.id}-${clause.id}`,
+                  }
+                )
               }
               placeholder="Leave blank to speak caption text..."
               className="w-full rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-zinc-100 focus:border-emerald-500 focus:outline-none"
@@ -714,7 +768,15 @@ export function ContextualInspector({
                 step={0.1}
                 min={0}
                 value={effectiveStart}
-                onCommit={(val) => updateClause({ start_sec: val })}
+                onCommit={(val) =>
+                  updateClause(
+                    { start_sec: val },
+                    {
+                      label: "Edit caption start",
+                      coalesceKey: `clause-start-${seg.id}-${clause.id}`,
+                    }
+                  )
+                }
                 className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
               />
             </label>
@@ -725,7 +787,15 @@ export function ContextualInspector({
                 step={0.1}
                 min={0.2}
                 value={effectiveDur}
-                onCommit={(val) => updateClause({ duration_sec: val })}
+                onCommit={(val) =>
+                  updateClause(
+                    { duration_sec: val },
+                    {
+                      label: "Edit caption length",
+                      coalesceKey: `clause-dur-${seg.id}-${clause.id}`,
+                    }
+                  )
+                }
                 className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
               />
             </label>
@@ -746,10 +816,13 @@ export function ContextualInspector({
               step={0.05}
               value={seg.speed}
               onChange={(e) =>
-                onUpdateSegment({
-                  ...seg,
-                  speed: parseFloat(e.target.value),
-                })
+                onUpdateSegment(
+                  {
+                    ...seg,
+                    speed: parseFloat(e.target.value),
+                  },
+                  { label: "Adjust narration speed", coalesceKey: `speed-${seg.id}` }
+                )
               }
             />
           </label>
@@ -843,13 +916,19 @@ export function ContextualInspector({
                       type="text"
                       value={v}
                       onChange={(e) =>
-                        onUpdateProject((prev) => ({
-                          ...prev,
-                          pronunciations: {
-                            ...prev.pronunciations,
-                            [k]: e.target.value,
-                          },
-                        }))
+                        onUpdateProject(
+                          (prev) => ({
+                            ...prev,
+                            pronunciations: {
+                              ...prev.pronunciations,
+                              [k]: e.target.value,
+                            },
+                          }),
+                          {
+                            label: `Edit pronunciation "${k}"`,
+                            coalesceKey: `pron-${k}`,
+                          }
+                        )
                       }
                       className="min-w-0 flex-1 rounded border border-zinc-800 bg-zinc-950 px-1.5 py-0.5 text-emerald-200"
                     />
@@ -886,7 +965,10 @@ export function ContextualInspector({
             aria-label="Project Voice"
             value={project.voice}
             onChange={(e) =>
-              onUpdateProject((prev) => ({ ...prev, voice: e.target.value }))
+              onUpdateProject(
+                (prev) => ({ ...prev, voice: e.target.value }),
+                { label: `Change voice (${e.target.value})` }
+              )
             }
             className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-100 focus:border-emerald-500 focus:outline-none"
           >
