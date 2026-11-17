@@ -190,6 +190,113 @@ def evaluate_crop_at(
     return CropBox(x_px=x_px, y_px=y_px, w_px=ideal_w, h_px=ideal_h, zoom=zoom)
 
 
+def slice_camera_keyframes_for_segment(
+    camera_keyframes: Sequence[CropKeyframe],
+    clip_start: float,
+    clip_dur: float,
+    width: int,
+    height: int,
+    output_width: int = 1080,
+    output_height: int = 1920,
+) -> list[CropKeyframe]:
+    """Project-level camera_keyframes -> segment-local keyframes over [clip_start, clip_start + clip_dur]."""
+    if not camera_keyframes:
+        raise GeometryValidationError("camera_keyframes must be non-empty")
+
+    def _active_transition_at(t_global: float) -> str:
+        for idx in range(len(camera_keyframes) - 1):
+            k0 = camera_keyframes[idx]
+            k1 = camera_keyframes[idx + 1]
+            if k0.t <= t_global < k1.t:
+                return k0.transition
+        return "tween"
+
+    box_start = evaluate_crop_at(
+        camera_keyframes,
+        clip_start,
+        width,
+        height,
+        output_width=output_width,
+        output_height=output_height,
+    )
+    start_x, start_y = clamp_normalized_coords(
+        box_start.x_px / float(width),
+        box_start.y_px / float(height),
+        box_start.zoom,
+        width,
+        height,
+        output_width=output_width,
+        output_height=output_height,
+    )
+    result: list[CropKeyframe] = [
+        CropKeyframe(
+            t=0.0,
+            x=round(start_x, 6),
+            y=round(start_y, 6),
+            zoom=round(box_start.zoom, 6),
+            transition=_active_transition_at(clip_start),  # type: ignore[arg-type]
+        )
+    ]
+
+    clip_end = clip_start + max(0.0, clip_dur)
+    last_global_t = clip_start
+    for kf in camera_keyframes:
+        if clip_start + 1e-4 < kf.t < clip_end - 1e-4:
+            cx, cy = clamp_normalized_coords(
+                kf.x,
+                kf.y,
+                kf.zoom,
+                width,
+                height,
+                output_width=output_width,
+                output_height=output_height,
+            )
+            result.append(
+                CropKeyframe(
+                    t=round(kf.t - clip_start, 6),
+                    x=round(cx, 6),
+                    y=round(cy, 6),
+                    zoom=round(kf.zoom, 6),
+                    transition=kf.transition,
+                )
+            )
+            last_global_t = kf.t
+
+    if clip_dur > 1e-4 and camera_keyframes[-1].t > last_global_t + 1e-4:
+        # Check if there is a keyframe at or after clip_end
+        if any(kf.t >= clip_end - 1e-4 for kf in camera_keyframes):
+            box_end = evaluate_crop_at(
+                camera_keyframes,
+                clip_end,
+                width,
+                height,
+                output_width=output_width,
+                output_height=output_height,
+            )
+            end_x, end_y = clamp_normalized_coords(
+                box_end.x_px / float(width),
+                box_end.y_px / float(height),
+                box_end.zoom,
+                width,
+                height,
+                output_width=output_width,
+                output_height=output_height,
+            )
+            local_end = round(clip_dur, 6)
+            if local_end > result[-1].t + 1e-5:
+                result.append(
+                    CropKeyframe(
+                        t=local_end,
+                        x=round(end_x, 6),
+                        y=round(end_y, 6),
+                        zoom=round(box_end.zoom, 6),
+                        transition="tween",
+                    )
+                )
+
+    return result
+
+
 def detect_trim_out_of_range(
     keyframes: Sequence[CropKeyframe],
     new_duration: float,

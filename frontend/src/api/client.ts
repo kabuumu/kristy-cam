@@ -235,9 +235,9 @@ export const apiClient = {
     );
   },
 
-  renderPreview(projectId: string, segId: string): Promise<JobAccepted> {
+  renderPreview(projectId: string): Promise<JobAccepted> {
     return request(
-      `/api/projects/${encodeURIComponent(projectId)}/segments/${encodeURIComponent(segId)}/preview`,
+      `/api/projects/${encodeURIComponent(projectId)}/preview`,
       { method: "POST" }
     );
   },

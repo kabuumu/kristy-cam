@@ -39,13 +39,17 @@ interface CropCanvasProps {
   tailPaddingSec: number;
   sourceTime: number;
   segTime?: number | null;
+  projectTime?: number;
+  cameraKeyframes?: CropKeyframe[];
   isPlaying: boolean;
   isProjectPlaying?: boolean;
   preparingPlayback?: boolean;
   onTogglePlay: () => void;
   onSourceTimeChange: (t: number) => void;
   onUpdateSegment: (updated: SegmentInput) => void;
-  onRenderPreview: (segId: string) => void;
+  onUpdateCameraKeyframes?: (keyframes: CropKeyframe[]) => void;
+  onRenderPreview: () => void;
+  canPreview?: boolean;
   previewBusy: boolean;
   previewModalOpen: boolean;
   onSetPreviewModalOpen: (open: boolean) => void;
@@ -67,13 +71,17 @@ export function CropCanvas({
   tailPaddingSec,
   sourceTime,
   segTime = null,
+  projectTime = 0,
+  cameraKeyframes,
   isPlaying,
   isProjectPlaying = false,
   preparingPlayback = false,
   onTogglePlay,
   onSourceTimeChange,
   onUpdateSegment,
+  onUpdateCameraKeyframes,
   onRenderPreview,
+  canPreview = false,
   previewBusy,
   previewModalOpen,
   onSetPreviewModalOpen,
@@ -316,28 +324,30 @@ export function CropCanvas({
     const withinAudio = audioDur > 0 && segRelTime < audioDur - 0.02;
 
     if (isPlaying && withinAudio) {
-      const drift = Math.abs(aud.currentTime - segRelTime);
-      if (drift > 0.25) {
-        const now = performance.now();
-        if (
-          now - playbackStartedAtRef.current > 250 &&
-          now - lastResyncLogAtRef.current.audio > 500
-        ) {
-          lastResyncLogAtRef.current.audio = now;
-          playbackCountersRef.current.audioResyncs += 1;
-          usageLogger.logActionOutput(
-            "Resync voiceover audio during playback",
-            "playback.resync",
-            {
-              media: "audio",
-              actual_time: Number(aud.currentTime.toFixed(3)),
-              expected_time: Number(segRelTime.toFixed(3)),
-              is_video_frozen: isVideoFrozen,
-            },
-            { projectId, segId: segment?.id ?? null }
-          );
+      if (aud.readyState >= 1) {
+        const drift = Math.abs(aud.currentTime - segRelTime);
+        if (drift > 0.25) {
+          const now = performance.now();
+          if (
+            now - playbackStartedAtRef.current > 250 &&
+            now - lastResyncLogAtRef.current.audio > 500
+          ) {
+            lastResyncLogAtRef.current.audio = now;
+            playbackCountersRef.current.audioResyncs += 1;
+            usageLogger.logActionOutput(
+              "Resync voiceover audio during playback",
+              "playback.resync",
+              {
+                media: "audio",
+                actual_time: Number(aud.currentTime.toFixed(3)),
+                expected_time: Number(segRelTime.toFixed(3)),
+                is_video_frozen: isVideoFrozen,
+              },
+              { projectId, segId: segment?.id ?? null }
+            );
+          }
+          aud.currentTime = Math.max(0, segRelTime);
         }
-        aud.currentTime = Math.max(0, segRelTime);
       }
       if (aud.paused) {
         aud.play().catch(() => {});
@@ -346,7 +356,7 @@ export function CropCanvas({
       if (!aud.paused) {
         aud.pause();
       }
-      if (!isPlaying && audioDur > 0) {
+      if (!isPlaying && audioDur > 0 && aud.readyState >= 1) {
         const clamped = Math.max(0, Math.min(audioDur, segRelTime));
         if (Math.abs(aud.currentTime - clamped) > 0.08) {
           aud.currentTime = clamped;
@@ -355,10 +365,26 @@ export function CropCanvas({
     }
   }, [isPlaying, segRelTime, voiceAudioUrl, audioDur, isVideoFrozen, projectId, segment]);
 
-  // Evaluated crop at current segment time
-  const currentCrop = segment
-    ? evaluateCropAt(segment.crop_keyframes, segRelTime, srcW, srcH, outputWidth, outputHeight)
-    : clampCropPosition(0.28, 0, 1.0, srcW, srcH, outputWidth, outputHeight);
+  const useProjectCamera = Boolean(
+    cameraKeyframes && cameraKeyframes.length > 0 && onUpdateCameraKeyframes
+  );
+  const activeKeyframes = useProjectCamera
+    ? cameraKeyframes!
+    : segment?.crop_keyframes ?? [];
+  const activeKeyframeTime = useProjectCamera ? projectTime : segRelTime;
+
+  // Evaluated crop at current project/segment time
+  const currentCrop =
+    activeKeyframes.length > 0
+      ? evaluateCropAt(
+          activeKeyframes,
+          activeKeyframeTime,
+          srcW,
+          srcH,
+          outputWidth,
+          outputHeight
+        )
+      : clampCropPosition(0.28, 0, 1.0, srcW, srcH, outputWidth, outputHeight);
 
   const ideal = computeIdealCrop(srcW, srcH, currentCrop.zoom, outputWidth, outputHeight);
   const boxLeftPct = (currentCrop.x * 100);
@@ -372,17 +398,18 @@ export function CropCanvas({
     y: number,
     zoom: number
   ) => {
-    if (!segment) return;
+    if (!useProjectCamera && !segment) return;
     const clamped = clampCropPosition(x, y, zoom, srcW, srcH, outputWidth, outputHeight);
     const roundedT = Number(Math.max(0, t).toFixed(3));
-    const existingIdx = segment.crop_keyframes.findIndex(
+    const existingIdx = activeKeyframes.findIndex(
       (kf) => Math.abs(kf.t - roundedT) < 0.05
     );
     let nextKfs: CropKeyframe[];
     if (existingIdx >= 0) {
-      nextKfs = segment.crop_keyframes.map((kf, idx) =>
+      nextKfs = activeKeyframes.map((kf, idx) =>
         idx === existingIdx
           ? {
+              ...kf,
               t: idx === 0 ? 0 : kf.t,
               x: Number(clamped.x.toFixed(4)),
               y: Number(clamped.y.toFixed(4)),
@@ -392,21 +419,26 @@ export function CropCanvas({
       );
     } else {
       nextKfs = [
-        ...segment.crop_keyframes,
+        ...activeKeyframes,
         {
           t: roundedT,
           x: Number(clamped.x.toFixed(4)),
           y: Number(clamped.y.toFixed(4)),
           zoom: Number(clamped.zoom.toFixed(3)),
+          transition: "tween" as const,
         },
       ].sort((a, b) => a.t - b.t);
     }
-    onUpdateSegment({ ...segment, crop_keyframes: nextKfs });
+    if (useProjectCamera && onUpdateCameraKeyframes) {
+      onUpdateCameraKeyframes(nextKfs);
+    } else if (segment) {
+      onUpdateSegment({ ...segment, crop_keyframes: nextKfs });
+    }
   };
 
   // Dragging handlers for bounding box & corner zoom handles
   useEffect(() => {
-    if (!dragMode || !segment) return;
+    if (!dragMode || (!useProjectCamera && !segment)) return;
 
     const handleMouseMove = (e: MouseEvent) => {
       const rect = stageRef.current?.getBoundingClientRect();
@@ -416,7 +448,7 @@ export function CropCanvas({
         const dxNorm = (e.clientX - dragMode.startClientX) / rect.width;
         const dyNorm = (e.clientY - dragMode.startClientY) / rect.height;
         upsertKeyframeAt(
-          segRelTime,
+          activeKeyframeTime,
           dragMode.origX + dxNorm,
           dragMode.origY + dyNorm,
           currentCrop.zoom
@@ -427,7 +459,7 @@ export function CropCanvas({
         const delta = (dragMode.corner.includes("r") ? dx : -dx) + (dragMode.corner.includes("b") ? dy : -dy);
         const nextZoom = Math.min(3.0, Math.max(1.0, dragMode.origZoom - delta * 0.005));
         upsertKeyframeAt(
-          segRelTime,
+          activeKeyframeTime,
           dragMode.origX,
           dragMode.origY,
           nextZoom
@@ -471,7 +503,7 @@ export function CropCanvas({
     });
   };
 
-  const previewArtifactId = segArtifacts?.preview_artifact_id ?? null;
+  const previewArtifactId = manifest.latest_preview_artifact_id ?? null;
 
   return (
     <section className="flex flex-1 flex-col overflow-hidden rounded-xl border border-zinc-800 bg-[#151821]">
@@ -522,11 +554,11 @@ export function CropCanvas({
             Safe Area
           </button>
 
-          {segment && (
+          {(canPreview || segment) && (
             <button
               type="button"
-              disabled={previewBusy}
-              onClick={() => onRenderPreview(segment.id)}
+              disabled={previewBusy || !canPreview}
+              onClick={() => onRenderPreview()}
               className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {previewBusy ? (
@@ -541,7 +573,7 @@ export function CropCanvas({
       </div>
 
       {/* Trim-shift out-of-range keyframe warning banner */}
-      {segment && outOfRangeKeyframes.length > 0 && (
+      {!useProjectCamera && segment && outOfRangeKeyframes.length > 0 && (
         <div
           className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-500/40 bg-amber-500/15 px-3 py-2 text-xs text-amber-200"
           role="alert"
@@ -623,7 +655,7 @@ export function CropCanvas({
           )}
 
           {/* Crop Overlay */}
-          {segment && (
+          {(useProjectCamera || segment) && (
             <div
               className="absolute border-2 border-emerald-400 cursor-move"
               style={{
@@ -728,12 +760,12 @@ export function CropCanvas({
           )}
         </div>
 
-        {segment && (
+        {(useProjectCamera || segment) && (
           <button
             type="button"
             onClick={() =>
               upsertKeyframeAt(
-                segRelTime,
+                activeKeyframeTime,
                 currentCrop.x,
                 currentCrop.y,
                 currentCrop.zoom
@@ -742,7 +774,7 @@ export function CropCanvas({
             className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-amber-200 hover:bg-amber-500/25"
           >
             <Plus className="h-3.5 w-3.5" />
-            Add Keyframe @{segRelTime.toFixed(2)}s
+            Add Keyframe @{activeKeyframeTime.toFixed(2)}s
           </button>
         )}
       </div>
@@ -753,12 +785,12 @@ export function CropCanvas({
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
           role="dialog"
           aria-modal="true"
-          aria-label="Segment Preview Player"
+          aria-label="Project Preview Player"
         >
           <div className="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-xl border border-zinc-700 bg-[#151821] shadow-2xl">
             <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5">
               <span className="text-sm font-semibold text-zinc-100">
-                Full-Res Segment Preview ({outputWidth}×{outputHeight})
+                Full-Res Project Preview ({outputWidth}×{outputHeight})
               </span>
               <button
                 type="button"
@@ -770,7 +802,7 @@ export function CropCanvas({
             </div>
             <div className="flex items-center justify-center bg-black p-3">
               {(() => {
-                const previewVersion = segArtifacts?.preview_path ?? segArtifacts?.render_hash ?? "";
+                const previewVersion = manifest.latest_preview_path ?? "";
                 const previewSrc = `${apiClient.mediaUrl(projectId, previewArtifactId)}?v=${encodeURIComponent(previewVersion)}`;
                 return (
                   <video

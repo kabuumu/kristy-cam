@@ -325,8 +325,9 @@ export function ContextualInspector({
     );
   };
 
-  const renderKeyframeInspector = (seg: SegmentInput, kfIndex: number) => {
-    const kf = seg.crop_keyframes[kfIndex];
+  const renderKeyframeInspector = (kfIndex: number) => {
+    const cameraKeyframes = project.camera_keyframes ?? [];
+    const kf = cameraKeyframes[kfIndex];
     if (!kf) return null;
 
     const updateKf = (patch: Partial<typeof kf>) => {
@@ -340,11 +341,11 @@ export function ContextualInspector({
         outW,
         outH
       );
-      const next = seg.crop_keyframes.map((item, idx) =>
+      const next = cameraKeyframes.map((item, idx) =>
         idx === kfIndex
           ? {
               ...merged,
-              t: idx === 0 ? 0 : Number(Math.max(0.01, merged.t).toFixed(2)),
+              t: idx === 0 ? 0 : Number(Math.max(0.05, merged.t).toFixed(2)),
               x: Number(clamped.x.toFixed(4)),
               y: Number(clamped.y.toFixed(4)),
               zoom: Number(clamped.zoom.toFixed(3)),
@@ -354,7 +355,7 @@ export function ContextualInspector({
       if (kfIndex > 0) {
         next.sort((a, b) => a.t - b.t);
       }
-      onUpdateSegment({ ...seg, crop_keyframes: next });
+      onUpdateProject((prev) => ({ ...prev, camera_keyframes: next }));
     };
 
     const transition: KeyframeTransition = kf.transition ?? "tween";
@@ -370,9 +371,11 @@ export function ContextualInspector({
               <button
                 type="button"
                 onClick={() => {
-                  const next = seg.crop_keyframes.filter((_, i) => i !== kfIndex);
-                  onUpdateSegment({ ...seg, crop_keyframes: next });
-                  onSelectItem({ type: "video", segId: seg.id });
+                  const next = cameraKeyframes.filter((_, i) => i !== kfIndex);
+                  onUpdateProject((prev) => ({ ...prev, camera_keyframes: next }));
+                  onSelectItem(
+                    selectedSegment ? { type: "video", segId: selectedSegment.id } : null
+                  );
                 }}
                 className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-rose-300 hover:bg-rose-500/20"
               >
@@ -381,6 +384,23 @@ export function ContextualInspector({
               </button>
             )}
           </div>
+
+          {kfIndex > 0 && (
+            <label className="flex flex-col gap-1">
+              <span className="text-zinc-400">Project Time (s)</span>
+              <input
+                type="number"
+                step={0.05}
+                min={0.05}
+                value={Number(kf.t.toFixed(2))}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  if (Number.isFinite(v) && v >= 0.05) updateKf({ t: v });
+                }}
+                className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100 focus:border-emerald-500 focus:outline-none"
+              />
+            </label>
+          )}
 
           <div className="grid grid-cols-2 gap-2.5">
             <label className="flex flex-col gap-1">
@@ -666,6 +686,7 @@ export function ContextualInspector({
           {ttsError && <p className="text-[11px] text-rose-300">{ttsError}</p>}
           {segArtifacts?.audio_artifact_id && (
             <audio
+              key={`${segArtifacts.audio_artifact_id}-${segArtifacts.tts_hash ?? ""}`}
               controls
               src={`${apiClient.mediaUrl(project.project_id, segArtifacts.audio_artifact_id)}?v=${segArtifacts.tts_hash ?? ""}`}
               className="h-8 w-full"
@@ -783,15 +804,20 @@ export function ContextualInspector({
       </div>
 
       <div className="flex-1 overflow-y-auto p-3">
-        {!selectedSegment || !selection ? (
+        {!selection ? (
+          <div className="rounded-lg border border-dashed border-zinc-700 p-6 text-center text-xs text-zinc-400">
+            Select a Video clip, Camera keyframe, or Narration &amp; Caption block
+            on the timeline to edit its options.
+          </div>
+        ) : selection.type === "keyframe" ? (
+          renderKeyframeInspector(selection.index)
+        ) : !selectedSegment ? (
           <div className="rounded-lg border border-dashed border-zinc-700 p-6 text-center text-xs text-zinc-400">
             Select a Video clip, Camera keyframe, or Narration &amp; Caption block
             on the timeline to edit its options.
           </div>
         ) : selection.type === "video" ? (
           renderVideoInspector(selectedSegment)
-        ) : selection.type === "keyframe" ? (
-          renderKeyframeInspector(selectedSegment, selection.index)
         ) : (
           renderClauseInspector(selectedSegment, selection.index)
         )}

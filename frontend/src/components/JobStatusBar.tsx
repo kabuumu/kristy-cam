@@ -42,7 +42,7 @@ export function JobStatusBar({
   const jobLabelMap: Record<JobState["job_type"], string> = {
     proxy: "Proxy Transcode",
     tts: "Voiceover Synthesis",
-    preview: "Segment Preview",
+    preview: "Project Preview",
     export: "Final Export",
   };
 

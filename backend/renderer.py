@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from backend.bootstrap import verify_ffmpeg, verify_font
-from backend.geometry import build_crop_filter
+from backend.geometry import build_crop_filter, slice_camera_keyframes_for_segment
 from backend.schemas import (
     ArtifactManifest,
     CaptionSettings,
@@ -155,6 +155,53 @@ def compute_preview_hash(
         "tts_hash": tts_hash,
         "display_texts": [c.display_text for c in segment.clauses],
         "caption_settings": caption_settings.model_dump(mode="json"),
+        "ass_wrap_v3": True,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def compute_project_preview_hash(
+    project: ProjectInput,
+    manifest: ArtifactManifest,
+) -> str:
+    """Compute 16-char SHA-256 content hash for a full-project captioned preview."""
+    seg_entries = []
+    for seg in project.segments:
+        seg_art = manifest.segments.get(seg.id)
+        tts_hash = (seg_art.tts_hash or "") if seg_art is not None else ""
+        render_hash = compute_render_hash(
+            segment=seg,
+            source_media=project.source_media,
+            tts_hash=tts_hash,
+            output_settings=project.output_settings,
+        )
+        seg_entries.append(
+            {
+                "id": seg.id,
+                "render_hash": render_hash,
+                "tts_hash": tts_hash,
+                "display_texts": [c.display_text for c in seg.clauses],
+                "clause_timings": [
+                    {"id": c.id, "start_sec": c.start_sec, "duration_sec": c.duration_sec}
+                    for c in seg.clauses
+                ],
+            }
+        )
+    payload = {
+        "segments": seg_entries,
+        "camera_keyframes": [
+            {
+                "t": round(float(kf.t), 6),
+                "x": round(float(kf.x), 6),
+                "y": round(float(kf.y), 6),
+                "zoom": round(float(kf.zoom), 4),
+                "transition": kf.transition,
+            }
+            for kf in project.camera_keyframes
+        ],
+        "output_settings": project.output_settings.model_dump(mode="json"),
+        "caption_settings": project.caption_settings.model_dump(mode="json"),
         "ass_wrap_v3": True,
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -756,8 +803,21 @@ def render_final_export(
             fps=project.output_settings.fps,
         )
 
+        render_segment = segment
+        if project.camera_keyframes:
+            sliced_kfs = slice_camera_keyframes_for_segment(
+                project.camera_keyframes,
+                clip_start=offset_sec,
+                clip_dur=plan.final_dur,
+                width=source_metadata.width,
+                height=source_metadata.height,
+                output_width=project.output_settings.width,
+                output_height=project.output_settings.height,
+            )
+            render_segment = segment.model_copy(update={"crop_keyframes": sliced_kfs})
+
         seg_mp4 = render_segment_stage1(
-            segment=segment,
+            segment=render_segment,
             source_media=project.source_media,
             source_metadata=source_metadata,
             output_settings=project.output_settings,
@@ -873,3 +933,53 @@ def render_final_export(
     finally:
         master_ass_path.unlink(missing_ok=True)
         concat_list_path.unlink(missing_ok=True)
+
+
+def render_project_preview(
+    project: ProjectInput,
+    source_metadata: SourceMetadata,
+    manifest: ArtifactManifest,
+    project_dir: Path,
+    ffmpeg_path: Path | None = None,
+    ffprobe_path: Path | None = None,
+    fonts_dir: Path | None = None,
+    cancel_event: threading.Event | None = None,
+    on_process_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+) -> Path:
+    """Render a full-project captioned MP4 preview (reusing Stage 1 & content-addressed preview cache)."""
+    if not project.segments:
+        raise RenderError("Project has no segments to preview")
+
+    ffmpeg_bin, ffprobe_bin = _resolve_ffmpeg_tools(ffmpeg_path, ffprobe_path)
+    preview_hash = compute_project_preview_hash(project, manifest)
+    artifacts_dir = project_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    preview_path = artifacts_dir / f"preview_project_{preview_hash}.mp4"
+
+    if preview_path.is_file():
+        try:
+            probe_rendered_video(
+                preview_path,
+                ffprobe_bin,
+                expected_width=project.output_settings.width,
+                expected_height=project.output_settings.height,
+                expected_fps=project.output_settings.fps,
+                require_audio=True,
+            )
+            return preview_path
+        except RenderError:
+            preview_path.unlink(missing_ok=True)
+
+    return render_final_export(
+        project=project,
+        source_metadata=source_metadata,
+        manifest=manifest,
+        project_dir=project_dir,
+        export_path=preview_path,
+        ffmpeg_path=ffmpeg_bin,
+        ffprobe_path=ffprobe_bin,
+        fonts_dir=fonts_dir,
+        cancel_event=cancel_event,
+        on_process_start=on_process_start,
+    )
+

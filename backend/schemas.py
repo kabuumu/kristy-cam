@@ -185,6 +185,7 @@ class ProjectInput(BaseModel):
     output_settings: OutputSettings = Field(default_factory=OutputSettings)
     caption_settings: CaptionSettings = Field(default_factory=CaptionSettings)
     pronunciations: dict[str, str] = Field(default_factory=dict)
+    camera_keyframes: list[CropKeyframe] = Field(default_factory=list)
     segments: list[SegmentInput] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -192,6 +193,19 @@ class ProjectInput(BaseModel):
         seg_ids = [s.id for s in self.segments]
         if len(seg_ids) != len(set(seg_ids)):
             raise ValueError("Segment IDs within a project must be unique")
+        if self.camera_keyframes:
+            if self.camera_keyframes[0].t != 0.0:
+                raise ValueError(
+                    f"First project camera keyframe must start at t == 0.0, got {self.camera_keyframes[0].t}"
+                )
+            for idx in range(1, len(self.camera_keyframes)):
+                prev_t = self.camera_keyframes[idx - 1].t
+                curr_t = self.camera_keyframes[idx].t
+                if curr_t <= prev_t:
+                    raise ValueError(
+                        f"camera_keyframes timestamps must be strictly increasing "
+                        f"(index {idx}: {curr_t} <= {prev_t})"
+                    )
         return self
 
 
@@ -255,6 +269,8 @@ class ArtifactManifest(BaseModel):
     source_metadata: SourceMetadata | None = None
     proxy: ProxyState = Field(default_factory=ProxyState)
     segments: dict[str, SegmentArtifactState] = Field(default_factory=dict)
+    latest_preview_artifact_id: str | None = None
+    latest_preview_path: str | None = None
     latest_export_artifact_id: str | None = None
     latest_export_path: str | None = None
 

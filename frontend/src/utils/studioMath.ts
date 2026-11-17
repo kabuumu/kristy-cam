@@ -334,6 +334,24 @@ export function computeClientPreviewSignature(
   });
 }
 
+export function computeClientProjectPreviewSignature(project: {
+  voice: string;
+  language: string;
+  pronunciations: Record<string, string>;
+  camera_keyframes?: CropKeyframe[];
+  output_settings: unknown;
+  caption_settings: unknown;
+  source_media: unknown;
+  segments: SegmentInput[];
+}): string {
+  return JSON.stringify({
+    segments: project.segments.map((seg) =>
+      computeClientPreviewSignature(seg, project)
+    ),
+    camera_keyframes: project.camera_keyframes ?? [],
+  });
+}
+
 export function formatTimecode(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) return "00:00.00";
   const mins = Math.floor(sec / 60);

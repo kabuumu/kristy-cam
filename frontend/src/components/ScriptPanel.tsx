@@ -398,6 +398,7 @@ export function ScriptPanel({
 
               {segArtifacts?.audio_artifact_id && (
                 <audio
+                  key={`${segArtifacts.audio_artifact_id}-${segArtifacts.tts_hash ?? ""}`}
                   controls
                   src={`${apiClient.mediaUrl(project.project_id, segArtifacts.audio_artifact_id)}?v=${segArtifacts.tts_hash ?? ""}`}
                   className="h-8 w-full"

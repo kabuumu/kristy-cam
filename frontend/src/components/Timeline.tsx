@@ -15,6 +15,7 @@ import {
 import type {
   ArtifactManifest,
   ClauseInput,
+  CropKeyframe,
   SegmentInput,
   TimelineSelection,
 } from "../types/studio";
@@ -27,6 +28,7 @@ import {
 
 interface TimelineProps {
   segments: SegmentInput[];
+  cameraKeyframes: CropKeyframe[];
   manifest: ArtifactManifest;
   selectedSegId: string | null;
   selection: TimelineSelection;
@@ -45,6 +47,7 @@ interface TimelineProps {
   onAddSegment: (videoIn: number, videoOut: number) => void;
   onDeleteSegment: (segId: string) => void;
   onUpdateSegment: (updated: SegmentInput) => void;
+  onUpdateCameraKeyframes: (keyframes: CropKeyframe[]) => void;
   onReorderSegments: (fromIndex: number, toIndex: number) => void;
   onSplitSegment: (segId: string, localTime: number) => void;
   onToggleProjectPlayback: () => void;
@@ -85,7 +88,6 @@ type DragAction =
     }
   | {
       type: "keyframe-move";
-      segId: string;
       index: number;
       startX: number;
       origT: number;
@@ -98,6 +100,7 @@ const MAX_TIMELINE_ZOOM = 16;
 
 export function Timeline({
   segments,
+  cameraKeyframes,
   manifest,
   selectedSegId,
   selection,
@@ -116,6 +119,7 @@ export function Timeline({
   onAddSegment,
   onDeleteSegment,
   onUpdateSegment,
+  onUpdateCameraKeyframes,
   onReorderSegments,
   onSplitSegment,
   onToggleProjectPlayback,
@@ -163,13 +167,11 @@ export function Timeline({
     onSelectItem({ type: "video", segId });
   };
 
-  const deleteKeyframeOnSeg = (segId: string, idx: number) => {
+  const deleteKeyframeAt = (idx: number) => {
     if (idx <= 0) return;
-    const seg = segments.find((s) => s.id === segId);
-    if (!seg) return;
-    const next = seg.crop_keyframes.filter((_, i) => i !== idx);
-    onUpdateSegment({ ...seg, crop_keyframes: next });
-    onSelectItem({ type: "video", segId });
+    const next = cameraKeyframes.filter((_, i) => i !== idx);
+    onUpdateCameraKeyframes(next);
+    onSelectItem(null);
   };
 
   const applyZoom = (nextZoomRaw: number, anchorClientX?: number) => {
@@ -242,7 +244,7 @@ export function Timeline({
           deleteClauseOnSeg(selection.segId, selection.index);
         } else if (selection?.type === "keyframe") {
           if (selection.index > 0) {
-            deleteKeyframeOnSeg(selection.segId, selection.index);
+            deleteKeyframeAt(selection.index);
           }
         } else if (selection?.type === "video") {
           onDeleteSegment(selection.segId);
@@ -345,10 +347,25 @@ export function Timeline({
 
       const rect = trackLaneRef.current?.getBoundingClientRect();
       if (!rect || rect.width <= 0) return;
-      const seg = segments.find((s) => s.id === drag.segId);
-      if (!seg) return;
 
       const dxSec = ((e.clientX - drag.startX) / rect.width) * drag.totalDur;
+
+      if (drag.type === "keyframe-move") {
+        if (drag.index > 0) {
+          const maxT = Math.max(0.2, drag.totalDur);
+          const nextT = Math.max(0.05, Math.min(maxT, drag.origT + dxSec));
+          const nextKfs = cameraKeyframes
+            .map((kf, idx) =>
+              idx === drag.index ? { ...kf, t: Number(nextT.toFixed(2)) } : kf
+            )
+            .sort((a, b) => a.t - b.t);
+          onUpdateCameraKeyframes(nextKfs);
+        }
+        return;
+      }
+
+      const seg = segments.find((s) => s.id === drag.segId);
+      if (!seg) return;
 
       if (drag.type === "video-slip") {
         const len = drag.origOut - drag.origIn;
@@ -412,15 +429,6 @@ export function Timeline({
           };
         });
         onUpdateSegment({ ...seg, clauses: nextClauses });
-      } else if (drag.type === "keyframe-move" && drag.index > 0) {
-        const rawDur = Math.max(0.2, seg.video_out - seg.video_in);
-        const nextT = Math.max(0.05, Math.min(rawDur, drag.origT + dxSec));
-        const nextKfs = seg.crop_keyframes
-          .map((kf, idx) =>
-            idx === drag.index ? { ...kf, t: Number(nextT.toFixed(2)) } : kf
-          )
-          .sort((a, b) => a.t - b.t);
-        onUpdateSegment({ ...seg, crop_keyframes: nextKfs });
       }
     };
 
@@ -496,56 +504,43 @@ export function Timeline({
   const handleDoubleClickCameraTrack = (clientX: number) => {
     const clickedT = timeFromClientX(clientX);
     if (clickedT === null) return;
-    const targetClip = findClipAtGlobalTime(clickedT);
-    if (!targetClip) return;
 
-    const rawVideoDur = Math.max(0.2, targetClip.plan.rawVideoDur);
-    const localT = Number(
-      Math.max(0.05, Math.min(rawVideoDur, clickedT - targetClip.startSec)).toFixed(2)
-    );
-    const existingIdx = targetClip.seg.crop_keyframes.findIndex(
-      (kf) => Math.abs(kf.t - localT) < 0.05
+    const globalT = Number(Math.max(0.05, clickedT).toFixed(2));
+    const existingIdx = cameraKeyframes.findIndex(
+      (kf) => Math.abs(kf.t - globalT) < 0.05
     );
     if (existingIdx >= 0) {
-      onSelectSegment(targetClip.seg.id);
       onSelectItem({
         type: "keyframe",
-        segId: targetClip.seg.id,
         index: existingIdx,
       });
-      onProjectTimeChange(targetClip.startSec + targetClip.seg.crop_keyframes[existingIdx].t);
+      onProjectTimeChange(cameraKeyframes[existingIdx].t);
       return;
     }
 
-    const evalLocalT =
-      resolved.clip?.seg.id === targetClip.seg.id ? resolved.localTime : localT;
     const lastViewedLens = evaluateCropAt(
-      targetClip.seg.crop_keyframes,
-      evalLocalT,
+      cameraKeyframes,
+      globalT,
       srcW,
       srcH,
       outputWidth,
       outputHeight
     );
     const newKf = {
-      t: localT,
+      t: globalT,
       x: Number(lastViewedLens.x.toFixed(4)),
       y: Number(lastViewedLens.y.toFixed(4)),
       zoom: Number(lastViewedLens.zoom.toFixed(3)),
       transition: "tween" as const,
     };
-    const nextKfs = [...targetClip.seg.crop_keyframes, newKf].sort(
-      (a, b) => a.t - b.t
-    );
+    const nextKfs = [...cameraKeyframes, newKf].sort((a, b) => a.t - b.t);
     const newIndex = nextKfs.findIndex((kf) => kf === newKf);
-    onUpdateSegment({ ...targetClip.seg, crop_keyframes: nextKfs });
-    onSelectSegment(targetClip.seg.id);
+    onUpdateCameraKeyframes(nextKfs);
     onSelectItem({
       type: "keyframe",
-      segId: targetClip.seg.id,
       index: Math.max(0, newIndex),
     });
-    onProjectTimeChange(targetClip.startSec + localT);
+    onProjectTimeChange(globalT);
   };
 
   const handleDoubleClickClauseTrack = (clientX: number) => {
@@ -976,93 +971,86 @@ export function Timeline({
                     )}
                   </div>
 
-                  {/* Track 2: Camera / View Window Keyframes across all clips */}
+                  {/* Track 2: Project-level Camera / View Window Keyframes */}
                   <div
                     data-testid="camera-track"
                     onDoubleClick={(e) => handleDoubleClickCameraTrack(e.clientX)}
                     title="Double-click to add a camera/lens keyframe here"
                     className="relative h-6 bg-zinc-900/50"
                   >
-                    {layout.clips.flatMap((clip) =>
-                      clip.seg.crop_keyframes.map((kf, idx) => {
-                        const globalT = clip.startSec + kf.t;
-                        const leftPct = Math.max(
-                          0,
-                          Math.min(100, (globalT / totalDur) * 100)
-                        );
-                        const isSelected =
-                          selection?.type === "keyframe" &&
-                          selection.segId === clip.seg.id &&
-                          selection.index === idx;
-                        const modeLabel =
-                          (kf.transition ?? "tween") === "snap" ? "S" : "T";
-                        return (
-                          <div
-                            key={`${clip.seg.id}-kf-${idx}-${kf.t}`}
-                            data-log-intent={`Select keyframe #${idx + 1} on ${clip.seg.id} @${kf.t.toFixed(2)}s`}
-                            onDoubleClick={(e) => e.stopPropagation()}
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              onSelectSegment(clip.seg.id);
-                              onSelectItem({
-                                type: "keyframe",
-                                segId: clip.seg.id,
+                    {cameraKeyframes.map((kf, idx) => {
+                      const leftPct = Math.max(
+                        0,
+                        Math.min(100, (kf.t / totalDur) * 100)
+                      );
+                      const isSelected =
+                        selection?.type === "keyframe" &&
+                        selection.index === idx;
+                      const modeLabel =
+                        (kf.transition ?? "tween") === "snap" ? "S" : "T";
+                      return (
+                        <div
+                          key={`cam-kf-${idx}-${kf.t}`}
+                          data-log-intent={`Select camera keyframe #${idx + 1} @${kf.t.toFixed(2)}s`}
+                          onDoubleClick={(e) => e.stopPropagation()}
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            onSelectItem({
+                              type: "keyframe",
+                              index: idx,
+                            });
+                            onProjectTimeChange(kf.t);
+                            if (idx > 0) {
+                              setDrag({
+                                type: "keyframe-move",
                                 index: idx,
+                                startX: e.clientX,
+                                origT: kf.t,
+                                totalDur,
                               });
-                              onProjectTimeChange(globalT);
-                              if (idx > 0) {
-                                setDrag({
-                                  type: "keyframe-move",
-                                  segId: clip.seg.id,
-                                  index: idx,
-                                  startX: e.clientX,
-                                  origT: kf.t,
-                                  totalDur,
-                                });
-                              }
-                            }}
-                            title={`Clip #${clip.index + 1} Keyframe #${idx + 1} @${kf.t.toFixed(2)}s • Zoom ${kf.zoom.toFixed(2)}x • ${(kf.transition ?? "tween").toUpperCase()}`}
-                            className={`group absolute top-0.5 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-mono ${
-                              idx > 0
-                                ? "cursor-grab active:cursor-grabbing"
-                                : "cursor-pointer"
-                            } ${
-                              isSelected
-                                ? "z-10 border-amber-300 bg-amber-500/40 text-white ring-1 ring-amber-300"
-                                : "border-amber-500/60 bg-amber-500/20 text-amber-200 hover:bg-amber-500/30"
-                            }`}
-                            style={{
-                              left: `${leftPct}%`,
-                              transform:
-                                leftPct < 3
-                                  ? "translateX(0)"
-                                  : leftPct > 97
-                                    ? "translateX(-100%)"
-                                    : "translateX(-50%)",
-                            }}
-                          >
-                            <span>
-                              ◆ {kf.zoom.toFixed(1)}x [{modeLabel}]
-                            </span>
-                            {idx > 0 && (
-                              <button
-                                type="button"
-                                onMouseDown={(e) => e.stopPropagation()}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  deleteKeyframeOnSeg(clip.seg.id, idx);
-                                }}
-                                title="Delete keyframe (Backspace/Delete)"
-                                aria-label={`Delete keyframe #${idx + 1}`}
-                                className="rounded text-amber-200/70 opacity-0 transition group-hover:opacity-100 hover:text-rose-300"
-                              >
-                                <X className="h-2.5 w-2.5" />
-                              </button>
-                            )}
-                          </div>
-                        );
-                      })
-                    )}
+                            }
+                          }}
+                          title={`Camera Keyframe #${idx + 1} @${kf.t.toFixed(2)}s • Zoom ${kf.zoom.toFixed(2)}x • ${(kf.transition ?? "tween").toUpperCase()}`}
+                          className={`group absolute top-0.5 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-mono ${
+                            idx > 0
+                              ? "cursor-grab active:cursor-grabbing"
+                              : "cursor-pointer"
+                          } ${
+                            isSelected
+                              ? "z-10 border-amber-300 bg-amber-500/40 text-white ring-1 ring-amber-300"
+                              : "border-amber-500/60 bg-amber-500/20 text-amber-200 hover:bg-amber-500/30"
+                          }`}
+                          style={{
+                            left: `${leftPct}%`,
+                            transform:
+                              leftPct < 3
+                                ? "translateX(0)"
+                                : leftPct > 97
+                                  ? "translateX(-100%)"
+                                  : "translateX(-50%)",
+                          }}
+                        >
+                          <span>
+                            ◆ {kf.zoom.toFixed(1)}x [{modeLabel}]
+                          </span>
+                          {idx > 0 && (
+                            <button
+                              type="button"
+                              onMouseDown={(e) => e.stopPropagation()}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                deleteKeyframeAt(idx);
+                              }}
+                              title="Delete keyframe (Backspace/Delete)"
+                              aria-label={`Delete keyframe #${idx + 1}`}
+                              className="rounded text-amber-200/70 opacity-0 transition group-hover:opacity-100 hover:text-rose-300"
+                            >
+                              <X className="h-2.5 w-2.5" />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
 
                   {/* Track 3: Narration & Caption Blocks across all clips */}

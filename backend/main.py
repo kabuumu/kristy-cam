@@ -30,7 +30,12 @@ from starlette.concurrency import run_in_threadpool
 from backend.usage_log import UsageLogger, get_usage_logger
 
 from backend.bootstrap import REPO_ROOT, get_data_dir, is_offline_env, verify_ffmpeg, verify_font
-from backend.geometry import COORD_EPSILON, GeometryValidationError, compute_ideal_crop_size
+from backend.geometry import (
+    COORD_EPSILON,
+    GeometryValidationError,
+    compute_ideal_crop_size,
+    slice_camera_keyframes_for_segment,
+)
 from backend.jobs import JobCancelledError, JobContext, JobManager
 from backend.media import (
     MediaSelectionCancelled,
@@ -44,7 +49,9 @@ from backend.renderer import (
     RenderCancelledError,
     RenderError,
     compute_render_hash,
+    plan_segment_duration,
     render_final_export,
+    render_project_preview,
     render_segment_preview,
     render_segment_stage1,
 )
@@ -75,7 +82,7 @@ from backend.storage import (
     save_manifest,
     save_project,
 )
-from backend.tts import compute_tts_hash, list_voices, synthesize_segment_tts
+from backend.tts import compute_tts_hash, list_voices, resolve_clause_spoken_text, synthesize_segment_tts
 
 APP_VERSION = "0.1.0"
 ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "testserver"})
@@ -358,6 +365,8 @@ def _resolve_artifact_path(manifest: ArtifactManifest, project_dir: Path, artifa
     rel_path: str | None = None
     if artifact_id == "art_proxy" or manifest.proxy.artifact_id == artifact_id:
         rel_path = manifest.proxy.path
+    elif manifest.latest_preview_artifact_id == artifact_id:
+        rel_path = manifest.latest_preview_path
     elif manifest.latest_export_artifact_id == artifact_id:
         rel_path = manifest.latest_export_path
     else:
@@ -498,6 +507,40 @@ def _ensure_segment_tts(
 
     manifest.segments[seg_id] = seg_state.model_copy(deep=True)
     return seg_state
+
+
+def _compute_stale_tts_segments(
+    project: ProjectInput,
+    manifest: ArtifactManifest,
+    project_dir: Path,
+) -> list[str]:
+    """Return segment IDs whose synthesized TTS audio is missing or out of date."""
+    stale: list[str] = []
+    for seg in project.segments:
+        has_spoken = any(
+            resolve_clause_spoken_text(c, project.pronunciations).strip()
+            for c in seg.clauses
+        )
+        existing = manifest.segments.get(seg.id)
+        if not has_spoken:
+            if existing is not None and existing.audio_artifact_id:
+                stale.append(seg.id)
+            continue
+        expected_hash = compute_tts_hash(
+            segment=seg,
+            pronunciations=project.pronunciations,
+            voice=project.voice,
+            language=project.language,
+            inter_clause_pause_ms=project.output_settings.inter_clause_pause_ms,
+        )
+        if (
+            existing is None
+            or existing.tts_hash != expected_hash
+            or not existing.audio_path
+            or not (project_dir / existing.audio_path).is_file()
+        ):
+            stale.append(seg.id)
+    return stale
 
 
 # --- REST Endpoints (F37) ---
@@ -838,12 +881,14 @@ def api_get_project(project_id: str, request: Request) -> dict[str, Any]:
     except StorageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    project_dir = get_project_dir(project_id, data_dir=data_dir)
     manifest = load_manifest(project_id, data_dir=data_dir)
     source_status = check_source_media(project.source_media)
     return {
         "project": project.model_dump(mode="json"),
         "manifest": manifest.model_dump(mode="json"),
         "source_status": source_status,
+        "stale_tts_segments": _compute_stale_tts_segments(project, manifest, project_dir),
     }
 
 
@@ -922,6 +967,35 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
                             f"[0.0, {max_y_norm:.6f}] for zoom={kf.zoom}"
                         ),
                     )
+        for idx, kf in enumerate(project.camera_keyframes):
+            try:
+                ideal_w, ideal_h = compute_ideal_crop_size(
+                    src_w,
+                    src_h,
+                    kf.zoom,
+                    output_width=project.output_settings.width,
+                    output_height=project.output_settings.height,
+                )
+            except GeometryValidationError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            max_x_norm = max(0.0, (float(src_w) - ideal_w) / float(src_w))
+            max_y_norm = max(0.0, (float(src_h) - ideal_h) / float(src_h))
+            if kf.x < -COORD_EPSILON or kf.x > max_x_norm + COORD_EPSILON:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Project camera keyframe {idx} x={kf.x} out of bounds "
+                        f"[0.0, {max_x_norm:.6f}] for zoom={kf.zoom}"
+                    ),
+                )
+            if kf.y < -COORD_EPSILON or kf.y > max_y_norm + COORD_EPSILON:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Project camera keyframe {idx} y={kf.y} out of bounds "
+                        f"[0.0, {max_y_norm:.6f}] for zoom={kf.zoom}"
+                    ),
+                )
 
     try:
         saved = save_project(project, expected_revision=expected_revision, data_dir=data_dir)
@@ -934,6 +1008,7 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
     except StorageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    project_dir = get_project_dir(project_id, data_dir=data_dir)
     manifest = load_manifest(project_id, data_dir=data_dir)
     _get_usage_logger(request).log_event(
         source="backend",
@@ -950,6 +1025,7 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
     return {
         "project": saved.model_dump(mode="json"),
         "manifest": manifest.model_dump(mode="json"),
+        "stale_tts_segments": _compute_stale_tts_segments(saved, manifest, project_dir),
     }
 
 
@@ -1037,6 +1113,7 @@ async def api_relink_source(project_id: str, request: Request) -> dict[str, Any]
         "project": updated_project.model_dump(mode="json"),
         "manifest": manifest.model_dump(mode="json"),
         "source_status": source_status,
+        "stale_tts_segments": _compute_stale_tts_segments(updated_project, manifest, project_dir),
     }
 
 
@@ -1180,6 +1257,138 @@ def api_segment_preview(project_id: str, seg_id: str, request: Request) -> JSONR
     return JSONResponse(status_code=202, content={"job_id": job.job_id})
 
 
+@app.post("/api/projects/{project_id}/preview")
+def api_project_preview(project_id: str, request: Request) -> JSONResponse:
+    """Enqueue full-project captioned preview render (202)."""
+    data_dir = _get_data_dir(request)
+    job_manager = _get_job_manager(request)
+
+    try:
+        project = load_project(project_id, data_dir=data_dir)
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not project.segments:
+        raise HTTPException(status_code=422, detail="Project has no segments to preview")
+
+    project_snap = project.model_copy(deep=True)
+    manifest_snap = load_manifest(project_id, data_dir=data_dir).model_copy(deep=True)
+    target_app = request.app
+
+    def _project_preview_worker(ctx: JobContext) -> dict[str, Any]:
+        ctx.update_progress(5, "Preparing project preview")
+        src_meta = manifest_snap.source_metadata
+        if src_meta is None:
+            src_meta = probe_and_validate_media(project_snap.source_media.path, data_dir=data_dir)
+
+        total_segs = len(project_snap.segments)
+        offset_sec = 0.0
+        for idx, seg in enumerate(project_snap.segments):
+            ctx.check_cancelled()
+            pct = 10 + int((idx / max(1, total_segs)) * 55)
+            ctx.update_progress(pct, f"Preparing segment {idx + 1}/{total_segs}")
+
+            seg_state = _ensure_segment_tts(
+                target_app=target_app,
+                project=project_snap,
+                seg_id=seg.id,
+                project_dir=project_dir,
+                data_dir=data_dir,
+                manifest=manifest_snap,
+            )
+            plan = plan_segment_duration(
+                segment=seg,
+                audio_duration=seg_state.audio_duration,
+                source_duration=src_meta.duration,
+                tail_padding_sec=project_snap.output_settings.tail_padding_sec,
+                fps=project_snap.output_settings.fps,
+            )
+            render_seg = seg
+            if project_snap.camera_keyframes:
+                sliced_kfs = slice_camera_keyframes_for_segment(
+                    project_snap.camera_keyframes,
+                    clip_start=offset_sec,
+                    clip_dur=plan.final_dur,
+                    width=src_meta.width,
+                    height=src_meta.height,
+                    output_width=project_snap.output_settings.width,
+                    output_height=project_snap.output_settings.height,
+                )
+                render_seg = seg.model_copy(update={"crop_keyframes": sliced_kfs})
+            offset_sec += plan.final_dur
+
+            audio_path = (project_dir / seg_state.audio_path) if seg_state.audio_path else None
+            try:
+                seg_mp4 = render_segment_stage1(
+                    segment=render_seg,
+                    source_media=project_snap.source_media,
+                    source_metadata=src_meta,
+                    output_settings=project_snap.output_settings,
+                    project_dir=project_dir,
+                    tts_hash=seg_state.tts_hash or "",
+                    audio_path=audio_path,
+                    audio_duration=seg_state.audio_duration,
+                    cancel_event=ctx.cancel_event,
+                    on_process_start=ctx.register_process,
+                )
+            except RenderCancelledError as exc:
+                raise JobCancelledError(str(exc)) from exc
+
+            render_hash = compute_render_hash(
+                segment=render_seg,
+                source_media=project_snap.source_media,
+                tts_hash=seg_state.tts_hash or "",
+                output_settings=project_snap.output_settings,
+            )
+            seg_rel = seg_mp4.relative_to(project_dir).as_posix()
+            lock = _get_manifest_lock(target_app, project_id)
+            with lock:
+                latest_manifest = load_manifest(project_id, data_dir=data_dir)
+                s_state = latest_manifest.segments.get(seg.id, SegmentArtifactState())
+                s_state.render_hash = render_hash
+                s_state.segment_artifact_id = f"art_seg_{seg.id}"
+                s_state.rendered_segment_path = seg_rel
+                latest_manifest.segments[seg.id] = s_state
+                save_manifest(latest_manifest, data_dir=data_dir)
+            manifest_snap.segments[seg.id] = s_state.model_copy(deep=True)
+
+        ctx.update_progress(70, "Rendering project preview")
+        try:
+            preview_path = render_project_preview(
+                project=project_snap,
+                source_metadata=src_meta,
+                manifest=manifest_snap,
+                project_dir=project_dir,
+                cancel_event=ctx.cancel_event,
+                on_process_start=ctx.register_process,
+            )
+        except RenderCancelledError as exc:
+            raise JobCancelledError(str(exc)) from exc
+        except RenderError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        ctx.check_cancelled()
+        preview_rel = preview_path.relative_to(project_dir).as_posix()
+        preview_art_id = "art_preview_latest"
+        lock = _get_manifest_lock(target_app, project_id)
+        with lock:
+            latest_manifest = load_manifest(project_id, data_dir=data_dir)
+            latest_manifest.latest_preview_artifact_id = preview_art_id
+            latest_manifest.latest_preview_path = preview_rel
+            save_manifest(latest_manifest, data_dir=data_dir)
+
+        ctx.update_progress(100, "Preview ready")
+        return {"preview_artifact_id": preview_art_id, "preview_path": preview_rel}
+
+    job = job_manager.submit_job(project_id, "preview", _project_preview_worker)
+    return JSONResponse(status_code=202, content={"job_id": job.job_id})
+
+
 @app.post("/api/projects/{project_id}/export")
 def api_project_export(project_id: str, request: Request) -> JSONResponse:
     """Enqueue immutable project snapshot render + concat + .ass burn-in (202)."""
@@ -1210,6 +1419,7 @@ def api_project_export(project_id: str, request: Request) -> JSONResponse:
             src_meta = probe_and_validate_media(project_snap.source_media.path, data_dir=data_dir)
 
         total_segs = len(project_snap.segments)
+        offset_sec = 0.0
         for idx, seg in enumerate(project_snap.segments):
             ctx.check_cancelled()
             pct = 10 + int((idx / max(1, total_segs)) * 55)
@@ -1223,10 +1433,31 @@ def api_project_export(project_id: str, request: Request) -> JSONResponse:
                 data_dir=data_dir,
                 manifest=manifest_snap,
             )
+            plan = plan_segment_duration(
+                segment=seg,
+                audio_duration=seg_state.audio_duration,
+                source_duration=src_meta.duration,
+                tail_padding_sec=project_snap.output_settings.tail_padding_sec,
+                fps=project_snap.output_settings.fps,
+            )
+            render_seg = seg
+            if project_snap.camera_keyframes:
+                sliced_kfs = slice_camera_keyframes_for_segment(
+                    project_snap.camera_keyframes,
+                    clip_start=offset_sec,
+                    clip_dur=plan.final_dur,
+                    width=src_meta.width,
+                    height=src_meta.height,
+                    output_width=project_snap.output_settings.width,
+                    output_height=project_snap.output_settings.height,
+                )
+                render_seg = seg.model_copy(update={"crop_keyframes": sliced_kfs})
+            offset_sec += plan.final_dur
+
             audio_path = (project_dir / seg_state.audio_path) if seg_state.audio_path else None
             try:
                 seg_mp4 = render_segment_stage1(
-                    segment=seg,
+                    segment=render_seg,
                     source_media=project_snap.source_media,
                     source_metadata=src_meta,
                     output_settings=project_snap.output_settings,
@@ -1241,7 +1472,7 @@ def api_project_export(project_id: str, request: Request) -> JSONResponse:
                 raise JobCancelledError(str(exc)) from exc
 
             render_hash = compute_render_hash(
-                segment=seg,
+                segment=render_seg,
                 source_media=project_snap.source_media,
                 tts_hash=seg_state.tts_hash or "",
                 output_settings=project_snap.output_settings,

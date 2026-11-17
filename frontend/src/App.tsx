@@ -21,6 +21,7 @@ import { Timeline } from "./components/Timeline";
 import type {
   ArtifactManifest,
   Capabilities,
+  CropKeyframe,
   JobState,
   MediaSelectResult,
   ProjectBundle,
@@ -32,7 +33,7 @@ import type {
 } from "./types/studio";
 import {
   clampCropPosition,
-  computeClientPreviewSignature,
+  computeClientProjectPreviewSignature,
   computeClientTtsSignature,
   computeIdealCrop,
   computeTimelineLayout,
@@ -78,8 +79,10 @@ export default function App() {
   const [lastSynthesizedSignatures, setLastSynthesizedSignatures] = useState<
     Record<string, string>
   >({});
-  const [lastRenderedPreviewSignatures, setLastRenderedPreviewSignatures] =
-    useState<Record<string, string>>({});
+  const [
+    lastRenderedProjectPreviewSignature,
+    setLastRenderedProjectPreviewSignature,
+  ] = useState<string | null>(null);
 
   // Modals
   const [newProjectOpen, setNewProjectOpen] = useState(false);
@@ -118,7 +121,42 @@ export default function App() {
   }, []);
 
   const applyBundle = useCallback((bundle: ProjectBundle) => {
-    setProject(bundle.project);
+    let normalizedProject = bundle.project;
+    if (
+      (!normalizedProject.camera_keyframes ||
+        normalizedProject.camera_keyframes.length === 0) &&
+      normalizedProject.segments.length > 0
+    ) {
+      const srcDur = bundle.manifest.source_metadata?.duration ?? 0;
+      const layout = computeTimelineLayout(
+        normalizedProject.segments,
+        bundle.manifest,
+        srcDur,
+        normalizedProject.output_settings.tail_padding_sec
+      );
+      const migrated: CropKeyframe[] = [];
+      for (const clip of layout.clips) {
+        for (const kf of clip.seg.crop_keyframes) {
+          const globalT = Number((clip.startSec + kf.t).toFixed(2));
+          if (
+            migrated.length === 0 ||
+            globalT > migrated[migrated.length - 1].t + 1e-4
+          ) {
+            migrated.push({
+              ...kf,
+              t: migrated.length === 0 ? 0.0 : globalT,
+            });
+          }
+        }
+      }
+      if (migrated.length > 0) {
+        normalizedProject = {
+          ...normalizedProject,
+          camera_keyframes: migrated,
+        };
+      }
+    }
+    setProject(normalizedProject);
     setManifest(bundle.manifest);
     setSourceStatus(bundle.source_status ?? null);
     setDirty(false);
@@ -126,30 +164,37 @@ export default function App() {
     setSelectedSegId((prev) => {
       if (
         prev &&
-        bundle.project.segments.some((s) => s.id === prev)
+        normalizedProject.segments.some((s) => s.id === prev)
       ) {
         return prev;
       }
-      return bundle.project.segments[0]?.id ?? null;
+      return normalizedProject.segments[0]?.id ?? null;
     });
+    const staleSet = new Set(bundle.stale_tts_segments ?? []);
     const sigs: Record<string, string> = {};
-    const previewSigs: Record<string, string> = {};
-    for (const seg of bundle.project.segments) {
-      if (bundle.manifest.segments[seg.id]?.audio_artifact_id) {
+    for (const seg of normalizedProject.segments) {
+      if (
+        !staleSet.has(seg.id) &&
+        bundle.manifest.segments[seg.id]?.audio_artifact_id
+      ) {
         sigs[seg.id] = computeClientTtsSignature(
           seg,
-          bundle.project.pronunciations,
-          bundle.project.voice,
-          bundle.project.language,
-          bundle.project.output_settings.inter_clause_pause_ms
+          normalizedProject.pronunciations,
+          normalizedProject.voice,
+          normalizedProject.language,
+          normalizedProject.output_settings.inter_clause_pause_ms
         );
       }
-      if (bundle.manifest.segments[seg.id]?.preview_artifact_id) {
-        previewSigs[seg.id] = computeClientPreviewSignature(seg, bundle.project);
-      }
     }
-    setLastSynthesizedSignatures((prev) => ({ ...sigs, ...prev }));
-    setLastRenderedPreviewSignatures((prev) => ({ ...previewSigs, ...prev }));
+    setLastSynthesizedSignatures(sigs);
+    if (bundle.manifest.latest_preview_artifact_id) {
+      setLastRenderedProjectPreviewSignature(
+        (prev) =>
+          prev ?? computeClientProjectPreviewSignature(normalizedProject)
+      );
+    } else {
+      setLastRenderedProjectPreviewSignature(null);
+    }
   }, []);
 
   const loadProject = useCallback(
@@ -275,20 +320,10 @@ export default function App() {
               setLastSynthesizedSignatures((prev) => ({ ...prev, ...sigs }));
             }
             if (updated.job_type === "preview") {
-              if (updated.seg_id && projectRef.current) {
-                const seg = projectRef.current.segments.find(
-                  (s) => s.id === updated.seg_id
+              if (projectRef.current) {
+                setLastRenderedProjectPreviewSignature(
+                  computeClientProjectPreviewSignature(projectRef.current)
                 );
-                if (seg) {
-                  const pSig = computeClientPreviewSignature(
-                    seg,
-                    projectRef.current
-                  );
-                  setLastRenderedPreviewSignatures((prev) => ({
-                    ...prev,
-                    [seg.id]: pSig,
-                  }));
-                }
               }
               setPreviewModalOpen(true);
             } else if (updated.job_type === "export") {
@@ -417,6 +452,13 @@ export default function App() {
     handleUpdateProject((prev) => ({
       ...prev,
       segments: prev.segments.map((s) => (s.id === updated.id ? updated : s)),
+    }));
+  };
+
+  const handleUpdateCameraKeyframes = (keyframes: CropKeyframe[]) => {
+    handleUpdateProject((prev) => ({
+      ...prev,
+      camera_keyframes: keyframes,
     }));
   };
 
@@ -586,46 +628,42 @@ export default function App() {
     }
   };
 
-  const handleRenderPreview = async (segId: string) => {
-    usageLogger.logIntention("Render segment preview", "preview.render", {
-      segId,
-    });
-    if (project && !dirty && manifest?.segments[segId]?.preview_artifact_id) {
-      const seg = project.segments.find((s) => s.id === segId);
-      if (
-        seg &&
-        lastRenderedPreviewSignatures[segId] ===
-          computeClientPreviewSignature(seg, project)
-      ) {
-        setPreviewModalOpen(true);
-        usageLogger.logActionOutput(
-          "Open cached segment preview",
-          "preview.cached",
-          { seg_id: segId, artifact_id: manifest.segments[segId]?.preview_artifact_id },
-          { projectId: project.project_id, segId }
-        );
-        return;
-      }
+  const handleRenderPreview = async () => {
+    if (!project || project.segments.length === 0) return;
+    usageLogger.logIntention("Render project preview", "preview.render");
+    if (
+      !dirty &&
+      manifest?.latest_preview_artifact_id &&
+      lastRenderedProjectPreviewSignature ===
+        computeClientProjectPreviewSignature(project)
+    ) {
+      setPreviewModalOpen(true);
+      usageLogger.logActionOutput(
+        "Open cached project preview",
+        "preview.cached",
+        { artifact_id: manifest.latest_preview_artifact_id },
+        { projectId: project.project_id }
+      );
+      return;
     }
     const saved = await ensureSavedBeforeJob();
     if (!saved) return;
     try {
-      const res = await apiClient.renderPreview(saved.project_id, segId);
+      const res = await apiClient.renderPreview(saved.project_id);
       const job = await apiClient.getJob(res.job_id);
       setActiveJob(job);
       usageLogger.logActionOutput(
-        "Queue segment preview job",
+        "Queue project preview job",
         "preview.queued",
         { job_id: job.job_id, status: job.status },
-        { projectId: saved.project_id, segId, jobId: job.job_id }
+        { projectId: saved.project_id, jobId: job.job_id }
       );
     } catch (err) {
       setBannerError(
         err instanceof Error ? err.message : "Failed to start preview"
       );
-      usageLogger.logError("Render segment preview", "preview.start_failed", err, {
+      usageLogger.logError("Render project preview", "preview.start_failed", err, {
         projectId: saved.project_id,
-        segId,
       });
     }
   };
@@ -693,6 +731,23 @@ export default function App() {
         width: nextW,
         height: nextH,
       },
+      camera_keyframes: (prev.camera_keyframes ?? []).map((kf) => {
+        const clamped = clampCropPosition(
+          kf.x,
+          kf.y,
+          kf.zoom,
+          srcW,
+          srcH,
+          nextW,
+          nextH
+        );
+        return {
+          ...kf,
+          x: Number(clamped.x.toFixed(4)),
+          y: Number(clamped.y.toFixed(4)),
+          zoom: Number(clamped.zoom.toFixed(3)),
+        };
+      }),
       segments: prev.segments.map((seg) => ({
         ...seg,
         crop_keyframes: seg.crop_keyframes.map((kf) => {
@@ -752,6 +807,10 @@ export default function App() {
     };
     handleUpdateProject((prev) => ({
       ...prev,
+      camera_keyframes:
+        prev.camera_keyframes && prev.camera_keyframes.length > 0
+          ? prev.camera_keyframes
+          : [{ t: 0.0, x: initialX, y: initialY, zoom: 1.0, transition: "tween" }],
       segments: [...prev.segments, newSeg],
     }));
     setSelectedSegId(id);
@@ -1372,6 +1431,8 @@ export default function App() {
                     tailPaddingSec={project.output_settings.tail_padding_sec}
                     sourceTime={stageSourceTime}
                     segTime={stageSegTime}
+                    projectTime={projectTime}
+                    cameraKeyframes={project.camera_keyframes ?? []}
                     isPlaying={isPlaying}
                     isProjectPlaying={isProjectPlaying}
                     preparingPlayback={preparingPlayback}
@@ -1381,7 +1442,9 @@ export default function App() {
                       setSourceTime(t);
                     }}
                     onUpdateSegment={handleUpdateSegment}
+                    onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
                     onRenderPreview={handleRenderPreview}
+                    canPreview={project.segments.length > 0}
                     previewBusy={
                       Boolean(isJobBusy && activeJob?.job_type === "preview")
                     }
@@ -1433,6 +1496,7 @@ export default function App() {
           {/* Lower Unified Multi-Track NLE Timeline */}
           <Timeline
             segments={project.segments}
+            cameraKeyframes={project.camera_keyframes ?? []}
             manifest={manifest}
             selectedSegId={selectedSegId}
             selection={
@@ -1479,6 +1543,7 @@ export default function App() {
               if (idx >= 0) handleDeleteSegment(idx);
             }}
             onUpdateSegment={handleUpdateSegment}
+            onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
             onReorderSegments={handleReorderSegments}
             onSplitSegment={handleSplitSegment}
             onToggleProjectPlayback={handleToggleProjectPlayback}

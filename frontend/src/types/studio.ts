@@ -55,7 +55,7 @@ export interface ClauseInput {
 
 export type TimelineSelection =
   | { type: "video"; segId: string }
-  | { type: "keyframe"; segId: string; index: number }
+  | { type: "keyframe"; index: number; segId?: string }
   | { type: "clause"; segId: string; index: number }
   | null;
 
@@ -83,6 +83,7 @@ export interface ProjectInput {
   output_settings: OutputSettings;
   caption_settings: CaptionSettings;
   pronunciations: Record<string, string>;
+  camera_keyframes?: CropKeyframe[];
   segments: SegmentInput[];
 }
 
@@ -133,6 +134,8 @@ export interface ArtifactManifest {
   source_metadata: SourceMetadata | null;
   proxy: ProxyState;
   segments: Record<string, SegmentArtifactState>;
+  latest_preview_artifact_id: string | null;
+  latest_preview_path: string | null;
   latest_export_artifact_id: string | null;
   latest_export_path: string | null;
 }
@@ -183,6 +186,7 @@ export interface ProjectBundle {
   project: ProjectInput;
   manifest: ArtifactManifest;
   source_status?: SourceStatus;
+  stale_tts_segments?: string[];
 }
 
 export interface MediaSelectResult {
