@@ -27,6 +27,7 @@ import {
   formatAspectRatio,
   formatTimecode,
 } from "../utils/studioMath";
+import { usageLogger } from "../utils/usageLogger";
 
 interface CropCanvasProps {
   projectId: string;
@@ -78,6 +79,28 @@ export function CropCanvas({
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
 
+  // Playback diagnostic refs (rate-limited so logs stay concise)
+  const playbackStartedAtRef = useRef<number>(0);
+  const prevPlayingRef = useRef<boolean>(false);
+  const prevFrozenRef = useRef<boolean>(false);
+  const prevSegIdRef = useRef<string | null>(null);
+  const prevPlayheadRef = useRef<{ segId: string | null; segRelTime: number; sourceTime: number }>({
+    segId: null,
+    segRelTime: 0,
+    sourceTime: 0,
+  });
+  const lastResyncLogAtRef = useRef<{ video: number; audio: number; jump: number }>({
+    video: 0,
+    audio: 0,
+    jump: 0,
+  });
+  const playbackCountersRef = useRef<{
+    videoResyncs: number;
+    audioResyncs: number;
+    jumpBacks: number;
+    freezeTransitions: number;
+  }>({ videoResyncs: 0, audioResyncs: 0, jumpBacks: 0, freezeTransitions: 0 });
+
   const [showMask, setShowMask] = useState(true);
   const [showSafeGuide, setShowSafeGuide] = useState(true);
   const [dragMode, setDragMode] = useState<DragMode>(null);
@@ -128,6 +151,114 @@ export function CropCanvas({
     ? segment.crop_keyframes.filter((kf) => kf.t > rawVideoDur + 1e-4)
     : [];
 
+  // Log playback start/stop, freeze transitions, and unexpected backward jumps
+  useEffect(() => {
+    const segId = segment?.id ?? null;
+    const now = performance.now();
+
+    if (isPlaying && !prevPlayingRef.current) {
+      playbackStartedAtRef.current = now;
+      prevFrozenRef.current = isVideoFrozen;
+      prevSegIdRef.current = segId;
+      prevPlayheadRef.current = { segId, segRelTime, sourceTime };
+      playbackCountersRef.current = {
+        videoResyncs: 0,
+        audioResyncs: 0,
+        jumpBacks: 0,
+        freezeTransitions: 0,
+      };
+      usageLogger.logIntention(
+        isProjectPlaying ? "Start project playback" : "Start source playback",
+        "playback.start",
+        {
+          projectId,
+          segId,
+          input: {
+            mode: isProjectPlaying ? "project" : "source",
+            seg_rel_time: Number(segRelTime.toFixed(3)),
+            source_time: Number(sourceTime.toFixed(3)),
+            moving_source_dur: durationPlan
+              ? Number(durationPlan.movingSourceDur.toFixed(3))
+              : null,
+            final_dur: durationPlan ? Number(durationPlan.finalDur.toFixed(3)) : null,
+            is_freeze_frame: durationPlan?.isFreezeFrame ?? false,
+            is_video_frozen: isVideoFrozen,
+          },
+        }
+      );
+    } else if (!isPlaying && prevPlayingRef.current) {
+      usageLogger.logActionOutput(
+        "Stop playback",
+        "playback.stop",
+        {
+          seg_rel_time: Number(segRelTime.toFixed(3)),
+          source_time: Number(sourceTime.toFixed(3)),
+          ...playbackCountersRef.current,
+        },
+        {
+          projectId,
+          segId,
+          durationMs: Math.round(now - playbackStartedAtRef.current),
+        }
+      );
+      prevFrozenRef.current = false;
+    }
+    prevPlayingRef.current = isPlaying;
+
+    if (isPlaying) {
+      if (segId !== prevSegIdRef.current) {
+        playbackStartedAtRef.current = now;
+        prevSegIdRef.current = segId;
+        prevFrozenRef.current = isVideoFrozen;
+        prevPlayheadRef.current = { segId, segRelTime, sourceTime };
+      } else {
+        if (isVideoFrozen !== prevFrozenRef.current) {
+          playbackCountersRef.current.freezeTransitions += 1;
+          usageLogger.logActionOutput(
+            isVideoFrozen ? "Enter freeze-frame window" : "Exit freeze-frame window",
+            isVideoFrozen ? "playback.freeze_enter" : "playback.freeze_exit",
+            {
+              seg_rel_time: Number(segRelTime.toFixed(3)),
+              source_time: Number(sourceTime.toFixed(3)),
+              moving_source_dur: durationPlan
+                ? Number(durationPlan.movingSourceDur.toFixed(3))
+                : null,
+            },
+            { projectId, segId }
+          );
+          prevFrozenRef.current = isVideoFrozen;
+        }
+
+        if (isProjectPlaying) {
+          const prev = prevPlayheadRef.current;
+          const segJumpedBack = segRelTime < prev.segRelTime - 0.05;
+          const srcJumpedBack = sourceTime < prev.sourceTime - 0.05;
+          if ((segJumpedBack || srcJumpedBack) && now - lastResyncLogAtRef.current.jump > 500) {
+            lastResyncLogAtRef.current.jump = now;
+            playbackCountersRef.current.jumpBacks += 1;
+            usageLogger.logError(
+              "Unexpected backward playhead jump during playback",
+              "playback.jump_back",
+              new Error("Playhead moved backward during active project playback"),
+              {
+                projectId,
+                segId,
+                context: {
+                  prev_seg_rel_time: Number(prev.segRelTime.toFixed(3)),
+                  next_seg_rel_time: Number(segRelTime.toFixed(3)),
+                  prev_source_time: Number(prev.sourceTime.toFixed(3)),
+                  next_source_time: Number(sourceTime.toFixed(3)),
+                  is_video_frozen: isVideoFrozen,
+                },
+              }
+            );
+          }
+          prevPlayheadRef.current = { segId, segRelTime, sourceTime };
+        }
+      }
+    }
+  }, [isPlaying, isProjectPlaying, isVideoFrozen, segRelTime, sourceTime, segment, durationPlan, projectId]);
+
   // Sync <video> playback, volume, & currentTime
   useEffect(() => {
     const vid = videoRef.current;
@@ -137,7 +268,28 @@ export function CropCanvas({
     vid.muted = targetVol <= 0;
 
     if (isPlaying && !isVideoFrozen) {
-      if (Math.abs(vid.currentTime - sourceTime) > 0.35) {
+      const drift = Math.abs(vid.currentTime - sourceTime);
+      if (drift > 0.35) {
+        const now = performance.now();
+        if (
+          now - playbackStartedAtRef.current > 250 &&
+          now - lastResyncLogAtRef.current.video > 500
+        ) {
+          lastResyncLogAtRef.current.video = now;
+          playbackCountersRef.current.videoResyncs += 1;
+          usageLogger.logActionOutput(
+            "Resync video element during playback",
+            "playback.resync",
+            {
+              media: "video",
+              actual_time: Number(vid.currentTime.toFixed(3)),
+              expected_time: Number(sourceTime.toFixed(3)),
+              seg_rel_time: Number(segRelTime.toFixed(3)),
+              is_video_frozen: isVideoFrozen,
+            },
+            { projectId, segId: segment?.id ?? null }
+          );
+        }
         vid.currentTime = Math.max(0, sourceTime);
       }
       if (vid.paused) {
@@ -151,7 +303,7 @@ export function CropCanvas({
         vid.currentTime = Math.max(0, sourceTime);
       }
     }
-  }, [isPlaying, isVideoFrozen, sourceTime, proxyUrl, segment]);
+  }, [isPlaying, isVideoFrozen, sourceTime, proxyUrl, segment, segRelTime, projectId]);
 
   // Sync synthesized voiceover <audio> playback with segment playhead
   useEffect(() => {
@@ -160,7 +312,27 @@ export function CropCanvas({
     const withinAudio = audioDur > 0 && segRelTime < audioDur - 0.02;
 
     if (isPlaying && withinAudio) {
-      if (Math.abs(aud.currentTime - segRelTime) > 0.25) {
+      const drift = Math.abs(aud.currentTime - segRelTime);
+      if (drift > 0.25) {
+        const now = performance.now();
+        if (
+          now - playbackStartedAtRef.current > 250 &&
+          now - lastResyncLogAtRef.current.audio > 500
+        ) {
+          lastResyncLogAtRef.current.audio = now;
+          playbackCountersRef.current.audioResyncs += 1;
+          usageLogger.logActionOutput(
+            "Resync voiceover audio during playback",
+            "playback.resync",
+            {
+              media: "audio",
+              actual_time: Number(aud.currentTime.toFixed(3)),
+              expected_time: Number(segRelTime.toFixed(3)),
+              is_video_frozen: isVideoFrozen,
+            },
+            { projectId, segId: segment?.id ?? null }
+          );
+        }
         aud.currentTime = Math.max(0, segRelTime);
       }
       if (aud.paused) {
@@ -177,7 +349,7 @@ export function CropCanvas({
         }
       }
     }
-  }, [isPlaying, segRelTime, voiceAudioUrl, audioDur]);
+  }, [isPlaying, segRelTime, voiceAudioUrl, audioDur, isVideoFrozen, projectId, segment]);
 
   // Evaluated crop at current segment time
   const currentCrop = segment

@@ -471,6 +471,7 @@ export function Timeline({
               >
                 {/* Scrubbable Ruler */}
                 <div
+                  data-log-intent="Scrub timeline ruler"
                   onMouseDown={(e) => {
                     setDrag({ type: "scrub" });
                     scrubAtClientX(e.clientX);
@@ -499,6 +500,7 @@ export function Timeline({
                 {/* Track 1: Video Clip (center = move, edges = resize) */}
                 <div className="relative h-6 bg-zinc-900/50">
                   <div
+                    data-log-intent={`Select/move video clip (${selectedSegment.video_in.toFixed(1)}s–${selectedSegment.video_out.toFixed(1)}s)`}
                     onMouseDown={(e) => {
                       e.stopPropagation();
                       onSelectItem({ type: "video", segId: selectedSegment.id });
@@ -518,6 +520,7 @@ export function Timeline({
                     style={{ width: `${videoEndPct}%` }}
                   >
                     <div
+                      data-log-intent="Trim video clip start"
                       onMouseDown={(e) => {
                         e.stopPropagation();
                         onSelectItem({ type: "video", segId: selectedSegment.id });
@@ -537,6 +540,7 @@ export function Timeline({
                       {Math.round(plan.rawVideoDur * 30)}f)
                     </span>
                     <div
+                      data-log-intent="Trim/extend video clip end"
                       onMouseDown={(e) => {
                         e.stopPropagation();
                         onSelectItem({ type: "video", segId: selectedSegment.id });
@@ -554,6 +558,7 @@ export function Timeline({
                   </div>
                   {videoEndPct < 99.9 && (
                     <div
+                      data-log-intent={`Timeline ${plan.isFreezeFrame ? "freeze" : "extension"} region (+${(totalDur - plan.rawVideoDur).toFixed(1)}s)`}
                       className="absolute inset-y-0 right-0 flex items-center px-2 text-[10px] font-mono text-sky-300/80 bg-sky-500/10"
                       style={{ left: `${videoEndPct}%` }}
                     >
@@ -573,6 +578,7 @@ export function Timeline({
                       <button
                         key={`${kf.t}-${idx}`}
                         type="button"
+                        data-log-intent={`Select keyframe #${idx + 1} @${kf.t.toFixed(2)}s`}
                         onMouseDown={(e) => {
                           e.stopPropagation();
                           onSelectItem({
@@ -635,6 +641,7 @@ export function Timeline({
                       return (
                         <div
                           key={b.id}
+                          data-log-intent={`Select caption block ${b.id}`}
                           onMouseDown={(e) => {
                             e.stopPropagation();
                             onSelectItem({
