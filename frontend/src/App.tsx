@@ -34,9 +34,13 @@ import {
   clampCropPosition,
   computeClientPreviewSignature,
   computeClientTtsSignature,
-  computeDurationPlan,
   computeIdealCrop,
+  computeTimelineLayout,
   formatAspectRatio,
+  resolveClauseSpokenText,
+  resolveProjectTime,
+  splitSegmentAt,
+  toProjectTime,
 } from "./utils/studioMath";
 import { usageLogger } from "./utils/usageLogger";
 
@@ -63,9 +67,11 @@ export default function App() {
   const [revisionConflict, setRevisionConflict] = useState(false);
 
   const [sourceTime, setSourceTime] = useState(0);
-  const [segTime, setSegTime] = useState(0);
+  const [projectTime, setProjectTime] = useState(0);
+  const [monitorMode, setMonitorMode] = useState<"timeline" | "source">("timeline");
   const [isPlaying, setIsPlaying] = useState(false);
   const [isProjectPlaying, setIsProjectPlaying] = useState(false);
+  const [preparingPlayback, setPreparingPlayback] = useState(false);
 
   const [activeJob, setActiveJob] = useState<JobState | null>(null);
   const [ttsError, setTtsError] = useState<string | null>(null);
@@ -338,59 +344,62 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [activeJob]);
 
-  // Continuous project playback timer following DurationPlan
+  const timelineLayout = useMemo(() => {
+    if (!project) return { clips: [], totalDuration: 0 };
+    const srcDur = manifest?.source_metadata?.duration ?? 0;
+    return computeTimelineLayout(
+      project.segments,
+      manifest,
+      srcDur,
+      project.output_settings.tail_padding_sec
+    );
+  }, [project, manifest]);
+
+  const resolvedProjectTime = useMemo(
+    () => resolveProjectTime(timelineLayout, projectTime),
+    [timelineLayout, projectTime]
+  );
+
+  // Continuous global project playback timer across all clips
   useEffect(() => {
-    if (!isProjectPlaying || !project || !manifest || project.segments.length === 0) {
+    if (
+      !isProjectPlaying ||
+      !project ||
+      !manifest ||
+      timelineLayout.clips.length === 0
+    ) {
       return;
     }
-    let segIdx = Math.max(
-      0,
-      project.segments.findIndex((s) => s.id === selectedSegId)
-    );
-    let segElapsed = 0;
-    const srcDur = manifest.source_metadata?.duration ?? 0;
-    const tailPad = project.output_settings.tail_padding_sec;
-
+    setMonitorMode("timeline");
     setIsPlaying(true);
-    setSelectedSegId(project.segments[segIdx].id);
-    setSourceTime(project.segments[segIdx].video_in);
 
-    const stepMs = 50;
+    let lastTick = performance.now();
     const timer = window.setInterval(() => {
-      const seg = project.segments[segIdx];
-      if (!seg) {
-        setIsProjectPlaying(false);
-        setIsPlaying(false);
-        return;
-      }
-      const audioDur = manifest.segments[seg.id]?.audio_duration ?? 0;
-      const plan = computeDurationPlan(seg, audioDur, srcDur, tailPad);
+      const now = performance.now();
+      const dt = (now - lastTick) / 1000;
+      lastTick = now;
 
-      segElapsed += stepMs / 1000;
-      if (segElapsed >= plan.finalDur) {
-        segIdx += 1;
-        segElapsed = 0;
-        if (segIdx >= project.segments.length) {
+      setProjectTime((prev) => {
+        const startFrom =
+          prev >= timelineLayout.totalDuration - 0.02 ? 0 : prev;
+        const next = startFrom + dt;
+        if (next >= timelineLayout.totalDuration) {
           setIsProjectPlaying(false);
           setIsPlaying(false);
-          return;
+          return timelineLayout.totalDuration;
         }
-        const nextSeg = project.segments[segIdx];
-        setSelectedSegId(nextSeg.id);
-        setSourceTime(nextSeg.video_in);
-      } else {
-        const clampedSrcTime = Math.min(
-          seg.video_out,
-          seg.video_in + segElapsed
-        );
-        setSourceTime(clampedSrcTime);
-      }
-    }, stepMs);
+        const res = resolveProjectTime(timelineLayout, next);
+        if (res.clip && res.clip.seg.id !== selectedSegIdRef.current) {
+          setSelectedSegId(res.clip.seg.id);
+        }
+        return next;
+      });
+    }, 33);
 
     return () => {
       window.clearInterval(timer);
     };
-  }, [isProjectPlaying, project, manifest, selectedSegId]);
+  }, [isProjectPlaying, project, manifest, timelineLayout]);
 
   const selectedSegment = useMemo(() => {
     if (!project || !selectedSegId) return null;
@@ -466,6 +475,115 @@ export default function App() {
     if (!project) return null;
     if (!dirty) return project;
     return handleSave();
+  };
+
+  const ensureStaleAudioBeforePlayback = async (
+    targetSegments: SegmentInput[]
+  ): Promise<boolean> => {
+    if (!project || !manifest) return true;
+    const staleSegments = targetSegments.filter((seg) => {
+      const hasSpoken = seg.clauses.some(
+        (c) =>
+          resolveClauseSpokenText(c, project.pronunciations).trim().length > 0
+      );
+      const sig = computeClientTtsSignature(
+        seg,
+        project.pronunciations,
+        project.voice,
+        project.language,
+        project.output_settings.inter_clause_pause_ms
+      );
+      const segArt = manifest.segments[seg.id];
+      const hasAudio = Boolean(segArt?.audio_artifact_id);
+      const lastSig = lastSynthesizedSignatures[seg.id];
+      return (hasSpoken && (!hasAudio || lastSig !== sig)) || (!hasSpoken && hasAudio);
+    });
+
+    if (staleSegments.length === 0) return true;
+
+    setPreparingPlayback(true);
+    setTtsError(null);
+    setBannerError(null);
+    try {
+      const saved = await ensureSavedBeforeJob();
+      if (!saved) return false;
+
+      for (const seg of staleSegments) {
+        const accepted = await apiClient.synthesizeTts(saved.project_id, seg.id);
+        let job = await apiClient.getJob(accepted.job_id);
+        setActiveJob(job);
+        while (job.status === "queued" || job.status === "running") {
+          await new Promise((r) => window.setTimeout(r, 300));
+          job = await apiClient.getJob(accepted.job_id);
+          setActiveJob(job);
+        }
+        if (job.status !== "succeeded") {
+          const msg = job.error || `Audio synthesis ${job.status}`;
+          setTtsError(msg);
+          setBannerError(msg);
+          return false;
+        }
+      }
+
+      const bundle = await apiClient.getProject(saved.project_id);
+      setManifest(bundle.manifest);
+      setSourceStatus(bundle.source_status ?? null);
+      const sigs: Record<string, string> = {};
+      for (const seg of bundle.project.segments) {
+        if (bundle.manifest.segments[seg.id]?.audio_artifact_id) {
+          sigs[seg.id] = computeClientTtsSignature(
+            seg,
+            bundle.project.pronunciations,
+            bundle.project.voice,
+            bundle.project.language,
+            bundle.project.output_settings.inter_clause_pause_ms
+          );
+        }
+      }
+      setLastSynthesizedSignatures((prev) => ({ ...prev, ...sigs }));
+      return true;
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Failed to regenerate narration audio";
+      setTtsError(msg);
+      setBannerError(msg);
+      return false;
+    } finally {
+      setPreparingPlayback(false);
+    }
+  };
+
+  const handleTogglePlay = async () => {
+    if (isPlaying || isProjectPlaying) {
+      setIsProjectPlaying(false);
+      setIsPlaying(false);
+      return;
+    }
+    if (monitorMode === "timeline" && project && project.segments.length > 0) {
+      const ok = await ensureStaleAudioBeforePlayback(project.segments);
+      if (ok) {
+        setIsProjectPlaying(true);
+      }
+      return;
+    }
+    const targets = selectedSegment ? [selectedSegment] : [];
+    const ok = await ensureStaleAudioBeforePlayback(targets);
+    if (ok) {
+      setIsPlaying(true);
+    }
+  };
+
+  const handleToggleProjectPlayback = async () => {
+    if (isProjectPlaying) {
+      setIsProjectPlaying(false);
+      setIsPlaying(false);
+      return;
+    }
+    if (!project || project.segments.length === 0) return;
+    const ok = await ensureStaleAudioBeforePlayback(project.segments);
+    if (ok) {
+      setIsProjectPlaying(true);
+    }
   };
 
   const handleRenderPreview = async (segId: string) => {
@@ -637,6 +755,9 @@ export default function App() {
       segments: [...prev.segments, newSeg],
     }));
     setSelectedSegId(id);
+    setSelection({ type: "video", segId: id });
+    setMonitorMode("timeline");
+    setProjectTime(timelineLayout.totalDuration);
     setSourceTime(videoIn);
     usageLogger.logActionOutput(
       "Add segment to timeline",
@@ -680,12 +801,81 @@ export default function App() {
     handleUpdateProject((prev) => ({ ...prev, segments: next }));
     if (selectedSegId === removed.id) {
       setSelectedSegId(next[Math.max(0, index - 1)]?.id ?? null);
+      setSelection(null);
     }
     usageLogger.logActionOutput(
       "Delete segment",
       "segment.delete",
       { deleted_seg_id: removed.id, remaining_count: next.length },
       { projectId: project.project_id, segId: removed.id }
+    );
+  };
+
+  const handleReorderSegments = (fromIndex: number, toIndex: number) => {
+    if (!project) return;
+    if (
+      fromIndex < 0 ||
+      toIndex < 0 ||
+      fromIndex >= project.segments.length ||
+      toIndex >= project.segments.length ||
+      fromIndex === toIndex
+    ) {
+      return;
+    }
+    const moved = project.segments[fromIndex];
+    handleUpdateProject((prev) => {
+      const next = [...prev.segments];
+      const [item] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, item);
+      return { ...prev, segments: next };
+    });
+    if (moved) {
+      setSelectedSegId(moved.id);
+      setSelection({ type: "video", segId: moved.id });
+    }
+    usageLogger.logActionOutput(
+      "Reorder timeline clips",
+      "segment.reorder",
+      { from_index: fromIndex, to_index: toIndex, seg_id: moved?.id },
+      { projectId: project.project_id, segId: moved?.id ?? null }
+    );
+  };
+
+  const handleSplitSegment = (segId: string, localTime: number) => {
+    if (!project) return;
+    const idx = project.segments.findIndex((s) => s.id === segId);
+    if (idx < 0) return;
+    const seg = project.segments[idx];
+    const existing = new Set(project.segments.map((s) => s.id));
+    let n = project.segments.length + 1;
+    while (existing.has(`seg_${String(n).padStart(2, "0")}`)) n += 1;
+    const newId = `seg_${String(n).padStart(2, "0")}`;
+
+    const srcW = manifest?.source_metadata?.width ?? 1920;
+    const srcH = manifest?.source_metadata?.height ?? 1080;
+    const split = splitSegmentAt(
+      seg,
+      localTime,
+      newId,
+      srcW,
+      srcH,
+      project.output_settings.width,
+      project.output_settings.height
+    );
+    if (!split) return;
+    const [firstSeg, secondSeg] = split;
+    handleUpdateProject((prev) => {
+      const next = [...prev.segments];
+      next.splice(idx, 1, firstSeg, secondSeg);
+      return { ...prev, segments: next };
+    });
+    setSelectedSegId(secondSeg.id);
+    setSelection({ type: "video", segId: secondSeg.id });
+    usageLogger.logActionOutput(
+      "Split clip at playhead",
+      "segment.split",
+      { seg_id: segId, new_seg_id: secondSeg.id, local_time: localTime },
+      { projectId: project.project_id, segId: secondSeg.id }
     );
   };
 
@@ -1095,65 +1285,102 @@ export default function App() {
         <main className="flex min-h-0 flex-1 flex-col gap-3 p-3 overflow-hidden">
           {/* Upper Stage + Inspector */}
           <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
-            <CropCanvas
-              projectId={project.project_id}
-              segment={selectedSegment}
-              manifest={manifest}
-              captionSettings={project.caption_settings}
-              outputWidth={project.output_settings.width}
-              outputHeight={project.output_settings.height}
-              tailPaddingSec={project.output_settings.tail_padding_sec}
-              sourceTime={sourceTime}
-              segTime={segTime}
-              isPlaying={isPlaying}
-              isProjectPlaying={isProjectPlaying}
-              onTogglePlay={() => {
-                setIsProjectPlaying(false);
-                setIsPlaying((p) => !p);
-              }}
-              onSourceTimeChange={(t) => {
-                setSourceTime(t);
-                if (selectedSegment) {
-                  setSegTime(Math.max(0, t - selectedSegment.video_in));
-                }
-              }}
-              onUpdateSegment={handleUpdateSegment}
-              onRenderPreview={handleRenderPreview}
-              previewBusy={
-                Boolean(isJobBusy && activeJob?.job_type === "preview")
-              }
-              previewModalOpen={previewModalOpen}
-              onSetPreviewModalOpen={setPreviewModalOpen}
-            />
+            {(() => {
+              const stageSeg =
+                monitorMode === "timeline"
+                  ? resolvedProjectTime.clip?.seg ?? selectedSegment
+                  : selectedSegment;
+              const stageSourceTime =
+                monitorMode === "timeline" && resolvedProjectTime.clip
+                  ? resolvedProjectTime.sourceTime
+                  : sourceTime;
+              const stageSegTime =
+                monitorMode === "timeline" && resolvedProjectTime.clip
+                  ? resolvedProjectTime.localTime
+                  : stageSeg
+                    ? Math.max(0, sourceTime - stageSeg.video_in)
+                    : 0;
+              const selectedClipLayout = selectedSegment
+                ? timelineLayout.clips.find((c) => c.seg.id === selectedSegment.id) ?? null
+                : null;
+              const canSplitSelected = Boolean(
+                resolvedProjectTime.clip &&
+                  resolvedProjectTime.localTime > 0.15 &&
+                  resolvedProjectTime.localTime <
+                    resolvedProjectTime.clip.plan.rawVideoDur - 0.15
+              );
 
-            <ContextualInspector
-              project={project}
-              manifest={manifest}
-              selectedSegment={selectedSegment}
-              selection={
-                selection ??
-                (selectedSegment
-                  ? { type: "video", segId: selectedSegment.id }
-                  : null)
-              }
-              voices={capabilities?.voices ?? []}
-              ttsError={ttsError}
-              lastSynthesizedSignatures={lastSynthesizedSignatures}
-              onUpdateProject={handleUpdateProject}
-              onUpdateSegment={handleUpdateSegment}
-              onDuplicateSegment={(segId) => {
-                const idx = project.segments.findIndex((s) => s.id === segId);
-                if (idx >= 0) handleDuplicateSegment(idx);
-              }}
-              onDeleteSegment={(segId) => {
-                const idx = project.segments.findIndex((s) => s.id === segId);
-                if (idx >= 0) handleDeleteSegment(idx);
-              }}
-              onSelectItem={setSelection}
-            />
+              return (
+                <>
+                  <CropCanvas
+                    projectId={project.project_id}
+                    segment={stageSeg}
+                    manifest={manifest}
+                    captionSettings={project.caption_settings}
+                    outputWidth={project.output_settings.width}
+                    outputHeight={project.output_settings.height}
+                    tailPaddingSec={project.output_settings.tail_padding_sec}
+                    sourceTime={stageSourceTime}
+                    segTime={stageSegTime}
+                    isPlaying={isPlaying}
+                    isProjectPlaying={isProjectPlaying}
+                    preparingPlayback={preparingPlayback}
+                    monitorMode={monitorMode}
+                    onTogglePlay={handleTogglePlay}
+                    onSourceTimeChange={(t) => {
+                      setSourceTime(t);
+                    }}
+                    onUpdateSegment={handleUpdateSegment}
+                    onRenderPreview={handleRenderPreview}
+                    previewBusy={
+                      Boolean(isJobBusy && activeJob?.job_type === "preview")
+                    }
+                    previewModalOpen={previewModalOpen}
+                    onSetPreviewModalOpen={setPreviewModalOpen}
+                  />
+
+                  <ContextualInspector
+                    project={project}
+                    manifest={manifest}
+                    selectedSegment={selectedSegment}
+                    clipLayout={selectedClipLayout}
+                    canSplitAtPlayhead={canSplitSelected}
+                    selection={
+                      selection ??
+                      (selectedSegment
+                        ? { type: "video", segId: selectedSegment.id }
+                        : null)
+                    }
+                    voices={capabilities?.voices ?? []}
+                    ttsError={ttsError}
+                    lastSynthesizedSignatures={lastSynthesizedSignatures}
+                    onUpdateProject={handleUpdateProject}
+                    onUpdateSegment={handleUpdateSegment}
+                    onDuplicateSegment={(segId) => {
+                      const idx = project.segments.findIndex((s) => s.id === segId);
+                      if (idx >= 0) handleDuplicateSegment(idx);
+                    }}
+                    onDeleteSegment={(segId) => {
+                      const idx = project.segments.findIndex((s) => s.id === segId);
+                      if (idx >= 0) handleDeleteSegment(idx);
+                    }}
+                    onSplitSegment={() => {
+                      if (canSplitSelected && resolvedProjectTime.clip) {
+                        handleSplitSegment(
+                          resolvedProjectTime.clip.seg.id,
+                          resolvedProjectTime.localTime
+                        );
+                      }
+                    }}
+                    onReorderSegment={handleReorderSegments}
+                    onSelectItem={setSelection}
+                  />
+                </>
+              );
+            })()}
           </div>
 
-          {/* Lower Unified Multi-Track Timeline */}
+          {/* Lower Unified Multi-Track NLE Timeline */}
           <Timeline
             segments={project.segments}
             manifest={manifest}
@@ -1165,53 +1392,46 @@ export default function App() {
                 : null)
             }
             tailPaddingSec={project.output_settings.tail_padding_sec}
+            outputWidth={project.output_settings.width}
+            outputHeight={project.output_settings.height}
+            projectTime={projectTime}
             sourceTime={sourceTime}
-            segTime={segTime}
             isModalOpen={isModalOpen}
             isProjectPlaying={isProjectPlaying}
+            preparingPlayback={preparingPlayback}
             onSelectSegment={(segId) => {
               setSelectedSegId(segId);
               setSelection({ type: "video", segId });
-              const seg = project.segments.find((s) => s.id === segId);
-              if (seg) {
-                setSegTime(0);
-                setSourceTime(seg.video_in);
+              setMonitorMode("timeline");
+              const res = resolveProjectTime(timelineLayout, projectTime);
+              if (res.clip?.seg.id !== segId) {
+                setProjectTime(toProjectTime(timelineLayout, segId, 0));
               }
             }}
             onSelectItem={setSelection}
-            onSourceTimeChange={(t) => {
-              setSourceTime(t);
-              if (selectedSegment) {
-                setSegTime(Math.max(0, t - selectedSegment.video_in));
+            onProjectTimeChange={(t) => {
+              setMonitorMode("timeline");
+              setProjectTime(t);
+              const res = resolveProjectTime(timelineLayout, t);
+              if (res.clip) {
+                setSelectedSegId(res.clip.seg.id);
               }
             }}
-            onSegTimeChange={(t) => {
-              setSegTime(t);
-              if (selectedSegment) {
-                const srcDur = manifest.source_metadata?.duration ?? 0;
-                const audioDur =
-                  manifest.segments[selectedSegment.id]?.audio_duration ?? 0;
-                const plan = computeDurationPlan(
-                  selectedSegment,
-                  audioDur,
-                  srcDur,
-                  project.output_settings.tail_padding_sec
-                );
-                setSourceTime(
-                  selectedSegment.video_in + Math.min(plan.movingSourceDur, t)
-                );
-              }
+            onSourceTimeChange={(t) => {
+              setIsProjectPlaying(false);
+              setIsPlaying(false);
+              setMonitorMode("source");
+              setSourceTime(t);
             }}
             onAddSegment={handleAddSegment}
-            onUpdateSegment={handleUpdateSegment}
-            onToggleProjectPlayback={() => {
-              if (isProjectPlaying) {
-                setIsProjectPlaying(false);
-                setIsPlaying(false);
-              } else {
-                setIsProjectPlaying(true);
-              }
+            onDeleteSegment={(segId) => {
+              const idx = project.segments.findIndex((s) => s.id === segId);
+              if (idx >= 0) handleDeleteSegment(idx);
             }}
+            onUpdateSegment={handleUpdateSegment}
+            onReorderSegments={handleReorderSegments}
+            onSplitSegment={handleSplitSegment}
+            onToggleProjectPlayback={handleToggleProjectPlayback}
           />
         </main>
       )}

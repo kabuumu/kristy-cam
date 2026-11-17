@@ -2,6 +2,8 @@ import { useState } from "react";
 import {
   AlertCircle,
   AlertTriangle,
+  ArrowLeft,
+  ArrowRight,
   BookOpen,
   Captions,
   CheckCircle2,
@@ -27,13 +29,17 @@ import {
   autoSplitTextToClauses,
   clampCropPosition,
   computeClientTtsSignature,
+  formatTimecode,
   resolveClauseSpokenText,
+  type TimelineClipLayout,
 } from "../utils/studioMath";
 
 interface ContextualInspectorProps {
   project: ProjectInput;
   manifest: ArtifactManifest;
   selectedSegment: SegmentInput | null;
+  clipLayout?: TimelineClipLayout | null;
+  canSplitAtPlayhead?: boolean;
   selection: TimelineSelection;
   voices: string[];
   ttsError: string | null;
@@ -42,6 +48,8 @@ interface ContextualInspectorProps {
   onUpdateSegment: (updated: SegmentInput) => void;
   onDuplicateSegment: (segId: string) => void;
   onDeleteSegment: (segId: string) => void;
+  onSplitSegment?: () => void;
+  onReorderSegment?: (fromIndex: number, toIndex: number) => void;
   onSelectItem: (sel: TimelineSelection) => void;
 }
 
@@ -49,6 +57,8 @@ export function ContextualInspector({
   project,
   manifest,
   selectedSegment,
+  clipLayout = null,
+  canSplitAtPlayhead = false,
   selection,
   voices,
   ttsError,
@@ -57,6 +67,8 @@ export function ContextualInspector({
   onUpdateSegment,
   onDuplicateSegment,
   onDeleteSegment,
+  onSplitSegment,
+  onReorderSegment,
   onSelectItem,
 }: ContextualInspectorProps) {
   const [newPronKey, setNewPronKey] = useState("");
@@ -140,8 +152,22 @@ export function ContextualInspector({
     });
   };
 
-  const renderVideoInspector = (seg: SegmentInput) => (
+  const renderVideoInspector = (seg: SegmentInput) => {
+    const segIdx = project.segments.findIndex((s) => s.id === seg.id);
+    return (
     <div className="space-y-3 text-xs">
+      {clipLayout && (
+        <div className="flex items-center justify-between rounded-lg border border-zinc-800 bg-[#11141b] px-3 py-2 font-mono text-[11px] text-zinc-300">
+          <span>
+            Clip #{clipLayout.index + 1} • Start @{" "}
+            <span className="text-emerald-300">{formatTimecode(clipLayout.startSec)}</span>
+          </span>
+          <span className="text-zinc-400">
+            Dur {clipLayout.plan.finalDur.toFixed(2)}s
+          </span>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-2.5 rounded-lg border border-zinc-800 bg-[#11141b] p-3">
         <label className="flex flex-col gap-1">
           <span className="text-zinc-400">Clip Start (s)</span>
@@ -224,6 +250,45 @@ export function ContextualInspector({
         </label>
       </div>
 
+      {(onSplitSegment || onReorderSegment) && (
+        <div className="flex items-center gap-2">
+          {onSplitSegment && (
+            <button
+              type="button"
+              disabled={!canSplitAtPlayhead}
+              onClick={onSplitSegment}
+              title="Split clip at playhead (S)"
+              className="inline-flex flex-1 items-center justify-center gap-1.5 rounded border border-zinc-700 bg-zinc-800 px-2.5 py-1.5 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+            >
+              <Scissors className="h-3.5 w-3.5" />
+              Split at Playhead
+            </button>
+          )}
+          {onReorderSegment && segIdx >= 0 && (
+            <>
+              <button
+                type="button"
+                disabled={segIdx === 0}
+                onClick={() => onReorderSegment(segIdx, segIdx - 1)}
+                title="Move clip earlier"
+                className="inline-flex items-center justify-center rounded border border-zinc-700 bg-zinc-800 p-1.5 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                disabled={segIdx >= project.segments.length - 1}
+                onClick={() => onReorderSegment(segIdx, segIdx + 1)}
+                title="Move clip later"
+                className="inline-flex items-center justify-center rounded border border-zinc-700 bg-zinc-800 p-1.5 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+              >
+                <ArrowRight className="h-3.5 w-3.5" />
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       <div className="flex items-center gap-2">
         <button
           type="button"
@@ -257,7 +322,8 @@ export function ContextualInspector({
         )}
       </div>
     </div>
-  );
+    );
+  };
 
   const renderKeyframeInspector = (seg: SegmentInput, kfIndex: number) => {
     const kf = seg.crop_keyframes[kfIndex];

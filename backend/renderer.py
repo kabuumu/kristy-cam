@@ -127,6 +127,7 @@ def compute_render_hash(
                 "x": float(kf.x),
                 "y": float(kf.y),
                 "zoom": float(kf.zoom),
+                "transition": kf.transition,
             }
             for kf in segment.crop_keyframes
         ],

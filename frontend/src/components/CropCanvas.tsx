@@ -41,6 +41,7 @@ interface CropCanvasProps {
   segTime?: number | null;
   isPlaying: boolean;
   isProjectPlaying?: boolean;
+  preparingPlayback?: boolean;
   onTogglePlay: () => void;
   onSourceTimeChange: (t: number) => void;
   onUpdateSegment: (updated: SegmentInput) => void;
@@ -48,6 +49,7 @@ interface CropCanvasProps {
   previewBusy: boolean;
   previewModalOpen: boolean;
   onSetPreviewModalOpen: (open: boolean) => void;
+  monitorMode?: "timeline" | "source";
 }
 
 type DragMode =
@@ -67,6 +69,7 @@ export function CropCanvas({
   segTime = null,
   isPlaying,
   isProjectPlaying = false,
+  preparingPlayback = false,
   onTogglePlay,
   onSourceTimeChange,
   onUpdateSegment,
@@ -74,6 +77,7 @@ export function CropCanvas({
   previewBusy,
   previewModalOpen,
   onSetPreviewModalOpen,
+  monitorMode = "timeline",
 }: CropCanvasProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -478,11 +482,15 @@ export function CropCanvas({
           <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-200">
             Crop &amp; Preview Stage
           </h2>
-          {segment && (
+          {monitorMode === "source" ? (
+            <span className="rounded border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 font-mono text-[11px] text-sky-200">
+              Source Monitor • {formatTimecode(sourceTime)}
+            </span>
+          ) : segment ? (
             <span className="rounded bg-zinc-800 px-2 py-0.5 font-mono text-[11px] text-zinc-300">
               {segment.id} • Zoom {currentCrop.zoom.toFixed(2)}x
             </span>
-          )}
+          ) : null}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -691,10 +699,15 @@ export function CropCanvas({
         <div className="flex items-center gap-2">
           <button
             type="button"
+            disabled={preparingPlayback}
             onClick={onTogglePlay}
-            className="inline-flex items-center gap-1 rounded bg-zinc-800 px-2.5 py-1 text-zinc-100 hover:bg-zinc-700"
+            className="inline-flex items-center gap-1 rounded bg-zinc-800 px-2.5 py-1 text-zinc-100 hover:bg-zinc-700 disabled:opacity-50"
           >
-            {isPlaying ? (
+            {preparingPlayback ? (
+              <>
+                <Loader2 className="h-3.5 w-3.5 animate-spin" /> Preparing Audio...
+              </>
+            ) : isPlaying ? (
               <>
                 <Pause className="h-3.5 w-3.5" /> Pause
               </>
@@ -756,12 +769,19 @@ export function CropCanvas({
               </button>
             </div>
             <div className="flex items-center justify-center bg-black p-3">
-              <video
-                src={apiClient.mediaUrl(projectId, previewArtifactId)}
-                controls
-                autoPlay
-                className="max-h-[75vh] w-auto rounded"
-              />
+              {(() => {
+                const previewVersion = segArtifacts?.preview_path ?? segArtifacts?.render_hash ?? "";
+                const previewSrc = `${apiClient.mediaUrl(projectId, previewArtifactId)}?v=${encodeURIComponent(previewVersion)}`;
+                return (
+                  <video
+                    key={previewSrc}
+                    src={previewSrc}
+                    controls
+                    autoPlay
+                    className="max-h-[75vh] w-auto rounded"
+                  />
+                );
+              })()}
             </div>
           </div>
         </div>

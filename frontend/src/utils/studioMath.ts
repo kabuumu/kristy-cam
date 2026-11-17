@@ -1,4 +1,5 @@
 import type {
+  ArtifactManifest,
   ClauseInput,
   CropKeyframe,
   SegmentInput,
@@ -369,3 +370,175 @@ export function autoSplitTextToClauses(text: string): string[] {
   }
   return result.length > 0 ? result : [trimmed];
 }
+
+export interface TimelineClipLayout {
+  seg: SegmentInput;
+  index: number;
+  startSec: number;
+  endSec: number;
+  plan: DurationPlan;
+}
+
+export interface TimelineLayout {
+  clips: TimelineClipLayout[];
+  totalDuration: number;
+}
+
+export interface ResolvedProjectTime {
+  clip: TimelineClipLayout | null;
+  projectTime: number;
+  localTime: number;
+  sourceTime: number;
+  isFrozen: boolean;
+}
+
+export function computeTimelineLayout(
+  segments: SegmentInput[],
+  manifest: ArtifactManifest | null,
+  sourceDuration: number,
+  tailPaddingSec = 0.4
+): TimelineLayout {
+  const clips: TimelineClipLayout[] = [];
+  let cursor = 0;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const audioDur = manifest?.segments[seg.id]?.audio_duration ?? 0;
+    const plan = computeDurationPlan(seg, audioDur, sourceDuration, tailPaddingSec);
+    const startSec = cursor;
+    const endSec = cursor + plan.finalDur;
+    clips.push({ seg, index: i, startSec, endSec, plan });
+    cursor = endSec;
+  }
+  return {
+    clips,
+    totalDuration: cursor,
+  };
+}
+
+export function resolveProjectTime(
+  layout: TimelineLayout,
+  rawProjectTime: number
+): ResolvedProjectTime {
+  if (layout.clips.length === 0) {
+    return {
+      clip: null,
+      projectTime: 0,
+      localTime: 0,
+      sourceTime: 0,
+      isFrozen: false,
+    };
+  }
+  const clamped = Math.max(0, Math.min(layout.totalDuration, rawProjectTime));
+  let target = layout.clips[layout.clips.length - 1];
+  for (const clip of layout.clips) {
+    if (clamped < clip.endSec - 1e-6) {
+      target = clip;
+      break;
+    }
+  }
+  const localTime = Math.max(
+    0,
+    Math.min(target.plan.finalDur, clamped - target.startSec)
+  );
+  const movingOffset = Math.min(target.plan.movingSourceDur, localTime);
+  const sourceTime = target.seg.video_in + movingOffset;
+  const isFrozen = localTime >= target.plan.movingSourceDur - 0.02;
+  return {
+    clip: target,
+    projectTime: clamped,
+    localTime,
+    sourceTime,
+    isFrozen,
+  };
+}
+
+export function toProjectTime(
+  layout: TimelineLayout,
+  segId: string,
+  localTime: number
+): number {
+  const clip = layout.clips.find((c) => c.seg.id === segId);
+  if (!clip) return 0;
+  return clip.startSec + Math.max(0, Math.min(clip.plan.finalDur, localTime));
+}
+
+export function splitSegmentAt(
+  segment: SegmentInput,
+  localTime: number,
+  newSegId: string,
+  sourceWidth: number,
+  sourceHeight: number,
+  outputWidth: number,
+  outputHeight: number
+): [SegmentInput, SegmentInput] | null {
+  const rawDur = segment.video_out - segment.video_in;
+  if (localTime <= 0.15 || localTime >= rawDur - 0.15) {
+    return null;
+  }
+  const splitSrc = Number((segment.video_in + localTime).toFixed(2));
+  if (splitSrc <= segment.video_in + 0.1 || splitSrc >= segment.video_out - 0.1) {
+    return null;
+  }
+  const splitLocal = Number((splitSrc - segment.video_in).toFixed(2));
+
+  const boundaryCrop = evaluateCropAt(
+    segment.crop_keyframes,
+    splitLocal,
+    sourceWidth,
+    sourceHeight,
+    outputWidth,
+    outputHeight
+  );
+
+  const firstKeyframes = segment.crop_keyframes
+    .filter((kf) => kf.t < splitLocal - 0.02)
+    .map((kf) => ({ ...kf }));
+
+  const secondTailKeyframes = segment.crop_keyframes
+    .filter((kf) => kf.t > splitLocal + 0.02)
+    .map((kf) => ({
+      ...kf,
+      t: Number((kf.t - splitLocal).toFixed(2)),
+    }));
+
+  const secondFirstKf: CropKeyframe = {
+    t: 0,
+    x: Number(boundaryCrop.x.toFixed(4)),
+    y: Number(boundaryCrop.y.toFixed(4)),
+    zoom: Number(boundaryCrop.zoom.toFixed(3)),
+    transition:
+      firstKeyframes[firstKeyframes.length - 1]?.transition ?? "tween",
+  };
+
+  const firstClauses: ClauseInput[] = [];
+  const secondClauses: ClauseInput[] = [];
+  for (const c of segment.clauses) {
+    const start = c.start_sec ?? 0;
+    if (start < splitLocal) {
+      firstClauses.push({ ...c });
+    } else {
+      secondClauses.push({
+        ...c,
+        start_sec: Number(Math.max(0, start - splitLocal).toFixed(2)),
+      });
+    }
+  }
+
+  const firstSeg: SegmentInput = {
+    ...segment,
+    video_out: splitSrc,
+    crop_keyframes: firstKeyframes.length > 0 ? firstKeyframes : [{ ...segment.crop_keyframes[0], t: 0 }],
+    clauses: firstClauses,
+  };
+
+  const secondSeg: SegmentInput = {
+    ...segment,
+    id: newSegId,
+    video_in: splitSrc,
+    crop_keyframes: [secondFirstKf, ...secondTailKeyframes],
+    clauses: secondClauses,
+  };
+
+  return [firstSeg, secondSeg];
+}
+
