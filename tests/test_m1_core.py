@@ -634,4 +634,5 @@ def test_subtitles_escaping_continuity_and_ass_output(tmp_path: Path) -> None:
         text="This is a very long caption that will wrap across four or more lines on a vertical screen",
     )
     long_content = render_ass_content([long_ev], CaptionSettings(), width=1080, height=1920)
-    assert r"{\an5}This is a very long caption" in long_content
+    assert r"{\an5}" not in long_content
+    assert "Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,This is a very long caption" in long_content
