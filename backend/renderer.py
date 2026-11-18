@@ -14,18 +14,33 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from backend.bootstrap import verify_ffmpeg, verify_font
-from backend.geometry import build_crop_filter, slice_camera_keyframes_for_segment
+from backend.geometry import build_crop_filter, round_even, slice_camera_keyframes_for_segment
+from backend.media import probe_and_validate_asset
 from backend.schemas import (
     ArtifactManifest,
+    AudioTrack,
     CaptionSettings,
+    CaptionTrack,
     ClauseTiming,
+    CropKeyframe,
+    MediaAssetMetadata,
+    MediaAssetRef,
     OutputSettings,
     ProjectInput,
     SegmentInput,
     SourceMediaRef,
     SourceMetadata,
+    TrackTransition,
+    VideoTrack,
+    VisualClip,
 )
-from backend.subtitles import SubtitleEvent, build_segment_subtitle_events, generate_ass_file
+from backend.subtitles import (
+    SubtitleEvent,
+    build_segment_subtitle_events,
+    build_timeline_subtitle_events,
+    generate_ass_file,
+)
+from backend.tts import compute_caption_tts_hash, mix_caption_tracks_audio
 
 AUDIO_SAMPLE_RATE = 48000
 
@@ -750,9 +765,273 @@ def verify_concat_compatibility(
             )
 
 
-def render_final_export(
+def _is_multitrack_project(project: ProjectInput) -> bool:
+    """Return True when project uses timeline tracks or has 0 legacy segments."""
+    if any(len(t.clips) > 0 for t in project.tracks):
+        return True
+    return len(project.segments) == 0
+
+
+def _resolve_caption_clip_dur(clip: Any, manifest: ArtifactManifest) -> float:
+    if not clip.auto_fit_tts and clip.duration_sec is not None and clip.duration_sec > 0.0:
+        return float(clip.duration_sec)
+    if clip.tts_enabled:
+        art = manifest.caption_artifacts.get(clip.id)
+        if art is not None and art.audio_duration > 0.0:
+            return float(art.audio_duration)
+    if clip.duration_sec is not None and clip.duration_sec > 0.0:
+        return float(clip.duration_sec)
+    words = max(1, len(str(clip.display_text).split()))
+    return max(1.2, min(8.0, float(words) * 0.42))
+
+
+def _resolve_asset_and_metadata(
     project: ProjectInput,
-    source_metadata: SourceMetadata,
+    manifest: ArtifactManifest,
+    asset_id: str,
+    asset_cache: dict[str, tuple[MediaAssetRef, MediaAssetMetadata]],
+    ffmpeg_bin: Path,
+    ffprobe_bin: Path,
+) -> tuple[MediaAssetRef, MediaAssetMetadata]:
+    if asset_id in asset_cache:
+        return asset_cache[asset_id]
+
+    ref = project.media_assets.get(asset_id)
+    if ref is None and asset_id == project.source_media.media_id:
+        sm = project.source_media
+        ref = MediaAssetRef(
+            asset_id=sm.media_id,
+            kind="video",
+            name=Path(sm.path).name or "Primary Video",
+            path=sm.path,
+            fingerprint=sm.fingerprint,
+            copied_to_project=sm.copied_to_project,
+        )
+    if ref is None:
+        raise RenderError(f"Referenced media asset {asset_id!r} not found in project")
+
+    meta = manifest.media_metadata.get(asset_id)
+    if meta is None and asset_id == project.source_media.media_id and manifest.source_metadata is not None:
+        sm_meta = manifest.source_metadata
+        meta = MediaAssetMetadata(
+            kind="video",
+            width=sm_meta.width,
+            height=sm_meta.height,
+            fps=sm_meta.fps,
+            duration=sm_meta.duration,
+            has_audio=sm_meta.has_audio,
+            has_alpha=False,
+            codec_name=sm_meta.codec_name,
+            pix_fmt=sm_meta.pix_fmt,
+            audio_sample_rate=sm_meta.audio_sample_rate,
+            audio_channels=sm_meta.audio_channels,
+        )
+    if meta is None:
+        try:
+            meta = probe_and_validate_asset(
+                ref.path,
+                expected_kind=ref.kind,
+                ffmpeg_path=ffmpeg_bin,
+                ffprobe_path=ffprobe_bin,
+            )
+        except Exception as exc:
+            raise RenderError(f"Failed to probe asset {asset_id!r} at {ref.path}: {exc}") from exc
+
+    asset_cache[asset_id] = (ref, meta)
+    return ref, meta
+
+
+def _group_video_track_runs(
+    track: VideoTrack,
+) -> list[tuple[list[VisualClip], list[TrackTransition]]]:
+    """Group sorted VisualClips into contiguous runs connected by TrackTransitions."""
+    clips = sorted(track.clips, key=lambda c: (c.start_sec, c.id))
+    if not clips:
+        return []
+    tr_lookup: dict[tuple[str, str], TrackTransition] = {
+        (t.from_clip_id, t.to_clip_id): t for t in track.transitions
+    }
+
+    runs: list[tuple[list[VisualClip], list[TrackTransition]]] = []
+    cur_clips = [clips[0]]
+    cur_trs: list[TrackTransition] = []
+
+    for nxt in clips[1:]:
+        prev = cur_clips[-1]
+        prev_end = prev.start_sec + prev.duration_sec
+        gap = nxt.start_sec - prev_end
+        tr = tr_lookup.get((prev.id, nxt.id))
+        if tr is not None and gap <= 0.12 and gap >= -min(prev.duration_sec, nxt.duration_sec) + 0.05:
+            cur_clips.append(nxt)
+            cur_trs.append(tr)
+        else:
+            runs.append((cur_clips, cur_trs))
+            cur_clips = [nxt]
+            cur_trs = []
+    runs.append((cur_clips, cur_trs))
+    return runs
+
+
+def get_project_timeline_duration(
+    project: ProjectInput,
+    manifest: ArtifactManifest,
+) -> tuple[float, int, float]:
+    """Compute (raw_dur, frame_count, final_dur) across all tracks and camera keyframes."""
+    if not _is_multitrack_project(project):
+        # Legacy mode
+        fps = max(1, project.output_settings.fps)
+        src_dur = manifest.source_metadata.duration if manifest.source_metadata is not None else 0.0
+        raw_total = 0.0
+        total_frames = 0
+        for seg in project.segments:
+            seg_art = manifest.segments.get(seg.id)
+            aud_dur = seg_art.audio_duration if seg_art is not None else 0.0
+            plan = plan_segment_duration(
+                seg,
+                audio_duration=aud_dur,
+                source_duration=src_dur,
+                tail_padding_sec=project.output_settings.tail_padding_sec,
+                fps=fps,
+            )
+            raw_total += plan.final_dur
+            total_frames += plan.frame_count
+        return raw_total, total_frames, raw_total
+
+    raw_dur = 0.0
+    for kf in project.camera_keyframes:
+        raw_dur = max(raw_dur, float(kf.t))
+
+    for track in project.tracks:
+        if isinstance(track, VideoTrack):
+            for run_clips, run_trs in _group_video_track_runs(track):
+                if len(run_clips) == 1:
+                    raw_dur = max(raw_dur, run_clips[0].start_sec + run_clips[0].duration_sec)
+                else:
+                    run_start = run_clips[0].start_sec
+                    cur_dur = run_clips[0].duration_sec
+                    for idx, nxt in enumerate(run_clips[1:]):
+                        tr = run_trs[idx]
+                        overlap = max(0.0, (run_start + cur_dur) - nxt.start_sec)
+                        if overlap >= 0.05:
+                            offset = max(0.0, nxt.start_sec - run_start)
+                        else:
+                            eff_d = min(tr.duration_sec, cur_dur * 0.45, nxt.duration_sec * 0.45)
+                            offset = max(0.0, cur_dur - eff_d)
+                        cur_dur = offset + nxt.duration_sec
+                    raw_dur = max(raw_dur, run_start + cur_dur)
+        elif isinstance(track, AudioTrack):
+            for clip in track.clips:
+                raw_dur = max(raw_dur, clip.start_sec + clip.duration_sec)
+        elif isinstance(track, CaptionTrack):
+            for clip in track.clips:
+                raw_dur = max(raw_dur, clip.start_sec + _resolve_caption_clip_dur(clip, manifest))
+
+    if raw_dur <= 0.0:
+        return 0.0, 0, 0.0
+
+    fps = max(1, project.output_settings.fps)
+    frame_count = max(1, math.ceil(raw_dur * float(fps)))
+    final_dur = float(frame_count) / float(fps)
+    return raw_dur, frame_count, final_dur
+
+
+def compute_timeline_render_hash(
+    project: ProjectInput,
+    manifest: ArtifactManifest,
+) -> str:
+    """Compute canonical 16-char hash for full multi-track project preview/export caching."""
+    cap_hashes: dict[str, str] = {}
+    cap_artifacts: dict[str, tuple[str, float]] = {}
+    for tr in project.tracks:
+        if isinstance(tr, CaptionTrack):
+            for clip in tr.clips:
+                cap_hashes[clip.id] = compute_caption_tts_hash(
+                    clip,
+                    project.pronunciations,
+                    project.voice,
+                    project.language,
+                )
+                art = manifest.caption_artifacts.get(clip.id)
+                if art is not None:
+                    cap_artifacts[clip.id] = (
+                        art.tts_hash or "",
+                        round(float(art.audio_duration or 0.0), 4),
+                    )
+
+    asset_fps = {aid: ref.fingerprint for aid, ref in sorted(project.media_assets.items())}
+    payload = {
+        "source_fp": project.source_media.fingerprint,
+        "asset_fps": asset_fps,
+        "tracks": [t.model_dump(mode="json") for t in project.tracks],
+        "camera_keyframes": [kf.model_dump(mode="json") for kf in project.camera_keyframes],
+        "output_settings": project.output_settings.model_dump(mode="json"),
+        "caption_settings": project.caption_settings.model_dump(mode="json"),
+        "voice": project.voice,
+        "language": project.language,
+        "pronunciations": sorted(project.pronunciations.items()),
+        "caption_hashes": sorted(cap_hashes.items()),
+        "caption_artifacts": sorted(cap_artifacts.items()),
+        "multitrack_v1": True,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _build_atempo_filters(speed: float) -> list[str]:
+    s = float(speed)
+    parts: list[str] = []
+    while s < 0.5 - 1e-6:
+        parts.append("atempo=0.5")
+        s /= 0.5
+    while s > 2.0 + 1e-6:
+        parts.append("atempo=2.0")
+        s /= 2.0
+    if abs(s - 1.0) > 1e-4:
+        parts.append(f"atempo={s:.6f}")
+    return parts
+
+
+def _build_slide_offset_expr(
+    edge_in_type: str,
+    d_in: float,
+    edge_out_type: str,
+    d_out: float,
+    start_sec: float,
+    end_sec: float,
+    axis: str,
+) -> str:
+    """Return additive x or y expression term (in canvas W/H units) for slide transitions."""
+    dim = "W" if axis == "x" else "H"
+    terms: list[str] = []
+    if d_in > 1e-4:
+        if axis == "x":
+            if edge_in_type == "slide_left":
+                terms.append(f"if(lt(t,{start_sec + d_in:.6f}),(1-(t-{start_sec:.6f})/{d_in:.6f})*{dim},0)")
+            elif edge_in_type == "slide_right":
+                terms.append(f"if(lt(t,{start_sec + d_in:.6f}),-(1-(t-{start_sec:.6f})/{d_in:.6f})*{dim},0)")
+        else:
+            if edge_in_type == "slide_up":
+                terms.append(f"if(lt(t,{start_sec + d_in:.6f}),(1-(t-{start_sec:.6f})/{d_in:.6f})*{dim},0)")
+            elif edge_in_type == "slide_down":
+                terms.append(f"if(lt(t,{start_sec + d_in:.6f}),-(1-(t-{start_sec:.6f})/{d_in:.6f})*{dim},0)")
+    if d_out > 1e-4:
+        out_st = max(start_sec, end_sec - d_out)
+        if axis == "x":
+            if edge_out_type == "slide_left":
+                terms.append(f"if(gt(t,{out_st:.6f}),-((t-{out_st:.6f})/{d_out:.6f})*{dim},0)")
+            elif edge_out_type == "slide_right":
+                terms.append(f"if(gt(t,{out_st:.6f}),((t-{out_st:.6f})/{d_out:.6f})*{dim},0)")
+        else:
+            if edge_out_type == "slide_up":
+                terms.append(f"if(gt(t,{out_st:.6f}),-((t-{out_st:.6f})/{d_out:.6f})*{dim},0)")
+            elif edge_out_type == "slide_down":
+                terms.append(f"if(gt(t,{out_st:.6f}),((t-{out_st:.6f})/{d_out:.6f})*{dim},0)")
+    return "+".join(terms) if terms else "0"
+
+
+def render_timeline_composite(
+    project: ProjectInput,
+    source_metadata: SourceMetadata | None,
     manifest: ArtifactManifest,
     project_dir: Path,
     export_path: Path | None = None,
@@ -762,9 +1041,646 @@ def render_final_export(
     cancel_event: threading.Event | None = None,
     on_process_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> Path:
-    """Render Stage 1 segments (reusing cache), verify concat compatibility, concat, and burn in master .ass."""
+    """Composite multi-track video/image/camera/audio/caption timeline into a 1080x1920 MP4."""
+    raw_dur, frame_count, final_dur = get_project_timeline_duration(project, manifest)
+    if raw_dur <= 0.0 or frame_count <= 0:
+        raise RenderError("Project timeline has zero duration; nothing to render")
+
+    ffmpeg_bin, ffprobe_bin = _resolve_ffmpeg_tools(ffmpeg_path, ffprobe_path)
+    resolved_fonts_dir = fonts_dir if fonts_dir is not None else verify_font().parent
+
+    exports_dir = project_dir / "exports"
+    tmp_dir = project_dir / "tmp"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    final_export_path = (
+        export_path if export_path is not None else exports_dir / f"{project.project_id}_export.mp4"
+    )
+    final_export_path.parent.mkdir(parents=True, exist_ok=True)
+
+    out_w = round_even(float(project.output_settings.width))
+    out_h = round_even(float(project.output_settings.height))
+    fps = max(1, int(project.output_settings.fps))
+
+    unique_tag = uuid.uuid4().hex[:8]
+    master_ass_path = tmp_dir / f"{project.project_id}_timeline_{unique_tag}.ass"
+    mixed_tts_wav_path = tmp_dir / f"{project.project_id}_tts_{unique_tag}.wav"
+    filter_script_path = tmp_dir / f"{project.project_id}_composite_{unique_tag}.txt"
+    tmp_out = tmp_dir / f"{project.project_id}_composite_{unique_tag}.mp4"
+
+    asset_cache: dict[str, tuple[MediaAssetRef, MediaAssetMetadata]] = {}
+    filter_lines: list[str] = []
+    node_seq = 0
+
+    def _next_lbl(prefix: str) -> str:
+        nonlocal node_seq
+        node_seq += 1
+        return f"{prefix}_{node_seq}"
+
+    try:
+        # 1. Master mixed TTS track + subtitle events
+        events = build_timeline_subtitle_events(project.tracks, manifest.caption_artifacts)
+        generate_ass_file(
+            events=events,
+            caption_settings=project.caption_settings,
+            output_path=master_ass_path,
+            width=out_w,
+            height=out_h,
+        )
+
+        tts_wav, _speaking_intervals = mix_caption_tracks_audio(
+            tracks=project.tracks,
+            caption_artifacts=manifest.caption_artifacts,
+            project_dir=project_dir,
+            total_duration_sec=final_dur,
+            output_wav_path=mixed_tts_wav_path,
+        )
+
+        # 2. Base RGBA canvas across exact project duration
+        canvas_lbl = _next_lbl("canvas")
+        filter_lines.append(
+            f"color=c=black:s={out_w}x{out_h}:r={fps}:d={final_dur:.6f},format=rgba[{canvas_lbl}]"
+        )
+
+        base_audio_labels: list[str] = []
+        ducked_audio_labels: list[str] = []
+        input_specs: list[list[str]] = []
+
+        def _add_input(args: list[str]) -> int:
+            idx = len(input_specs)
+            input_specs.append(args)
+            return idx
+
+        def _build_prepared_clip(
+            track: VideoTrack,
+            clip: VisualClip,
+            *,
+            pad_to_full_canvas: bool,
+        ) -> tuple[str, str | None, int, int, float, float, float]:
+            asset_ref, asset_meta = _resolve_asset_and_metadata(
+                project, manifest, clip.asset_id, asset_cache, ffmpeg_bin, ffprobe_bin
+            )
+            asset_path = Path(asset_ref.path)
+            if not asset_path.is_file():
+                raise RenderError(f"Media file missing for clip {clip.id!r}: {asset_path}")
+
+            asset_w = int(asset_meta.width or out_w)
+            asset_h = int(asset_meta.height or out_h)
+            dur = float(clip.duration_sec)
+            speed = float(clip.speed)
+
+            if clip.kind == "image" or asset_meta.kind == "image":
+                in_idx = _add_input(
+                    ["-loop", "1", "-framerate", str(fps), "-t", f"{dur:.6f}", "-i", str(asset_path)]
+                )
+                src_v_expr = f"[{in_idx}:v]fps={fps},setpts=PTS-STARTPTS"
+                has_clip_audio = False
+                slice_dur = dur
+            else:
+                avail_dur = max(0.05, float(asset_meta.duration) - float(clip.media_in))
+                trim_end = float(clip.media_out) if clip.media_out is not None else float(asset_meta.duration)
+                slice_dur = max(0.02, min(avail_dur, trim_end - float(clip.media_in)))
+                need_src_dur = dur * speed
+                read_dur = slice_dur if clip.end_behavior == "loop" else min(slice_dur, need_src_dur + 0.1)
+
+                in_idx = _add_input(
+                    ["-ss", f"{clip.media_in:.6f}", "-t", f"{max(0.02, read_dur):.6f}", "-i", str(asset_path)]
+                )
+                parts = [f"[{in_idx}:v]setpts=(PTS-STARTPTS)/{speed:.6f}", f"fps={fps}"]
+                played_dur = read_dur / speed
+                if clip.end_behavior == "loop" and played_dur < dur - 1e-4:
+                    loop_frames = min(18000, max(1, math.ceil(played_dur * float(fps)) + 4))
+                    parts.append(f"loop=loop=-1:size={loop_frames}:start=0")
+                elif played_dur < dur + 0.25:
+                    parts.append(f"tpad=stop_mode=clone:stop_duration={dur - played_dur + 0.5:.6f}")
+                parts.append(f"trim=duration={dur:.6f},setpts=PTS-STARTPTS")
+                src_v_expr = ",".join(parts)
+                has_clip_audio = (
+                    not track.muted
+                    and asset_meta.has_audio
+                    and float(clip.volume) > 0.0
+                )
+
+            # Spatial framing / camera crop vs canvas overlay fit
+            raw_v_lbl = _next_lbl("vraw")
+            filter_lines.append(f"{src_v_expr}[{raw_v_lbl}]")
+
+            if track.camera_follow:
+                if project.camera_keyframes:
+                    local_kfs = slice_camera_keyframes_for_segment(
+                        project.camera_keyframes,
+                        clip_start=clip.start_sec,
+                        clip_dur=dur,
+                        width=asset_w,
+                        height=asset_h,
+                        output_width=out_w,
+                        output_height=out_h,
+                    )
+                else:
+                    # Default centered vertical crop
+                    from backend.geometry import compute_ideal_crop_size
+
+                    iw, ih = compute_ideal_crop_size(
+                        asset_w, asset_h, 1.0, output_width=out_w, output_height=out_h
+                    )
+                    cx = max(0.0, (float(asset_w) - iw) / (2.0 * float(asset_w)))
+                    cy = max(0.0, (float(asset_h) - ih) / (2.0 * float(asset_h)))
+                    local_kfs = [CropKeyframe(t=0.0, x=round(cx, 6), y=round(cy, 6), zoom=1.0)]
+
+                crop_filter = build_crop_filter(
+                    local_kfs,
+                    width=asset_w,
+                    height=asset_h,
+                    duration=dur,
+                    fps=fps,
+                    output_width=out_w,
+                    output_height=out_h,
+                )
+                clip_w = out_w
+                clip_h = out_h
+                framed_lbl = _next_lbl("vcrop")
+                filter_lines.append(f"[{raw_v_lbl}]{crop_filter},trim=duration={dur:.6f},setpts=PTS-STARTPTS[{framed_lbl}]")
+
+                if abs(clip.transform.scale - 1.0) > 1e-3:
+                    clip_w = max(2, round_even(float(out_w) * float(clip.transform.scale)))
+                    clip_h = max(2, round_even(float(out_h) * float(clip.transform.scale)))
+                    scaled_lbl = _next_lbl("vscl")
+                    filter_lines.append(
+                        f"[{framed_lbl}]scale={clip_w}:{clip_h}:flags=lanczos,setsar=1,format=rgba[{scaled_lbl}]"
+                    )
+                    framed_lbl = scaled_lbl
+                else:
+                    rgba_lbl = _next_lbl("vrgba")
+                    filter_lines.append(f"[{framed_lbl}]format=rgba[{rgba_lbl}]")
+                    framed_lbl = rgba_lbl
+            else:
+                fit_scale = min(float(out_w) / float(asset_w), float(out_h) / float(asset_h))
+                clip_w = max(2, round_even(float(asset_w) * fit_scale * float(clip.transform.scale)))
+                clip_h = max(2, round_even(float(asset_h) * fit_scale * float(clip.transform.scale)))
+                framed_lbl = _next_lbl("vov")
+                filter_lines.append(
+                    f"[{raw_v_lbl}]scale={clip_w}:{clip_h}:flags=lanczos,setsar=1,format=rgba[{framed_lbl}]"
+                )
+
+            # Opacity multiplier
+            if float(clip.transform.opacity) < 0.999:
+                op_lbl = _next_lbl("vop")
+                filter_lines.append(
+                    f"[{framed_lbl}]colorchannelmixer=aa={float(clip.transform.opacity):.6f}[{op_lbl}]"
+                )
+                framed_lbl = op_lbl
+
+            # Clip-edge In/Out transitions
+            d_in = float(clip.transition_in.duration_sec) if clip.transition_in.type != "none" else 0.0
+            d_out = float(clip.transition_out.duration_sec) if clip.transition_out.type != "none" else 0.0
+            if d_in + d_out > dur and (d_in + d_out) > 0.0:
+                factor = dur / (d_in + d_out)
+                d_in *= factor
+                d_out *= factor
+
+            t_in = clip.transition_in.type
+            t_out = clip.transition_out.type
+
+            # Wipe In
+            if d_in > 1e-4 and t_in in ("wipe_left", "wipe_right"):
+                xf_w = "wipeleft" if t_in == "wipe_left" else "wiperight"
+                min_lbl = _next_lbl("wmin")
+                wout_lbl = _next_lbl("win")
+                filter_lines.append(
+                    f"color=c=black@0.0:s={clip_w}x{clip_h}:r={fps}:d={d_in:.6f},format=rgba[{min_lbl}]"
+                )
+                filter_lines.append(
+                    f"[{min_lbl}][{framed_lbl}]xfade=transition={xf_w}:duration={d_in:.6f}:offset=0[{wout_lbl}]"
+                )
+                framed_lbl = wout_lbl
+            elif d_in > 1e-4 and t_in in ("fade", "zoom"):
+                fin_lbl = _next_lbl("fin")
+                filter_lines.append(f"[{framed_lbl}]fade=t=in:st=0:d={d_in:.6f}:alpha=1[{fin_lbl}]")
+                framed_lbl = fin_lbl
+
+            # Wipe Out / Fade Out
+            if d_out > 1e-4 and t_out in ("wipe_left", "wipe_right"):
+                xf_w = "wipeleft" if t_out == "wipe_left" else "wiperight"
+                mout_lbl = _next_lbl("wmout")
+                wout_lbl = _next_lbl("wout")
+                offset_out = max(0.0, dur - d_out)
+                filter_lines.append(
+                    f"color=c=black@0.0:s={clip_w}x{clip_h}:r={fps}:d={d_out:.6f},format=rgba[{mout_lbl}]"
+                )
+                filter_lines.append(
+                    f"[{framed_lbl}][{mout_lbl}]xfade=transition={xf_w}:duration={d_out:.6f}:offset={offset_out:.6f}[{wout_lbl}]"
+                )
+                framed_lbl = wout_lbl
+            elif d_out > 1e-4 and t_out in ("fade", "zoom"):
+                fout_lbl = _next_lbl("fout")
+                st_out = max(0.0, dur - d_out)
+                filter_lines.append(f"[{framed_lbl}]fade=t=out:st={st_out:.6f}:d={d_out:.6f}:alpha=1[{fout_lbl}]")
+                framed_lbl = fout_lbl
+
+            # Rotation (applied after wipe so matte dimensions match pre-rotation size)
+            if abs(float(clip.transform.rotation_deg)) > 0.01:
+                rad = math.radians(float(clip.transform.rotation_deg))
+                rot_lbl = _next_lbl("vrot")
+                filter_lines.append(
+                    f"[{framed_lbl}]rotate={rad:.6f}:ow=rotw({rad:.6f}):oh=roth({rad:.6f}):c=black@0.0[{rot_lbl}]"
+                )
+                framed_lbl = rot_lbl
+
+            # Optional normalization to full canvas (needed before TrackTransition xfade)
+            if pad_to_full_canvas and (
+                clip_w != out_w
+                or clip_h != out_h
+                or abs(clip.transform.x - 0.5) > 1e-3
+                or abs(clip.transform.y - 0.5) > 1e-3
+                or abs(clip.transform.rotation_deg) > 0.01
+            ):
+                base_pad = _next_lbl("cpad")
+                merged_pad = _next_lbl("cfull")
+                filter_lines.append(
+                    f"color=c=black@0.0:s={out_w}x{out_h}:r={fps}:d={dur:.6f},format=rgba[{base_pad}]"
+                )
+                filter_lines.append(
+                    f"[{base_pad}][{framed_lbl}]overlay=x='{clip.transform.x:.6f}*W-w/2':y='{clip.transform.y:.6f}*H-h/2':format=rgb,format=rgba[{merged_pad}]"
+                )
+                framed_lbl = merged_pad
+                clip_w = out_w
+                clip_h = out_h
+
+            # Clip Audio Preparation (always at 0..dur local time before placement/acrossfade)
+            aud_lbl: str | None = None
+            if has_clip_audio:
+                aud_lbl = _next_lbl("vaud")
+                a_parts = [f"[{in_idx}:a]asetpts=PTS-STARTPTS"]
+                a_parts.extend(_build_atempo_filters(speed))
+                a_played_dur = read_dur / speed
+                if clip.end_behavior == "loop" and a_played_dur < dur - 1e-4:
+                    loop_smps = max(1, int(round(a_played_dur * float(AUDIO_SAMPLE_RATE))))
+                    a_parts.extend(
+                        [
+                            f"aresample={AUDIO_SAMPLE_RATE}",
+                            f"aformat=sample_fmts=fltp:channel_layouts=stereo",
+                            f"aloop=loop=-1:size={loop_smps}",
+                        ]
+                    )
+                else:
+                    a_parts.extend(
+                        [
+                            f"aresample={AUDIO_SAMPLE_RATE}",
+                            "aformat=sample_fmts=fltp:channel_layouts=stereo",
+                            f"apad=whole_dur={dur:.6f}",
+                        ]
+                    )
+                a_parts.extend([f"atrim=duration={dur:.6f}", "asetpts=PTS-STARTPTS", f"volume={float(clip.volume):.6f}"])
+                if float(clip.audio_fade_in_sec) > 1e-4:
+                    a_parts.append(f"afade=t=in:st=0:d={min(dur, float(clip.audio_fade_in_sec)):.6f}")
+                if float(clip.audio_fade_out_sec) > 1e-4:
+                    f_out = min(dur, float(clip.audio_fade_out_sec))
+                    a_parts.append(f"afade=t=out:st={max(0.0, dur - f_out):.6f}:d={f_out:.6f}")
+                filter_lines.append(",".join(a_parts) + f"[{aud_lbl}]")
+
+            return framed_lbl, aud_lbl, clip_w, clip_h, dur, d_in, d_out
+
+        # 3. Render Visual Tracks Bottom-to-Top
+        for track in project.tracks:
+            if not isinstance(track, VideoTrack) or not track.visible:
+                continue
+
+            for run_clips, run_trs in _group_video_track_runs(track):
+                is_run = len(run_clips) > 1
+                if not is_run:
+                    c0 = run_clips[0]
+                    v_lbl, a_lbl, _cw, _ch, c_dur, d_in, d_out = _build_prepared_clip(
+                        track, c0, pad_to_full_canvas=False
+                    )
+                    pts_lbl = _next_lbl("vpts")
+                    start_s = float(c0.start_sec)
+                    end_s = start_s + c_dur
+                    filter_lines.append(f"[{v_lbl}]setpts=PTS-STARTPTS+{start_s:.6f}/TB[{pts_lbl}]")
+
+                    dx_expr = _build_slide_offset_expr(
+                        c0.transition_in.type, d_in, c0.transition_out.type, d_out, start_s, end_s, "x"
+                    )
+                    dy_expr = _build_slide_offset_expr(
+                        c0.transition_in.type, d_in, c0.transition_out.type, d_out, start_s, end_s, "y"
+                    )
+                    base_x = f"{c0.transform.x:.6f}*W-w/2"
+                    base_y = f"{c0.transform.y:.6f}*H-h/2"
+                    x_expr = base_x if dx_expr == "0" else f"{base_x}+{dx_expr}"
+                    y_expr = base_y if dy_expr == "0" else f"{base_y}+{dy_expr}"
+
+                    next_canvas = _next_lbl("canvas")
+                    filter_lines.append(
+                        f"[{canvas_lbl}][{pts_lbl}]overlay=x='{x_expr}':y='{y_expr}':"
+                        f"enable='between(t,{start_s:.6f},{end_s:.6f})':eof_action=pass:format=rgb[{next_canvas}]"
+                    )
+                    canvas_lbl = next_canvas
+
+                    if a_lbl is not None:
+                        if start_s > 1e-4:
+                            delayed = _next_lbl("adel")
+                            delay_ms = int(round(start_s * 1000.0))
+                            filter_lines.append(f"[{a_lbl}]adelay=delays={delay_ms}:all=1[{delayed}]")
+                            base_audio_labels.append(delayed)
+                        else:
+                            base_audio_labels.append(a_lbl)
+                else:
+                    # Same-track xfade / acrossfade junction chain
+                    prepared = [
+                        _build_prepared_clip(track, clp, pad_to_full_canvas=True) for clp in run_clips
+                    ]
+                    any_audio = any(item[1] is not None for item in prepared)
+                    run_start = float(run_clips[0].start_sec)
+                    cur_v, cur_a, _w, _h, cur_dur, _di, _do = prepared[0]
+                    if any_audio and cur_a is None:
+                        cur_a = _next_lbl("asil")
+                        filter_lines.append(
+                            f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=stereo:d={cur_dur:.6f}[{cur_a}]"
+                        )
+
+                    for idx, nxt_clip in enumerate(run_clips[1:]):
+                        tr = run_trs[idx]
+                        nxt_v, nxt_a, _nw, _nh, nxt_dur, _ndi, _ndo = prepared[idx + 1]
+                        overlap = max(0.0, (run_start + cur_dur) - float(nxt_clip.start_sec))
+                        if overlap >= 0.05:
+                            eff_d = min(float(tr.duration_sec), overlap, cur_dur * 0.85, nxt_dur * 0.85)
+                            offset = max(0.0, float(nxt_clip.start_sec) - run_start)
+                        else:
+                            eff_d = min(float(tr.duration_sec), cur_dur * 0.45, nxt_dur * 0.45)
+                            offset = max(0.0, cur_dur - eff_d)
+
+                        xf_name = "fade" if tr.type == "crossfade" else tr.type
+                        merged_v = _next_lbl("vxf")
+                        filter_lines.append(
+                            f"[{cur_v}][{nxt_v}]xfade=transition={xf_name}:duration={eff_d:.6f}:offset={offset:.6f}[{merged_v}]"
+                        )
+                        cur_v = merged_v
+
+                        if any_audio:
+                            if nxt_a is None:
+                                nxt_a = _next_lbl("asil")
+                                filter_lines.append(
+                                    f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=stereo:d={nxt_dur:.6f}[{nxt_a}]"
+                                )
+                            merged_a = _next_lbl("axf")
+                            if overlap >= 0.05 or abs(eff_d) > 1e-4:
+                                # Trim cur_a cleanly to offset + eff_d before acrossfade if overlapping beyond eff_d
+                                if abs((offset + eff_d) - cur_dur) > 0.02:
+                                    trimmed_a = _next_lbl("atrm")
+                                    filter_lines.append(
+                                        f"[{cur_a}]atrim=duration={max(eff_d + 0.02, offset + eff_d):.6f},asetpts=PTS-STARTPTS[{trimmed_a}]"
+                                    )
+                                    cur_a = trimmed_a
+                                filter_lines.append(
+                                    f"[{cur_a}][{nxt_a}]acrossfade=d={eff_d:.6f}:c1=tri:c2=tri[{merged_a}]"
+                                )
+                                cur_a = merged_a
+
+                        cur_dur = offset + nxt_dur
+
+                    pts_lbl = _next_lbl("vrpts")
+                    run_end = run_start + cur_dur
+                    filter_lines.append(f"[{cur_v}]setpts=PTS-STARTPTS+{run_start:.6f}/TB[{pts_lbl}]")
+                    next_canvas = _next_lbl("canvas")
+                    filter_lines.append(
+                        f"[{canvas_lbl}][{pts_lbl}]overlay=x=0:y=0:"
+                        f"enable='between(t,{run_start:.6f},{run_end:.6f})':eof_action=pass:format=rgb[{next_canvas}]"
+                    )
+                    canvas_lbl = next_canvas
+
+                    if cur_a is not None:
+                        if run_start > 1e-4:
+                            delayed = _next_lbl("radel")
+                            delay_ms = int(round(run_start * 1000.0))
+                            filter_lines.append(f"[{cur_a}]adelay=delays={delay_ms}:all=1[{delayed}]")
+                            base_audio_labels.append(delayed)
+                        else:
+                            base_audio_labels.append(cur_a)
+
+        # 4. Subtitle Burn-In + Exact Video Output Framing
+        yuv_lbl = _next_lbl("vyuv")
+        ass_filter = (
+            f"format=yuv420p,"
+            f"ass=filename={_escape_ffmpeg_filter_path(master_ass_path)}"
+            f":fontsdir={_escape_ffmpeg_filter_path(resolved_fonts_dir)},"
+            f"trim=end_frame={frame_count},setpts=PTS-STARTPTS"
+        )
+        filter_lines.append(f"[{canvas_lbl}]{ass_filter}[{yuv_lbl}]")
+
+        # 5. Standalone Audio Tracks (Mute / Solo / Fade / Loop / Ducking)
+        audio_tracks = [t for t in project.tracks if isinstance(t, AudioTrack)]
+        has_solo = any(t.solo and not t.muted for t in audio_tracks)
+        for atr in audio_tracks:
+            if atr.muted or (has_solo and not atr.solo) or float(atr.volume) <= 0.0:
+                continue
+            for aclip in atr.clips:
+                asset_ref, asset_meta = _resolve_asset_and_metadata(
+                    project, manifest, aclip.asset_id, asset_cache, ffmpeg_bin, ffprobe_bin
+                )
+                asset_path = Path(asset_ref.path)
+                if not asset_path.is_file():
+                    raise RenderError(f"Audio file missing for clip {aclip.id!r}: {asset_path}")
+                if not asset_meta.has_audio:
+                    raise RenderError(f"Asset {aclip.asset_id!r} has no audio stream")
+
+                dur = float(aclip.duration_sec)
+                spd = float(aclip.speed)
+                avail_dur = max(0.02, float(asset_meta.duration) - float(aclip.media_in))
+                need_src = dur * spd
+                read_dur = avail_dur if aclip.loop else min(avail_dur, need_src + 0.1)
+
+                in_idx = _add_input(
+                    ["-ss", f"{aclip.media_in:.6f}", "-t", f"{max(0.02, read_dur):.6f}", "-i", str(asset_path)]
+                )
+                aparts = [f"[{in_idx}:a]asetpts=PTS-STARTPTS"]
+                aparts.extend(_build_atempo_filters(spd))
+                played_dur = read_dur / spd
+                if aclip.loop and played_dur < dur - 1e-4:
+                    loop_smps = max(1, int(round(played_dur * float(AUDIO_SAMPLE_RATE))))
+                    aparts.extend(
+                        [
+                            f"aresample={AUDIO_SAMPLE_RATE}",
+                            "aformat=sample_fmts=fltp:channel_layouts=stereo",
+                            f"aloop=loop=-1:size={loop_smps}",
+                        ]
+                    )
+                else:
+                    aparts.extend(
+                        [
+                            f"aresample={AUDIO_SAMPLE_RATE}",
+                            "aformat=sample_fmts=fltp:channel_layouts=stereo",
+                            f"apad=whole_dur={dur:.6f}",
+                        ]
+                    )
+                eff_vol = float(atr.volume) * float(aclip.volume)
+                aparts.extend([f"atrim=duration={dur:.6f}", "asetpts=PTS-STARTPTS", f"volume={eff_vol:.6f}"])
+                if float(aclip.fade_in_sec) > 1e-4:
+                    aparts.append(f"afade=t=in:st=0:d={min(dur, float(aclip.fade_in_sec)):.6f}")
+                if float(aclip.fade_out_sec) > 1e-4:
+                    f_out = min(dur, float(aclip.fade_out_sec))
+                    aparts.append(f"afade=t=out:st={max(0.0, dur - f_out):.6f}:d={f_out:.6f}")
+                if float(aclip.start_sec) > 1e-4:
+                    delay_ms = int(round(float(aclip.start_sec) * 1000.0))
+                    aparts.append(f"adelay=delays={delay_ms}:all=1")
+
+                albl = _next_lbl("atrk")
+                filter_lines.append(",".join(aparts) + f"[{albl}]")
+                if atr.duck_under_narration:
+                    ducked_audio_labels.append(albl)
+                else:
+                    base_audio_labels.append(albl)
+
+        # 6. Mixed Kokoro TTS Audio Bus + Optional Sidechain Ducking
+        tts_mix_label: str | None = None
+        if tts_wav is not None and tts_wav.is_file():
+            tts_idx = _add_input(["-i", str(tts_wav)])
+            tts_raw_lbl = _next_lbl("ttsin")
+            filter_lines.append(
+                f"[{tts_idx}:a]aresample={AUDIO_SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"apad=whole_dur={final_dur:.6f},atrim=duration={final_dur:.6f},asetpts=PTS-STARTPTS[{tts_raw_lbl}]"
+            )
+            tts_mix_label = tts_raw_lbl
+
+        if ducked_audio_labels:
+            if len(ducked_audio_labels) == 1:
+                duck_bus = _next_lbl("dbus")
+                filter_lines.append(
+                    f"[{ducked_audio_labels[0]}]apad=whole_dur={final_dur:.6f},atrim=duration={final_dur:.6f},asetpts=PTS-STARTPTS[{duck_bus}]"
+                )
+            else:
+                duck_bus = _next_lbl("dbus")
+                refs = "".join(f"[{l}]" for l in ducked_audio_labels)
+                filter_lines.append(
+                    f"{refs}amix=inputs={len(ducked_audio_labels)}:duration=longest:normalize=0,"
+                    f"apad=whole_dur={final_dur:.6f},atrim=duration={final_dur:.6f},asetpts=PTS-STARTPTS[{duck_bus}]"
+                )
+
+            if tts_mix_label is not None:
+                tts_sc = _next_lbl("ttssc")
+                tts_main = _next_lbl("ttsmain")
+                ducked_out = _next_lbl("duckout")
+                filter_lines.append(f"[{tts_mix_label}]asplit=2[{tts_sc}][{tts_main}]")
+                filter_lines.append(
+                    f"[{duck_bus}][{tts_sc}]sidechaincompress=threshold=0.02:ratio=6:attack=20:release=250:level_sc=1[{ducked_out}]"
+                )
+                base_audio_labels.append(ducked_out)
+                base_audio_labels.append(tts_main)
+            else:
+                base_audio_labels.append(duck_bus)
+        elif tts_mix_label is not None:
+            base_audio_labels.append(tts_mix_label)
+
+        aout_lbl = "aout"
+        audio_end_pad = final_dur + (1024.0 / float(AUDIO_SAMPLE_RATE))
+        if not base_audio_labels:
+            filter_lines.append(
+                f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=stereo:d={final_dur:.6f}[{aout_lbl}]"
+            )
+        elif len(base_audio_labels) == 1:
+            filter_lines.append(
+                f"[{base_audio_labels[0]}]alimiter=limit=0.95,apad=whole_dur={audio_end_pad:.6f},"
+                f"atrim=duration={audio_end_pad:.6f},asetpts=PTS-STARTPTS[{aout_lbl}]"
+            )
+        else:
+            refs = "".join(f"[{l}]" for l in base_audio_labels)
+            filter_lines.append(
+                f"{refs}amix=inputs={len(base_audio_labels)}:duration=longest:normalize=0,"
+                f"alimiter=limit=0.95,apad=whole_dur={audio_end_pad:.6f},"
+                f"atrim=duration={audio_end_pad:.6f},asetpts=PTS-STARTPTS[{aout_lbl}]"
+            )
+
+        filter_script_path.write_text(";\n".join(filter_lines), encoding="utf-8")
+
+        cmd = [str(ffmpeg_bin), "-y", "-hide_banner"]
+        for spec in input_specs:
+            cmd.extend(spec)
+        cmd.extend(
+            [
+                "-filter_complex_script",
+                str(filter_script_path),
+                "-map",
+                f"[{yuv_lbl}]",
+                "-map",
+                f"[{aout_lbl}]",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "19",
+                "-preset",
+                "medium",
+                "-pix_fmt",
+                "yuv420p",
+                "-r",
+                str(fps),
+                "-fps_mode",
+                "cfr",
+                "-frames:v",
+                str(frame_count),
+                "-movflags",
+                "+faststart",
+                "-c:a",
+                "aac",
+                "-ar",
+                str(AUDIO_SAMPLE_RATE),
+                "-ac",
+                "2",
+                "-b:a",
+                "192k",
+                str(tmp_out),
+            ]
+        )
+
+        _run_ffmpeg_cancellable(cmd, cancel_event=cancel_event, on_process_start=on_process_start)
+        probe_rendered_video(
+            tmp_out,
+            ffprobe_bin,
+            expected_width=out_w,
+            expected_height=out_h,
+            expected_fps=fps,
+            require_audio=True,
+        )
+        os.replace(tmp_out, final_export_path)
+        return final_export_path
+    except Exception:
+        tmp_out.unlink(missing_ok=True)
+        raise
+    finally:
+        master_ass_path.unlink(missing_ok=True)
+        mixed_tts_wav_path.unlink(missing_ok=True)
+        filter_script_path.unlink(missing_ok=True)
+
+
+def render_final_export(
+    project: ProjectInput,
+    source_metadata: SourceMetadata | None,
+    manifest: ArtifactManifest,
+    project_dir: Path,
+    export_path: Path | None = None,
+    ffmpeg_path: Path | None = None,
+    ffprobe_path: Path | None = None,
+    fonts_dir: Path | None = None,
+    cancel_event: threading.Event | None = None,
+    on_process_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+) -> Path:
+    """Render full project to final 1080x1920 MP4 (multi-track compositor or legacy two-stage concat)."""
+    if _is_multitrack_project(project):
+        return render_timeline_composite(
+            project=project,
+            source_metadata=source_metadata,
+            manifest=manifest,
+            project_dir=project_dir,
+            export_path=export_path,
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
+            fonts_dir=fonts_dir,
+            cancel_event=cancel_event,
+            on_process_start=on_process_start,
+        )
+
     if not project.segments:
         raise RenderError("Project has no segments to export")
+    if source_metadata is None:
+        raise RenderError("Source metadata is required for legacy segment export")
 
     ffmpeg_bin, ffprobe_bin = _resolve_ffmpeg_tools(ffmpeg_path, ffprobe_path)
     resolved_fonts_dir = fonts_dir if fonts_dir is not None else verify_font().parent
@@ -937,7 +1853,7 @@ def render_final_export(
 
 def render_project_preview(
     project: ProjectInput,
-    source_metadata: SourceMetadata,
+    source_metadata: SourceMetadata | None,
     manifest: ArtifactManifest,
     project_dir: Path,
     ffmpeg_path: Path | None = None,
@@ -946,12 +1862,16 @@ def render_project_preview(
     cancel_event: threading.Event | None = None,
     on_process_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> Path:
-    """Render a full-project captioned MP4 preview (reusing Stage 1 & content-addressed preview cache)."""
-    if not project.segments:
-        raise RenderError("Project has no segments to preview")
-
+    """Render a full-project captioned MP4 preview (content-addressed preview cache)."""
     ffmpeg_bin, ffprobe_bin = _resolve_ffmpeg_tools(ffmpeg_path, ffprobe_path)
-    preview_hash = compute_project_preview_hash(project, manifest)
+
+    if _is_multitrack_project(project):
+        preview_hash = compute_timeline_render_hash(project, manifest)
+    else:
+        if not project.segments:
+            raise RenderError("Project has no segments to preview")
+        preview_hash = compute_project_preview_hash(project, manifest)
+
     artifacts_dir = project_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     preview_path = artifacts_dir / f"preview_project_{preview_hash}.mp4"

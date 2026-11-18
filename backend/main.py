@@ -42,13 +42,16 @@ from backend.media import (
     MediaValidationError,
     import_uploaded_media,
     probe_and_validate_media,
+    register_project_asset,
     select_media_native,
 )
 from backend.proxy import generate_proxy, probe_nvenc_support
 from backend.renderer import (
     RenderCancelledError,
     RenderError,
+    _is_multitrack_project,
     compute_render_hash,
+    get_project_timeline_duration,
     plan_segment_duration,
     render_final_export,
     render_project_preview,
@@ -57,11 +60,17 @@ from backend.renderer import (
 )
 from backend.schemas import (
     ArtifactManifest,
+    AudioTrack,
+    CaptionArtifactState,
+    CaptionTrack,
+    MediaAssetMetadata,
+    MediaProxyState,
     ProjectInput,
     ProxyState,
     SegmentArtifactState,
     SourceMediaRef,
     SourceMetadata,
+    VideoTrack,
 )
 from backend.storage import (
     InsufficientDiskSpaceError,
@@ -73,6 +82,7 @@ from backend.storage import (
     compute_file_fingerprint,
     create_project,
     ensure_free_disk_space,
+    ensure_primary_media_registered,
     get_project_dir,
     load_global_pronunciations,
     load_manifest,
@@ -82,7 +92,15 @@ from backend.storage import (
     save_manifest,
     save_project,
 )
-from backend.tts import compute_tts_hash, list_voices, resolve_clause_spoken_text, synthesize_segment_tts
+from backend.tts import (
+    compute_caption_tts_hash,
+    compute_tts_hash,
+    list_voices,
+    resolve_caption_spoken_text,
+    resolve_clause_spoken_text,
+    synthesize_caption_tts,
+    synthesize_segment_tts,
+)
 
 APP_VERSION = "0.1.0"
 ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "testserver"})
@@ -330,22 +348,34 @@ def _validate_manual_media_path(raw_path: Any) -> Path:
 
 
 def _parse_multipart_file(content_type: str, body: bytes) -> tuple[str, bytes]:
+    filename, payload, _ = _parse_multipart_upload(content_type, body)
+    return filename, payload
+
+
+def _parse_multipart_upload(content_type: str, body: bytes) -> tuple[str, bytes, dict[str, str]]:
     header_block = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("latin-1")
     msg = BytesParser(policy=default_email_policy).parsebytes(header_block + body)
     if not msg.is_multipart():
         raise MediaValidationError("Invalid multipart/form-data payload.")
+    fields: dict[str, str] = {}
+    found_file: tuple[str, bytes] | None = None
     for part in msg.iter_parts():
         disp_name = part.get_param("name", header="content-disposition")
         filename = part.get_filename()
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            raw = part.get_payload(decode=False)
+            payload = raw.encode("utf-8") if isinstance(raw, str) else b""
         if disp_name == "file" or filename:
             if not filename:
                 raise MediaValidationError("Uploaded multipart part is missing a filename.")
-            payload = part.get_payload(decode=True)
-            if payload is None:
-                raw = part.get_payload(decode=False)
-                payload = raw.encode("utf-8") if isinstance(raw, str) else b""
-            return filename, payload
-    raise MediaValidationError("No file field found in multipart/form-data request.")
+            if found_file is None:
+                found_file = (filename, payload)
+        elif disp_name:
+            fields[str(disp_name)] = payload.decode("utf-8", errors="replace").strip()
+    if found_file is None:
+        raise MediaValidationError("No file field found in multipart/form-data request.")
+    return found_file[0], found_file[1], fields
 
 
 def _validate_relative_artifact_path(project_dir: Path, rel_path: str) -> Path:
@@ -361,7 +391,12 @@ def _validate_relative_artifact_path(project_dir: Path, rel_path: str) -> Path:
     return resolved
 
 
-def _resolve_artifact_path(manifest: ArtifactManifest, project_dir: Path, artifact_id: str) -> Path | None:
+def _resolve_artifact_path(
+    manifest: ArtifactManifest,
+    project_dir: Path,
+    artifact_id: str,
+    project: ProjectInput | None = None,
+) -> Path | None:
     rel_path: str | None = None
     if artifact_id == "art_proxy" or manifest.proxy.artifact_id == artifact_id:
         rel_path = manifest.proxy.path
@@ -370,20 +405,54 @@ def _resolve_artifact_path(manifest: ArtifactManifest, project_dir: Path, artifa
     elif manifest.latest_export_artifact_id == artifact_id:
         rel_path = manifest.latest_export_path
     else:
-        for seg_state in manifest.segments.values():
-            if seg_state.audio_artifact_id == artifact_id:
-                rel_path = seg_state.audio_path
+        for aid, pstate in manifest.media_proxies.items():
+            if pstate.artifact_id == artifact_id or artifact_id == f"art_proxy_{aid}":
+                rel_path = pstate.path
                 break
-            if seg_state.segment_artifact_id == artifact_id:
-                rel_path = seg_state.rendered_segment_path
-                break
-            if seg_state.preview_artifact_id == artifact_id:
-                rel_path = seg_state.preview_path
-                break
+        if not rel_path:
+            for cid, cstate in manifest.caption_artifacts.items():
+                if cstate.audio_artifact_id == artifact_id or artifact_id == f"art_cap_{cid}":
+                    rel_path = cstate.audio_path
+                    break
+        if not rel_path:
+            for seg_state in manifest.segments.values():
+                if seg_state.audio_artifact_id == artifact_id:
+                    rel_path = seg_state.audio_path
+                    break
+                if seg_state.segment_artifact_id == artifact_id:
+                    rel_path = seg_state.rendered_segment_path
+                    break
+                if seg_state.preview_artifact_id == artifact_id:
+                    rel_path = seg_state.preview_path
+                    break
 
-    if not rel_path:
-        return None
-    return _validate_relative_artifact_path(project_dir, rel_path)
+    if rel_path:
+        return _validate_relative_artifact_path(project_dir, rel_path)
+
+    if project is not None:
+        asset_ref = project.media_assets.get(artifact_id)
+        if asset_ref is None and artifact_id == project.source_media.media_id:
+            asset_path_str = project.source_media.path
+            copied_to_project = project.source_media.copied_to_project
+        elif asset_ref is not None:
+            asset_path_str = asset_ref.path
+            copied_to_project = asset_ref.copied_to_project
+        else:
+            return None
+
+        if not asset_path_str or "\x00" in asset_path_str:
+            raise HTTPException(status_code=403, detail="Invalid media asset path")
+        raw_path = Path(asset_path_str)
+        if ".." in raw_path.parts:
+            raise HTTPException(status_code=403, detail="Path traversal rejected")
+        resolved = raw_path.resolve()
+        if copied_to_project:
+            project_root = project_dir.resolve()
+            if not resolved.is_relative_to(project_root):
+                raise HTTPException(status_code=403, detail="Copied asset path escapes project directory")
+        return resolved
+
+    return None
 
 
 def _parse_byte_range(range_header: str, file_size: int) -> tuple[int, int] | None:
@@ -443,11 +512,168 @@ def _iter_file_range(path: Path, start: int, end: int) -> Iterator[bytes]:
 
 def _media_content_type(path: Path) -> str:
     suffix = path.suffix.lower()
-    if suffix == ".mp4":
-        return "video/mp4"
-    if suffix == ".wav":
-        return "audio/wav"
-    return "application/octet-stream"
+    mapping = {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska",
+        ".webm": "video/webm",
+        ".avi": "video/x-msvideo",
+        ".m4v": "video/x-m4v",
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".aac": "audio/aac",
+        ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/opus",
+        ".flac": "audio/flac",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+    }
+    return mapping.get(suffix, "application/octet-stream")
+
+
+def _asset_meta_from_source(meta: SourceMetadata) -> MediaAssetMetadata:
+    return MediaAssetMetadata(
+        kind="video",
+        width=meta.width,
+        height=meta.height,
+        fps=meta.fps,
+        duration=meta.duration,
+        has_audio=meta.has_audio,
+        has_alpha=False,
+        codec_name=meta.codec_name,
+        pix_fmt=meta.pix_fmt,
+        audio_sample_rate=meta.audio_sample_rate,
+        audio_channels=meta.audio_channels,
+    )
+
+
+def _find_caption_clip(project: ProjectInput, clip_id: str) -> Any | None:
+    for track in project.tracks:
+        if isinstance(track, CaptionTrack):
+            for clip in track.clips:
+                if clip.id == clip_id:
+                    return clip
+    return None
+
+
+def _ensure_caption_tts(
+    target_app: FastAPI,
+    project: ProjectInput,
+    clip_id: str,
+    project_dir: Path,
+    data_dir: Path,
+    manifest: ArtifactManifest,
+) -> CaptionArtifactState:
+    clip = _find_caption_clip(project, clip_id)
+    if clip is None:
+        raise ValueError(f"CaptionClip {clip_id!r} not found")
+
+    expected_hash = compute_caption_tts_hash(
+        clip=clip,
+        pronunciations=project.pronunciations,
+        voice=project.voice,
+        language=project.language,
+    )
+    spoken = resolve_caption_spoken_text(clip, project.pronunciations).strip()
+    existing = manifest.caption_artifacts.get(clip_id)
+
+    if not clip.tts_enabled or not spoken:
+        if (
+            existing is not None
+            and existing.tts_hash == expected_hash
+            and existing.audio_artifact_id is None
+        ):
+            return existing
+        state = CaptionArtifactState(
+            tts_hash=expected_hash,
+            audio_artifact_id=None,
+            audio_path=None,
+            sample_rate=24000,
+            total_samples=0,
+            audio_duration=0.0,
+        )
+        lock = _get_manifest_lock(target_app, project.project_id)
+        with lock:
+            latest_manifest = load_manifest(project.project_id, data_dir=data_dir)
+            latest_manifest.caption_artifacts[clip_id] = state
+            save_manifest(latest_manifest, data_dir=data_dir)
+        manifest.caption_artifacts[clip_id] = state.model_copy(deep=True)
+        return state
+
+    if (
+        existing is not None
+        and existing.tts_hash == expected_hash
+        and existing.audio_path
+        and (project_dir / existing.audio_path).is_file()
+    ):
+        return existing
+
+    res = synthesize_caption_tts(
+        clip=clip,
+        pronunciations=project.pronunciations,
+        voice=project.voice,
+        language=project.language,
+        output_dir=project_dir / "artifacts",
+    )
+    rel_audio = res.audio_path.relative_to(project_dir).as_posix() if res.audio_path is not None else None
+    audio_art_id = f"art_cap_{clip_id}" if res.audio_path is not None else None
+
+    state = CaptionArtifactState(
+        tts_hash=res.tts_hash,
+        audio_artifact_id=audio_art_id,
+        audio_path=rel_audio,
+        sample_rate=res.sample_rate,
+        total_samples=res.total_samples,
+        audio_duration=res.audio_duration,
+    )
+    lock = _get_manifest_lock(target_app, project.project_id)
+    with lock:
+        latest_manifest = load_manifest(project.project_id, data_dir=data_dir)
+        latest_manifest.caption_artifacts[clip_id] = state
+        save_manifest(latest_manifest, data_dir=data_dir)
+
+    manifest.caption_artifacts[clip_id] = state.model_copy(deep=True)
+    return state
+
+
+def _compute_stale_tts_captions(
+    project: ProjectInput,
+    manifest: ArtifactManifest,
+    project_dir: Path,
+) -> list[str]:
+    """Return CaptionClip IDs whose synthesized TTS audio is missing or out of date."""
+    stale: list[str] = []
+    for track in project.tracks:
+        if not isinstance(track, CaptionTrack):
+            continue
+        for clip in track.clips:
+            spoken = resolve_caption_spoken_text(clip, project.pronunciations).strip()
+            existing = manifest.caption_artifacts.get(clip.id)
+            if not clip.tts_enabled or not spoken:
+                if existing is not None and existing.audio_artifact_id:
+                    stale.append(clip.id)
+                continue
+            expected_hash = compute_caption_tts_hash(
+                clip=clip,
+                pronunciations=project.pronunciations,
+                voice=project.voice,
+                language=project.language,
+            )
+            if (
+                existing is None
+                or existing.tts_hash != expected_hash
+                or not existing.audio_path
+                or not (project_dir / existing.audio_path).is_file()
+            ):
+                stale.append(clip.id)
+    return stale
 
 
 def _ensure_segment_tts(
@@ -690,6 +916,7 @@ def api_list_projects(request: Request) -> dict[str, list[dict[str, Any]]]:
                     "revision": proj.revision,
                     "updated_at": proj.updated_at,
                     "segment_count": len(proj.segments),
+                    "clip_count": sum(len(t.clips) for t in proj.tracks),
                 }
             )
     items.sort(key=lambda p: p["updated_at"], reverse=True)
@@ -773,7 +1000,9 @@ async def api_create_project(request: Request) -> JSONResponse:
     with manifest_lock:
         manifest = load_manifest(project_id, data_dir=data_dir)
         manifest.source_metadata = source_meta
+        manifest.media_metadata[media_id] = _asset_meta_from_source(source_meta)
         manifest.proxy = ProxyState(status="pending")
+        manifest.media_proxies[media_id] = MediaProxyState(status="pending")
         save_manifest(manifest, data_dir=data_dir)
 
     proxy_output = project_dir / "artifacts" / "proxy.mp4"
@@ -783,6 +1012,7 @@ async def api_create_project(request: Request) -> JSONResponse:
         with manifest_lock:
             m = load_manifest(project_id, data_dir=data_dir)
             m.proxy = ProxyState(status="running")
+            m.media_proxies[media_id] = MediaProxyState(status="running")
             save_manifest(m, data_dir=data_dir)
 
         active_src_path = final_src_path
@@ -802,8 +1032,11 @@ async def api_create_project(request: Request) -> JSONResponse:
                 fingerprint=copied_fp,
                 copied_to_project=True,
             )
+            updated_proj = ensure_primary_media_registered(
+                cur_proj.model_copy(update={"source_media": updated_ref})
+            )
             save_project(
-                cur_proj.model_copy(update={"source_media": updated_ref}),
+                updated_proj,
                 expected_revision=cur_proj.revision,
                 data_dir=data_dir,
             )
@@ -828,12 +1061,19 @@ async def api_create_project(request: Request) -> JSONResponse:
             with manifest_lock:
                 m = load_manifest(project_id, data_dir=data_dir)
                 m.proxy = ProxyState(status="failed", artifact_id=None, path=None, error=str(exc))
+                m.media_proxies[media_id] = MediaProxyState(status="failed", artifact_id=None, path=None, error=str(exc))
                 save_manifest(m, data_dir=data_dir)
             raise
 
         with manifest_lock:
             m = load_manifest(project_id, data_dir=data_dir)
             m.proxy = ProxyState(
+                status="ready",
+                artifact_id="art_proxy",
+                path="artifacts/proxy.mp4",
+                error=None,
+            )
+            m.media_proxies[media_id] = MediaProxyState(
                 status="ready",
                 artifact_id="art_proxy",
                 path="artifacts/proxy.mp4",
@@ -881,14 +1121,21 @@ def api_get_project(project_id: str, request: Request) -> dict[str, Any]:
     except StorageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    project = ensure_primary_media_registered(project)
     project_dir = get_project_dir(project_id, data_dir=data_dir)
     manifest = load_manifest(project_id, data_dir=data_dir)
+    if (
+        manifest.source_metadata is not None
+        and project.source_media.media_id not in manifest.media_metadata
+    ):
+        manifest.media_metadata[project.source_media.media_id] = _asset_meta_from_source(manifest.source_metadata)
     source_status = check_source_media(project.source_media)
     return {
         "project": project.model_dump(mode="json"),
         "manifest": manifest.model_dump(mode="json"),
         "source_status": source_status,
         "stale_tts_segments": _compute_stale_tts_segments(project, manifest, project_dir),
+        "stale_tts_captions": _compute_stale_tts_captions(project, manifest, project_dir),
     }
 
 
@@ -926,6 +1173,8 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
 
     if project.project_id != project_id:
         raise HTTPException(status_code=422, detail="project_id in body does not match URL path")
+
+    project = ensure_primary_media_registered(project)
 
     try:
         manifest = load_manifest(project_id, data_dir=data_dir)
@@ -984,7 +1233,7 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        f"Project camera keyframe {idx} x={kf.x} out of bounds "
+                        f"Camera keyframe {idx} x={kf.x} out of bounds "
                         f"[0.0, {max_x_norm:.6f}] for zoom={kf.zoom}"
                     ),
                 )
@@ -992,10 +1241,11 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        f"Project camera keyframe {idx} y={kf.y} out of bounds "
+                        f"Camera keyframe {idx} y={kf.y} out of bounds "
                         f"[0.0, {max_y_norm:.6f}] for zoom={kf.zoom}"
                     ),
                 )
+
 
     try:
         saved = save_project(project, expected_revision=expected_revision, data_dir=data_dir)
@@ -1019,6 +1269,7 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
         output_data={
             "revision": saved.revision,
             "segment_count": len(saved.segments),
+            "track_count": len(saved.tracks),
             "output_resolution": f"{saved.output_settings.width}x{saved.output_settings.height}",
         },
     )
@@ -1026,6 +1277,7 @@ async def api_save_project(project_id: str, request: Request) -> dict[str, Any]:
         "project": saved.model_dump(mode="json"),
         "manifest": manifest.model_dump(mode="json"),
         "stale_tts_segments": _compute_stale_tts_segments(saved, manifest, project_dir),
+        "stale_tts_captions": _compute_stale_tts_captions(saved, manifest, project_dir),
     }
 
 
@@ -1094,6 +1346,7 @@ async def api_relink_source(project_id: str, request: Request) -> dict[str, Any]
     with lock:
         manifest = load_manifest(project_id, data_dir=data_dir)
         manifest.source_metadata = source_meta
+        manifest.media_metadata[new_media_id] = _asset_meta_from_source(source_meta)
         save_manifest(manifest, data_dir=data_dir)
 
     source_status = check_source_media(updated_project.source_media)
@@ -1114,7 +1367,359 @@ async def api_relink_source(project_id: str, request: Request) -> dict[str, Any]
         "manifest": manifest.model_dump(mode="json"),
         "source_status": source_status,
         "stale_tts_segments": _compute_stale_tts_segments(updated_project, manifest, project_dir),
+        "stale_tts_captions": _compute_stale_tts_captions(updated_project, manifest, project_dir),
     }
+
+
+@app.post("/api/projects/{project_id}/assets")
+async def api_import_project_asset(project_id: str, request: Request) -> JSONResponse:
+    """Import an additional video, image (with alpha), or audio asset into the project Media Bin."""
+    data_dir = _get_data_dir(request)
+    job_manager = _get_job_manager(request)
+    try:
+        load_project(project_id, data_dir=data_dir)
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    content_type = request.headers.get("content-type", "")
+    raw_body = await request.body()
+    expected_kind: str | None = None
+    asset_name: str | None = None
+    copy_to_project = False
+    temp_upload_path: Path | None = None
+
+    try:
+        if "multipart/form-data" in content_type.lower():
+            filename, file_bytes, fields = _parse_multipart_upload(content_type, raw_body)
+            raw_kind = fields.get("kind") or None
+            if raw_kind in ("video", "image", "audio"):
+                expected_kind = raw_kind
+            elif raw_kind is not None:
+                raise MediaValidationError(f"Unsupported media kind: {raw_kind!r}")
+            asset_name = fields.get("name") or None
+            temp_upload_path = await run_in_threadpool(
+                import_uploaded_media, filename, file_bytes, data_dir / "uploads"
+            )
+            media_path = temp_upload_path
+            copy_to_project = True
+        elif raw_body.strip():
+            try:
+                payload = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+            raw_kind = payload.get("kind")
+            if raw_kind is not None:
+                if raw_kind not in ("video", "image", "audio"):
+                    raise MediaValidationError(f"Unsupported media kind: {raw_kind!r}")
+                expected_kind = raw_kind
+            if payload.get("name") is not None:
+                asset_name = str(payload["name"]).strip() or None
+            copy_to_project = bool(payload.get("copy_to_project", False))
+            if payload.get("path") is not None:
+                media_path = _validate_manual_media_path(payload["path"])
+            else:
+                selected = await run_in_threadpool(select_media_native, "Select Media Asset")
+                if selected is None:
+                    raise MediaSelectionCancelled("Media selection cancelled by user")
+                media_path = selected
+        else:
+            selected = await run_in_threadpool(select_media_native, "Select Media Asset")
+            if selected is None:
+                raise MediaSelectionCancelled("Media selection cancelled by user")
+            media_path = selected
+
+        asset_id = f"asset_{uuid.uuid4().hex[:8]}"
+        asset_ref, asset_meta = await run_in_threadpool(
+            register_project_asset,
+            media_path,
+            expected_kind=expected_kind,  # type: ignore[arg-type]
+            asset_id=asset_id,
+            name=asset_name,
+            copy_to_dir=(project_dir / "source") if copy_to_project else None,
+            data_dir=data_dir,
+        )
+    except MediaValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except MediaSelectionCancelled as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        if temp_upload_path is not None:
+            temp_upload_path.unlink(missing_ok=True)
+
+    # Persist asset_ref to project.json with retry on concurrent revision update
+    saved_project: ProjectInput | None = None
+    for _attempt in range(3):
+        cur_proj = ensure_primary_media_registered(load_project(project_id, data_dir=data_dir))
+        new_assets = dict(cur_proj.media_assets)
+        new_assets[asset_ref.asset_id] = asset_ref
+        try:
+            saved_project = save_project(
+                cur_proj.model_copy(update={"media_assets": new_assets}),
+                expected_revision=cur_proj.revision,
+                data_dir=data_dir,
+            )
+            break
+        except RevisionConflictError:
+            continue
+    if saved_project is None:
+        raise HTTPException(status_code=409, detail="Concurrent project save conflict while registering asset")
+
+    manifest_lock = _get_manifest_lock(request.app, project_id)
+    with manifest_lock:
+        manifest = load_manifest(project_id, data_dir=data_dir)
+        manifest.media_metadata[asset_ref.asset_id] = asset_meta
+        if asset_ref.kind == "video":
+            manifest.media_proxies[asset_ref.asset_id] = MediaProxyState(status="pending")
+        save_manifest(manifest, data_dir=data_dir)
+
+    job_id: str | None = None
+    if asset_ref.kind == "video":
+        proxy_rel = f"artifacts/proxy_{asset_ref.asset_id}.mp4"
+        proxy_out = project_dir / proxy_rel
+        src_for_proxy = SourceMetadata(
+            width=int(asset_meta.width or 2),
+            height=int(asset_meta.height or 2),
+            fps=float(asset_meta.fps or 30.0),
+            duration=float(asset_meta.duration),
+            has_audio=bool(asset_meta.has_audio),
+            codec_name=asset_meta.codec_name,
+            pix_fmt=asset_meta.pix_fmt,
+            audio_sample_rate=asset_meta.audio_sample_rate,
+            audio_channels=asset_meta.audio_channels,
+        )
+
+        def _asset_proxy_worker(ctx: JobContext) -> dict[str, Any]:
+            with manifest_lock:
+                m = load_manifest(project_id, data_dir=data_dir)
+                m.media_proxies[asset_ref.asset_id] = MediaProxyState(status="running")
+                save_manifest(m, data_dir=data_dir)
+            selected_encoders: list[str] = []
+            try:
+                generate_proxy(
+                    source_path=Path(asset_ref.path),
+                    output_path=proxy_out,
+                    project_id=None,
+                    asset_id=asset_ref.asset_id,
+                    source_duration=asset_meta.duration,
+                    source_metadata=src_for_proxy,
+                    data_dir=data_dir,
+                    on_progress=ctx.update_progress,
+                    on_process_start=ctx.register_process,
+                    on_encoder_selected=selected_encoders.append,
+                    cancel_event=ctx.cancel_event,
+                )
+            except JobCancelledError:
+                raise
+            except Exception as exc:
+                with manifest_lock:
+                    m = load_manifest(project_id, data_dir=data_dir)
+                    m.media_proxies[asset_ref.asset_id] = MediaProxyState(
+                        status="failed", artifact_id=None, path=None, error=str(exc)
+                    )
+                    save_manifest(m, data_dir=data_dir)
+                raise
+
+            art_id = f"art_proxy_{asset_ref.asset_id}"
+            with manifest_lock:
+                m = load_manifest(project_id, data_dir=data_dir)
+                m.media_proxies[asset_ref.asset_id] = MediaProxyState(
+                    status="ready",
+                    artifact_id=art_id,
+                    path=proxy_rel,
+                    error=None,
+                )
+                save_manifest(m, data_dir=data_dir)
+            return {
+                "asset_id": asset_ref.asset_id,
+                "artifact_id": art_id,
+                "path": proxy_rel,
+                "encoder": selected_encoders[-1] if selected_encoders else "libx264",
+            }
+
+        job = job_manager.submit_job(project_id, "proxy", _asset_proxy_worker)
+        job_id = job.job_id
+
+    source_status = check_source_media(saved_project.source_media)
+    _get_usage_logger(request).log_event(
+        source="backend",
+        category="action_output",
+        action="asset.import",
+        intention="Import project media asset",
+        project_id=project_id,
+        job_id=job_id,
+        output_data={
+            "asset_id": asset_ref.asset_id,
+            "kind": asset_ref.kind,
+            "name": asset_ref.name,
+        },
+    )
+    return JSONResponse(
+        status_code=202 if job_id is not None else 201,
+        content={
+            "asset": asset_ref.model_dump(mode="json"),
+            "metadata": asset_meta.model_dump(mode="json"),
+            "job_id": job_id,
+            "project": saved_project.model_dump(mode="json"),
+            "manifest": manifest.model_dump(mode="json"),
+            "source_status": source_status,
+            "stale_tts_segments": _compute_stale_tts_segments(saved_project, manifest, project_dir),
+            "stale_tts_captions": _compute_stale_tts_captions(saved_project, manifest, project_dir),
+        },
+    )
+
+
+@app.delete("/api/projects/{project_id}/assets/{asset_id}")
+def api_delete_project_asset(project_id: str, asset_id: str, request: Request) -> dict[str, Any]:
+    """Delete an unreferenced secondary media asset from the project Media Bin."""
+    data_dir = _get_data_dir(request)
+    try:
+        project = ensure_primary_media_registered(load_project(project_id, data_dir=data_dir))
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if asset_id == project.source_media.media_id:
+        raise HTTPException(status_code=409, detail="Cannot remove primary project source video")
+    if asset_id not in project.media_assets:
+        raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} not found")
+
+    for track in project.tracks:
+        if isinstance(track, (VideoTrack, AudioTrack)):
+            for clip in track.clips:
+                if clip.asset_id == asset_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Asset {asset_id!r} is referenced by clip {clip.id!r} on track {track.name!r}",
+                    )
+
+    updated_assets = dict(project.media_assets)
+    removed_ref = updated_assets.pop(asset_id)
+    saved_project = save_project(
+        project.model_copy(update={"media_assets": updated_assets}),
+        expected_revision=project.revision,
+        data_dir=data_dir,
+    )
+
+    manifest_lock = _get_manifest_lock(request.app, project_id)
+    with manifest_lock:
+        manifest = load_manifest(project_id, data_dir=data_dir)
+        manifest.media_metadata.pop(asset_id, None)
+        pstate = manifest.media_proxies.pop(asset_id, None)
+        save_manifest(manifest, data_dir=data_dir)
+
+    if pstate is not None and pstate.path:
+        try:
+            proxy_abs = _validate_relative_artifact_path(project_dir, pstate.path)
+            proxy_abs.unlink(missing_ok=True)
+        except Exception:
+            pass
+    if removed_ref.copied_to_project:
+        try:
+            src_abs = Path(removed_ref.path).resolve()
+            if src_abs.is_relative_to(project_dir.resolve()):
+                src_abs.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    source_status = check_source_media(saved_project.source_media)
+    return {
+        "project": saved_project.model_dump(mode="json"),
+        "manifest": manifest.model_dump(mode="json"),
+        "source_status": source_status,
+        "stale_tts_segments": _compute_stale_tts_segments(saved_project, manifest, project_dir),
+        "stale_tts_captions": _compute_stale_tts_captions(saved_project, manifest, project_dir),
+    }
+
+
+@app.post("/api/projects/{project_id}/tts")
+async def api_project_tts(project_id: str, request: Request) -> JSONResponse:
+    """Enqueue CPU Kokoro TTS synthesis for independent CaptionClips across all CaptionTracks (202)."""
+    data_dir = _get_data_dir(request)
+    job_manager = _get_job_manager(request)
+
+    try:
+        project = load_project(project_id, data_dir=data_dir)
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UnsupportedSchemaVersionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    raw_body = await request.body()
+    requested_ids: list[str] | None = None
+    if raw_body.strip():
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+        raw_ids = payload.get("clip_ids")
+        if raw_ids is not None:
+            if not isinstance(raw_ids, list) or not all(isinstance(cid, str) and cid for cid in raw_ids):
+                raise HTTPException(status_code=422, detail="'clip_ids' must be a list of non-empty strings")
+            requested_ids = list(raw_ids)
+
+    all_caption_ids = [
+        c.id
+        for tr in project.tracks
+        if isinstance(tr, CaptionTrack)
+        for c in tr.clips
+    ]
+    if requested_ids is not None:
+        missing = [cid for cid in requested_ids if cid not in set(all_caption_ids)]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"CaptionClip(s) not found: {missing!r}")
+        target_ids = requested_ids
+    else:
+        manifest_now = load_manifest(project_id, data_dir=data_dir)
+        stale_ids = _compute_stale_tts_captions(project, manifest_now, project_dir)
+        target_ids = stale_ids if stale_ids else all_caption_ids
+
+    project_snap = project.model_copy(deep=True)
+    target_app = request.app
+
+    def _project_tts_worker(ctx: JobContext) -> dict[str, Any]:
+        manifest_snap = load_manifest(project_id, data_dir=data_dir)
+        total = max(1, len(target_ids))
+        synthesized: list[str] = []
+        for idx, cid in enumerate(target_ids):
+            ctx.check_cancelled()
+            ctx.update_progress(int((idx / total) * 90) + 5, f"Synthesizing caption {idx + 1}/{total}")
+            _ensure_caption_tts(
+                target_app=target_app,
+                project=project_snap,
+                clip_id=cid,
+                project_dir=project_dir,
+                data_dir=data_dir,
+                manifest=manifest_snap,
+            )
+            synthesized.append(cid)
+        ctx.update_progress(100, "Captions narration ready")
+        return {
+            "synthesized_clip_ids": synthesized,
+            "caption_artifacts": {
+                k: v.model_dump(mode="json") for k, v in manifest_snap.caption_artifacts.items()
+            },
+        }
+
+    job = job_manager.submit_job(project_id, "tts", _project_tts_worker)
+    return JSONResponse(status_code=202, content={"job_id": job.job_id, "target_clip_ids": target_ids})
 
 
 @app.post("/api/projects/{project_id}/segments/{seg_id}/tts")
@@ -1273,89 +1878,118 @@ def api_project_preview(project_id: str, request: Request) -> JSONResponse:
     except StorageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if not project.segments:
+    manifest_snap = load_manifest(project_id, data_dir=data_dir).model_copy(deep=True)
+    is_mt = _is_multitrack_project(project)
+    if is_mt:
+        raw_dur, _fc, _fd = get_project_timeline_duration(project, manifest_snap)
+        if raw_dur <= 0.0:
+            raise HTTPException(
+                status_code=422,
+                detail="Timeline has no clips, captions, or camera keyframes to preview",
+            )
+    elif not project.segments:
         raise HTTPException(status_code=422, detail="Project has no segments to preview")
 
     project_snap = project.model_copy(deep=True)
-    manifest_snap = load_manifest(project_id, data_dir=data_dir).model_copy(deep=True)
     target_app = request.app
 
     def _project_preview_worker(ctx: JobContext) -> dict[str, Any]:
         ctx.update_progress(5, "Preparing project preview")
         src_meta = manifest_snap.source_metadata
-        if src_meta is None:
-            src_meta = probe_and_validate_media(project_snap.source_media.path, data_dir=data_dir)
 
-        total_segs = len(project_snap.segments)
-        offset_sec = 0.0
-        for idx, seg in enumerate(project_snap.segments):
-            ctx.check_cancelled()
-            pct = 10 + int((idx / max(1, total_segs)) * 55)
-            ctx.update_progress(pct, f"Preparing segment {idx + 1}/{total_segs}")
-
-            seg_state = _ensure_segment_tts(
-                target_app=target_app,
-                project=project_snap,
-                seg_id=seg.id,
-                project_dir=project_dir,
-                data_dir=data_dir,
-                manifest=manifest_snap,
-            )
-            plan = plan_segment_duration(
-                segment=seg,
-                audio_duration=seg_state.audio_duration,
-                source_duration=src_meta.duration,
-                tail_padding_sec=project_snap.output_settings.tail_padding_sec,
-                fps=project_snap.output_settings.fps,
-            )
-            render_seg = seg
-            if project_snap.camera_keyframes:
-                sliced_kfs = slice_camera_keyframes_for_segment(
-                    project_snap.camera_keyframes,
-                    clip_start=offset_sec,
-                    clip_dur=plan.final_dur,
-                    width=src_meta.width,
-                    height=src_meta.height,
-                    output_width=project_snap.output_settings.width,
-                    output_height=project_snap.output_settings.height,
+        if is_mt:
+            cap_ids = [
+                c.id
+                for tr in project_snap.tracks
+                if isinstance(tr, CaptionTrack)
+                for c in tr.clips
+            ]
+            for idx, cid in enumerate(cap_ids):
+                ctx.check_cancelled()
+                pct = 10 + int((idx / max(1, len(cap_ids))) * 45)
+                ctx.update_progress(pct, f"Checking caption audio {idx + 1}/{len(cap_ids)}")
+                _ensure_caption_tts(
+                    target_app=target_app,
+                    project=project_snap,
+                    clip_id=cid,
+                    project_dir=project_dir,
+                    data_dir=data_dir,
+                    manifest=manifest_snap,
                 )
-                render_seg = seg.model_copy(update={"crop_keyframes": sliced_kfs})
-            offset_sec += plan.final_dur
+        else:
+            if src_meta is None:
+                src_meta = probe_and_validate_media(project_snap.source_media.path, data_dir=data_dir)
 
-            audio_path = (project_dir / seg_state.audio_path) if seg_state.audio_path else None
-            try:
-                seg_mp4 = render_segment_stage1(
+            total_segs = len(project_snap.segments)
+            offset_sec = 0.0
+            for idx, seg in enumerate(project_snap.segments):
+                ctx.check_cancelled()
+                pct = 10 + int((idx / max(1, total_segs)) * 55)
+                ctx.update_progress(pct, f"Preparing segment {idx + 1}/{total_segs}")
+
+                seg_state = _ensure_segment_tts(
+                    target_app=target_app,
+                    project=project_snap,
+                    seg_id=seg.id,
+                    project_dir=project_dir,
+                    data_dir=data_dir,
+                    manifest=manifest_snap,
+                )
+                plan = plan_segment_duration(
+                    segment=seg,
+                    audio_duration=seg_state.audio_duration,
+                    source_duration=src_meta.duration,
+                    tail_padding_sec=project_snap.output_settings.tail_padding_sec,
+                    fps=project_snap.output_settings.fps,
+                )
+                render_seg = seg
+                if project_snap.camera_keyframes:
+                    sliced_kfs = slice_camera_keyframes_for_segment(
+                        project_snap.camera_keyframes,
+                        clip_start=offset_sec,
+                        clip_dur=plan.final_dur,
+                        width=src_meta.width,
+                        height=src_meta.height,
+                        output_width=project_snap.output_settings.width,
+                        output_height=project_snap.output_settings.height,
+                    )
+                    render_seg = seg.model_copy(update={"crop_keyframes": sliced_kfs})
+                offset_sec += plan.final_dur
+
+                audio_path = (project_dir / seg_state.audio_path) if seg_state.audio_path else None
+                try:
+                    seg_mp4 = render_segment_stage1(
+                        segment=render_seg,
+                        source_media=project_snap.source_media,
+                        source_metadata=src_meta,
+                        output_settings=project_snap.output_settings,
+                        project_dir=project_dir,
+                        tts_hash=seg_state.tts_hash or "",
+                        audio_path=audio_path,
+                        audio_duration=seg_state.audio_duration,
+                        cancel_event=ctx.cancel_event,
+                        on_process_start=ctx.register_process,
+                    )
+                except RenderCancelledError as exc:
+                    raise JobCancelledError(str(exc)) from exc
+
+                render_hash = compute_render_hash(
                     segment=render_seg,
                     source_media=project_snap.source_media,
-                    source_metadata=src_meta,
-                    output_settings=project_snap.output_settings,
-                    project_dir=project_dir,
                     tts_hash=seg_state.tts_hash or "",
-                    audio_path=audio_path,
-                    audio_duration=seg_state.audio_duration,
-                    cancel_event=ctx.cancel_event,
-                    on_process_start=ctx.register_process,
+                    output_settings=project_snap.output_settings,
                 )
-            except RenderCancelledError as exc:
-                raise JobCancelledError(str(exc)) from exc
-
-            render_hash = compute_render_hash(
-                segment=render_seg,
-                source_media=project_snap.source_media,
-                tts_hash=seg_state.tts_hash or "",
-                output_settings=project_snap.output_settings,
-            )
-            seg_rel = seg_mp4.relative_to(project_dir).as_posix()
-            lock = _get_manifest_lock(target_app, project_id)
-            with lock:
-                latest_manifest = load_manifest(project_id, data_dir=data_dir)
-                s_state = latest_manifest.segments.get(seg.id, SegmentArtifactState())
-                s_state.render_hash = render_hash
-                s_state.segment_artifact_id = f"art_seg_{seg.id}"
-                s_state.rendered_segment_path = seg_rel
-                latest_manifest.segments[seg.id] = s_state
-                save_manifest(latest_manifest, data_dir=data_dir)
-            manifest_snap.segments[seg.id] = s_state.model_copy(deep=True)
+                seg_rel = seg_mp4.relative_to(project_dir).as_posix()
+                lock = _get_manifest_lock(target_app, project_id)
+                with lock:
+                    latest_manifest = load_manifest(project_id, data_dir=data_dir)
+                    s_state = latest_manifest.segments.get(seg.id, SegmentArtifactState())
+                    s_state.render_hash = render_hash
+                    s_state.segment_artifact_id = f"art_seg_{seg.id}"
+                    s_state.rendered_segment_path = seg_rel
+                    latest_manifest.segments[seg.id] = s_state
+                    save_manifest(latest_manifest, data_dir=data_dir)
+                manifest_snap.segments[seg.id] = s_state.model_copy(deep=True)
 
         ctx.update_progress(70, "Rendering project preview")
         try:
@@ -1405,91 +2039,120 @@ def api_project_export(project_id: str, request: Request) -> JSONResponse:
     except StorageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if not project.segments:
+    manifest_snap = load_manifest(project_id, data_dir=data_dir).model_copy(deep=True)
+    is_mt = _is_multitrack_project(project)
+    if is_mt:
+        raw_dur, _fc, _fd = get_project_timeline_duration(project, manifest_snap)
+        if raw_dur <= 0.0:
+            raise HTTPException(
+                status_code=422,
+                detail="Timeline has no clips, captions, or camera keyframes to export",
+            )
+    elif not project.segments:
         raise HTTPException(status_code=422, detail="Project has no segments to export")
 
     project_snap = project.model_copy(deep=True)
-    manifest_snap = load_manifest(project_id, data_dir=data_dir).model_copy(deep=True)
     target_app = request.app
 
     def _export_worker(ctx: JobContext) -> dict[str, Any]:
         ctx.update_progress(5, "Preparing export")
         src_meta = manifest_snap.source_metadata
-        if src_meta is None:
-            src_meta = probe_and_validate_media(project_snap.source_media.path, data_dir=data_dir)
 
-        total_segs = len(project_snap.segments)
-        offset_sec = 0.0
-        for idx, seg in enumerate(project_snap.segments):
-            ctx.check_cancelled()
-            pct = 10 + int((idx / max(1, total_segs)) * 55)
-            ctx.update_progress(pct, f"Preparing segment {idx + 1}/{total_segs}")
-
-            seg_state = _ensure_segment_tts(
-                target_app=target_app,
-                project=project_snap,
-                seg_id=seg.id,
-                project_dir=project_dir,
-                data_dir=data_dir,
-                manifest=manifest_snap,
-            )
-            plan = plan_segment_duration(
-                segment=seg,
-                audio_duration=seg_state.audio_duration,
-                source_duration=src_meta.duration,
-                tail_padding_sec=project_snap.output_settings.tail_padding_sec,
-                fps=project_snap.output_settings.fps,
-            )
-            render_seg = seg
-            if project_snap.camera_keyframes:
-                sliced_kfs = slice_camera_keyframes_for_segment(
-                    project_snap.camera_keyframes,
-                    clip_start=offset_sec,
-                    clip_dur=plan.final_dur,
-                    width=src_meta.width,
-                    height=src_meta.height,
-                    output_width=project_snap.output_settings.width,
-                    output_height=project_snap.output_settings.height,
+        if is_mt:
+            cap_ids = [
+                c.id
+                for tr in project_snap.tracks
+                if isinstance(tr, CaptionTrack)
+                for c in tr.clips
+            ]
+            for idx, cid in enumerate(cap_ids):
+                ctx.check_cancelled()
+                pct = 10 + int((idx / max(1, len(cap_ids))) * 45)
+                ctx.update_progress(pct, f"Checking caption audio {idx + 1}/{len(cap_ids)}")
+                _ensure_caption_tts(
+                    target_app=target_app,
+                    project=project_snap,
+                    clip_id=cid,
+                    project_dir=project_dir,
+                    data_dir=data_dir,
+                    manifest=manifest_snap,
                 )
-                render_seg = seg.model_copy(update={"crop_keyframes": sliced_kfs})
-            offset_sec += plan.final_dur
+        else:
+            if src_meta is None:
+                src_meta = probe_and_validate_media(project_snap.source_media.path, data_dir=data_dir)
 
-            audio_path = (project_dir / seg_state.audio_path) if seg_state.audio_path else None
-            try:
-                seg_mp4 = render_segment_stage1(
+            total_segs = len(project_snap.segments)
+            offset_sec = 0.0
+            for idx, seg in enumerate(project_snap.segments):
+                ctx.check_cancelled()
+                pct = 10 + int((idx / max(1, total_segs)) * 55)
+                ctx.update_progress(pct, f"Preparing segment {idx + 1}/{total_segs}")
+
+                seg_state = _ensure_segment_tts(
+                    target_app=target_app,
+                    project=project_snap,
+                    seg_id=seg.id,
+                    project_dir=project_dir,
+                    data_dir=data_dir,
+                    manifest=manifest_snap,
+                )
+                plan = plan_segment_duration(
+                    segment=seg,
+                    audio_duration=seg_state.audio_duration,
+                    source_duration=src_meta.duration,
+                    tail_padding_sec=project_snap.output_settings.tail_padding_sec,
+                    fps=project_snap.output_settings.fps,
+                )
+                render_seg = seg
+                if project_snap.camera_keyframes:
+                    sliced_kfs = slice_camera_keyframes_for_segment(
+                        project_snap.camera_keyframes,
+                        clip_start=offset_sec,
+                        clip_dur=plan.final_dur,
+                        width=src_meta.width,
+                        height=src_meta.height,
+                        output_width=project_snap.output_settings.width,
+                        output_height=project_snap.output_settings.height,
+                    )
+                    render_seg = seg.model_copy(update={"crop_keyframes": sliced_kfs})
+                offset_sec += plan.final_dur
+
+                audio_path = (project_dir / seg_state.audio_path) if seg_state.audio_path else None
+                try:
+                    seg_mp4 = render_segment_stage1(
+                        segment=render_seg,
+                        source_media=project_snap.source_media,
+                        source_metadata=src_meta,
+                        output_settings=project_snap.output_settings,
+                        project_dir=project_dir,
+                        tts_hash=seg_state.tts_hash or "",
+                        audio_path=audio_path,
+                        audio_duration=seg_state.audio_duration,
+                        cancel_event=ctx.cancel_event,
+                        on_process_start=ctx.register_process,
+                    )
+                except RenderCancelledError as exc:
+                    raise JobCancelledError(str(exc)) from exc
+
+                render_hash = compute_render_hash(
                     segment=render_seg,
                     source_media=project_snap.source_media,
-                    source_metadata=src_meta,
-                    output_settings=project_snap.output_settings,
-                    project_dir=project_dir,
                     tts_hash=seg_state.tts_hash or "",
-                    audio_path=audio_path,
-                    audio_duration=seg_state.audio_duration,
-                    cancel_event=ctx.cancel_event,
-                    on_process_start=ctx.register_process,
+                    output_settings=project_snap.output_settings,
                 )
-            except RenderCancelledError as exc:
-                raise JobCancelledError(str(exc)) from exc
+                seg_rel = seg_mp4.relative_to(project_dir).as_posix()
+                lock = _get_manifest_lock(target_app, project_id)
+                with lock:
+                    latest_manifest = load_manifest(project_id, data_dir=data_dir)
+                    s_state = latest_manifest.segments.get(seg.id, SegmentArtifactState())
+                    s_state.render_hash = render_hash
+                    s_state.segment_artifact_id = f"art_seg_{seg.id}"
+                    s_state.rendered_segment_path = seg_rel
+                    latest_manifest.segments[seg.id] = s_state
+                    save_manifest(latest_manifest, data_dir=data_dir)
+                manifest_snap.segments[seg.id] = s_state.model_copy(deep=True)
 
-            render_hash = compute_render_hash(
-                segment=render_seg,
-                source_media=project_snap.source_media,
-                tts_hash=seg_state.tts_hash or "",
-                output_settings=project_snap.output_settings,
-            )
-            seg_rel = seg_mp4.relative_to(project_dir).as_posix()
-            lock = _get_manifest_lock(target_app, project_id)
-            with lock:
-                latest_manifest = load_manifest(project_id, data_dir=data_dir)
-                s_state = latest_manifest.segments.get(seg.id, SegmentArtifactState())
-                s_state.render_hash = render_hash
-                s_state.segment_artifact_id = f"art_seg_{seg.id}"
-                s_state.rendered_segment_path = seg_rel
-                latest_manifest.segments[seg.id] = s_state
-                save_manifest(latest_manifest, data_dir=data_dir)
-            manifest_snap.segments[seg.id] = s_state.model_copy(deep=True)
-
-        ctx.update_progress(70, "Concatenating and burning captions")
+        ctx.update_progress(70, "Compositing and burning captions")
         try:
             export_path = render_final_export(
                 project=project_snap,
@@ -1552,8 +2215,12 @@ def api_stream_media(project_id: str, artifact_id: str, request: Request) -> Res
     if not project_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"Project {project_id!r} not found")
 
+    try:
+        project = load_project(project_id, data_dir=data_dir)
+    except Exception:
+        project = None
     manifest = load_manifest(project_id, data_dir=data_dir)
-    target_path = _resolve_artifact_path(manifest, project_dir, artifact_id)
+    target_path = _resolve_artifact_path(manifest, project_dir, artifact_id, project=project)
     if target_path is None or not target_path.is_file():
         raise HTTPException(status_code=404, detail=f"Artifact {artifact_id!r} not found")
 

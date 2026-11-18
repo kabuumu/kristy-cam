@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ProjectInput } from "../types/studio.ts";
+import type { ProjectInput } from "../src/types/studio.ts";
 import {
   COALESCE_WINDOW_MS,
   MAX_HISTORY_ENTRIES,
@@ -229,3 +229,89 @@ test("history stack respects MAX_HISTORY_ENTRIES cap", () => {
   assert.equal(state.past.length, MAX_HISTORY_ENTRIES);
   assert.equal(state.past[0].after.project.title, "Title 26");
 });
+
+test("multi-track undo/redo restores and sanitizes clip, transition, and track selections", () => {
+  let state = createInitialHistoryState();
+  const v1Base: ProjectInput["tracks"] = [
+    {
+      id: "v1",
+      name: "Video 1",
+      kind: "video",
+      visible: true,
+      muted: false,
+      locked: false,
+      camera_follow: true,
+      clips: [
+        {
+          id: "vc_1",
+          asset_id: "src_1",
+          kind: "video",
+          start_sec: 0,
+          duration_sec: 3,
+          media_in: 0,
+          media_out: 3,
+          speed: 1,
+          end_behavior: "freeze",
+          volume: 1,
+          audio_fade_in_sec: 0,
+          audio_fade_out_sec: 0,
+          transform: { x: 0.5, y: 0.5, scale: 1, rotation_deg: 0, opacity: 1 },
+          transition_in: { type: "none", duration_sec: 0 },
+          transition_out: { type: "none", duration_sec: 0 },
+        },
+        {
+          id: "vc_2",
+          asset_id: "src_1",
+          kind: "video",
+          start_sec: 3,
+          duration_sec: 2,
+          media_in: 3,
+          media_out: 5,
+          speed: 1,
+          end_behavior: "freeze",
+          volume: 1,
+          audio_fade_in_sec: 0,
+          audio_fade_out_sec: 0,
+          transform: { x: 0.5, y: 0.5, scale: 1, rotation_deg: 0, opacity: 1 },
+          transition_in: { type: "none", duration_sec: 0 },
+          transition_out: { type: "none", duration_sec: 0 },
+        },
+      ],
+      transitions: [
+        { id: "tr_1", from_clip_id: "vc_1", to_clip_id: "vc_2", type: "crossfade", duration_sec: 0.5 },
+      ],
+    },
+  ];
+  const p0 = makeProject({ tracks: v1Base, segments: [] });
+  const p1 = makeProject({
+    tracks: [
+      {
+        ...v1Base[0],
+        clips: [v1Base[0].clips[0]],
+        transitions: [],
+      },
+    ],
+    segments: [],
+  });
+
+  state = recordHistoryUpdate(
+    state,
+    { project: p0, selectedSegId: null, selection: { type: "transition", trackId: "v1", transitionId: "tr_1" } },
+    { project: p1, selectedSegId: null, selection: { type: "video-clip", trackId: "v1", clipId: "vc_1" } },
+    { label: "Delete clip vc_2" },
+    1000
+  );
+
+  const undone = stepUndo(state, p1);
+  assert.ok(undone);
+  assert.deepEqual(undone.restored.selection, { type: "transition", trackId: "v1", transitionId: "tr_1" });
+  const vTrack = undone.restored.project.tracks?.[0];
+  assert.ok(vTrack && vTrack.kind === "video");
+  assert.equal(vTrack.clips.length, 2);
+  assert.equal(vTrack.transitions.length, 1);
+
+  const redone = stepRedo(undone.state, undone.restored.project);
+  assert.ok(redone);
+  assert.deepEqual(redone.restored.selection, { type: "video-clip", trackId: "v1", clipId: "vc_1" });
+});
+

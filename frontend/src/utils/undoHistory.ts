@@ -207,23 +207,62 @@ export function sanitizeRestoredSnapshot(
       ? cloned.selectedSegId
       : cloned.project.segments[0]?.id ?? null;
 
+  const tracks = cloned.project.tracks ?? [];
+  const firstVisualTrack = tracks.find((t) => t.kind === "video");
+  const firstVisualClip = firstVisualTrack?.clips[0];
+  const fallbackMultiSelection: TimelineSelection =
+    firstVisualTrack && firstVisualClip
+      ? { type: "video-clip", trackId: firstVisualTrack.id, clipId: firstVisualClip.id }
+      : validSegId
+        ? { type: "video", segId: validSegId }
+        : null;
+
   let validSelection: TimelineSelection = cloned.selection;
   if (validSelection) {
-    if (validSelection.type === "video") {
-      if (!segIds.has(validSelection.segId)) {
-        validSelection = validSegId ? { type: "video", segId: validSegId } : null;
+    const sel = validSelection;
+    if (sel.type === "video") {
+      if (!segIds.has(sel.segId)) {
+        validSelection = fallbackMultiSelection;
       }
-    } else if (validSelection.type === "clause") {
-      const seg = cloned.project.segments.find((s) => s.id === validSelection!.segId);
-      if (!seg || validSelection.index < 0 || validSelection.index >= seg.clauses.length) {
-        validSelection = validSegId ? { type: "video", segId: validSegId } : null;
+    } else if (sel.type === "clause") {
+      const seg = cloned.project.segments.find((s) => s.id === sel.segId);
+      if (!seg || sel.index < 0 || sel.index >= seg.clauses.length) {
+        validSelection = fallbackMultiSelection;
       } else {
         validSegId = seg.id;
       }
-    } else if (validSelection.type === "keyframe") {
+    } else if (sel.type === "keyframe") {
       const kfs = cloned.project.camera_keyframes ?? [];
-      if (validSelection.index < 0 || validSelection.index >= kfs.length) {
-        validSelection = validSegId ? { type: "video", segId: validSegId } : null;
+      if (sel.index < 0 || sel.index >= kfs.length) {
+        validSelection = fallbackMultiSelection;
+      }
+    } else if (sel.type === "video-clip") {
+      const tr = tracks.find((t) => t.id === sel.trackId && t.kind === "video");
+      if (!tr || tr.kind !== "video" || !tr.clips.some((c) => c.id === sel.clipId)) {
+        validSelection = fallbackMultiSelection;
+      }
+    } else if (sel.type === "audio-clip") {
+      const tr = tracks.find((t) => t.id === sel.trackId && t.kind === "audio");
+      if (!tr || tr.kind !== "audio" || !tr.clips.some((c) => c.id === sel.clipId)) {
+        validSelection = fallbackMultiSelection;
+      }
+    } else if (sel.type === "caption-clip") {
+      const tr = tracks.find((t) => t.id === sel.trackId && t.kind === "caption");
+      if (!tr || tr.kind !== "caption" || !tr.clips.some((c) => c.id === sel.clipId)) {
+        validSelection = fallbackMultiSelection;
+      }
+    } else if (sel.type === "transition") {
+      const tr = tracks.find((t) => t.id === sel.trackId && t.kind === "video");
+      if (
+        !tr ||
+        tr.kind !== "video" ||
+        !tr.transitions.some((jt) => jt.id === sel.transitionId)
+      ) {
+        validSelection = fallbackMultiSelection;
+      }
+    } else if (sel.type === "track") {
+      if (!tracks.some((t) => t.id === sel.trackId)) {
+        validSelection = fallbackMultiSelection;
       }
     }
   }

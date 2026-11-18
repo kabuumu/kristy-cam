@@ -13,8 +13,8 @@ from typing import Any
 
 from backend.bootstrap import is_offline_env, verify_ffmpeg
 from backend.media import MediaValidationError, probe_and_validate_media
-from backend.schemas import ProxyState, SourceMetadata
-from backend.storage import load_manifest, save_manifest
+from backend.schemas import MediaProxyState, ProxyState, SourceMetadata
+from backend.storage import get_project_dir, load_manifest, save_manifest
 
 
 class ProxyError(RuntimeError):
@@ -130,6 +130,7 @@ def generate_proxy(
     output_path: str | Path,
     *,
     project_id: str | None = None,
+    asset_id: str | None = None,
     source_duration: float | None = None,
     source_metadata: SourceMetadata | None = None,
     use_nvenc: bool | None = None,
@@ -149,12 +150,20 @@ def generate_proxy(
         if project_id is not None:
             try:
                 manifest = load_manifest(project_id, data_dir=data_dir)
-                manifest.proxy = ProxyState(
-                    status="failed",
-                    artifact_id=None,
-                    path=None,
-                    error=err_msg,
-                )
+                if asset_id is None:
+                    manifest.proxy = ProxyState(
+                        status="failed",
+                        artifact_id=None,
+                        path=None,
+                        error=err_msg,
+                    )
+                else:
+                    manifest.media_proxies[asset_id] = MediaProxyState(
+                        status="failed",
+                        artifact_id=None,
+                        path=None,
+                        error=err_msg,
+                    )
                 save_manifest(manifest, data_dir=data_dir)
             except Exception:
                 pass
@@ -306,14 +315,27 @@ def generate_proxy(
 
         if project_id is not None:
             manifest = load_manifest(project_id, data_dir=data_dir)
-            if manifest.source_metadata is None:
-                manifest.source_metadata = src_meta
-            manifest.proxy = ProxyState(
-                status="ready",
-                artifact_id="art_proxy",
-                path="artifacts/proxy.mp4",
-                error=None,
-            )
+            if asset_id is None:
+                if manifest.source_metadata is None:
+                    manifest.source_metadata = src_meta
+                manifest.proxy = ProxyState(
+                    status="ready",
+                    artifact_id="art_proxy",
+                    path="artifacts/proxy.mp4",
+                    error=None,
+                )
+            else:
+                try:
+                    proj_dir = get_project_dir(project_id, data_dir=data_dir).resolve()
+                    rel_path = out_path.resolve().relative_to(proj_dir).as_posix()
+                except Exception:
+                    rel_path = f"artifacts/{out_path.name}"
+                manifest.media_proxies[asset_id] = MediaProxyState(
+                    status="ready",
+                    artifact_id=f"art_proxy_{asset_id}",
+                    path=rel_path,
+                    error=None,
+                )
             save_manifest(manifest, data_dir=data_dir)
 
         if on_progress is not None:

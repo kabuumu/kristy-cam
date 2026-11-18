@@ -16,11 +16,19 @@ from backend.bootstrap import get_data_dir
 from backend.schemas import (
     CURRENT_SCHEMA_VERSION,
     ArtifactManifest,
+    AudioTrack,
+    CaptionClip,
     CaptionSettings,
+    CaptionTrack,
+    CropKeyframe,
+    MediaAssetRef,
     OutputSettings,
     ProjectInput,
     SegmentInput,
     SourceMediaRef,
+    TimelineTrack,
+    VideoTrack,
+    VisualClip,
     utc_now_iso,
 )
 
@@ -251,6 +259,207 @@ def save_global_pronunciations(
     return dict(cleaned)
 
 
+def create_default_tracks() -> list[TimelineTrack]:
+    """Return the initial independent V1, T1, A1 tracks for a multi-track NLE timeline."""
+    return [
+        VideoTrack(id="v1", name="Video 1", camera_follow=True),
+        CaptionTrack(id="t1", name="Captions 1"),
+        AudioTrack(id="a1", name="Audio 1", duck_under_narration=True),
+    ]
+
+
+def ensure_primary_media_registered(project: ProjectInput) -> ProjectInput:
+    """Ensure project.source_media is registered in project.media_assets."""
+    sm = project.source_media
+    existing = project.media_assets.get(sm.media_id)
+    if (
+        existing is not None
+        and existing.path == sm.path
+        and existing.fingerprint == sm.fingerprint
+        and existing.copied_to_project == sm.copied_to_project
+    ):
+        return project
+
+    updated_assets = dict(project.media_assets)
+    updated_assets[sm.media_id] = MediaAssetRef(
+        asset_id=sm.media_id,
+        kind="video",
+        name=Path(sm.path).name or existing.name if existing is not None else (Path(sm.path).name or "Primary Video"),
+        path=sm.path,
+        fingerprint=sm.fingerprint,
+        copied_to_project=sm.copied_to_project,
+    )
+    return project.model_copy(update={"media_assets": updated_assets})
+
+
+def _compute_legacy_segment_duration(
+    seg: SegmentInput,
+    audio_duration: float,
+    tail_padding_sec: float,
+    fps: int,
+) -> float:
+    import math
+
+    raw_video_dur = max(0.01, float(seg.video_out - seg.video_in))
+    nar_dur = max(0.0, float(audio_duration))
+    if seg.duration_mode == "preserve_video":
+        raw_target = max(raw_video_dur, nar_dur + tail_padding_sec) if nar_dur > 0.0 else raw_video_dur
+    else:
+        raw_target = (nar_dur + tail_padding_sec) if nar_dur > 0.0 else raw_video_dur
+    frame_count = max(1, math.ceil(raw_target * float(max(1, fps))))
+    return float(frame_count) / float(max(1, fps))
+
+
+def migrate_legacy_segments_to_tracks(
+    project: ProjectInput,
+    manifest: ArtifactManifest | None = None,
+    *,
+    clear_segments: bool = False,
+) -> ProjectInput:
+    """Deterministically convert legacy sequential segments into decoupled V1/T1/A1 tracks."""
+    registered = ensure_primary_media_registered(project)
+    has_track_clips = any(len(t.clips) > 0 for t in registered.tracks)
+    if has_track_clips or not registered.segments:
+        if not registered.tracks:
+            return registered.model_copy(update={"tracks": create_default_tracks()})
+        return registered
+
+    fps = max(1, registered.output_settings.fps)
+    tail_pad = registered.output_settings.tail_padding_sec
+    existing_v1 = next((t for t in registered.tracks if t.kind == "video"), None)
+    existing_t1 = next((t for t in registered.tracks if t.kind == "caption"), None)
+    existing_a1 = next((t for t in registered.tracks if t.kind == "audio"), None)
+
+    visual_clips: list[VisualClip] = []
+    caption_clips: list[CaptionClip] = []
+    migrated_kfs: list[CropKeyframe] = list(registered.camera_keyframes)
+    preserve_existing_camera = len(migrated_kfs) > 0
+
+    used_clip_ids: set[str] = set()
+
+    def _alloc_clip_id(preferred: str) -> str:
+        candidate = preferred or "clip"
+        if candidate not in used_clip_ids:
+            used_clip_ids.add(candidate)
+            return candidate
+        idx = 2
+        while f"{candidate}_{idx}" in used_clip_ids:
+            idx += 1
+        unique = f"{candidate}_{idx}"
+        used_clip_ids.add(unique)
+        return unique
+
+    cursor = 0.0
+    for seg in registered.segments:
+        seg_art = manifest.segments.get(seg.id) if manifest is not None else None
+        audio_dur = seg_art.audio_duration if seg_art is not None else 0.0
+        final_dur = _compute_legacy_segment_duration(seg, audio_dur, tail_pad, fps)
+
+        vclip_id = _alloc_clip_id(f"vclip_{seg.id}")
+        visual_clips.append(
+            VisualClip(
+                id=vclip_id,
+                asset_id=registered.source_media.media_id,
+                kind="video",
+                start_sec=round(cursor, 6),
+                duration_sec=round(final_dur, 6),
+                media_in=round(seg.video_in, 6),
+                media_out=round(seg.video_out, 6),
+                speed=1.0,  # Legacy SegmentInput.speed governed TTS speed, while video played at 1.0x
+                end_behavior="freeze",
+                volume=seg.source_audio_volume,
+            )
+        )
+
+        if not preserve_existing_camera:
+            for kf in seg.crop_keyframes:
+                global_t = round(cursor + kf.t, 4)
+                if not migrated_kfs or global_t > migrated_kfs[-1].t + 1e-4:
+                    migrated_kfs.append(
+                        CropKeyframe(
+                            t=global_t,
+                            x=kf.x,
+                            y=kf.y,
+                            zoom=kf.zoom,
+                            transition=kf.transition,
+                        )
+                    )
+
+        clause_timings = seg_art.clause_timings if seg_art is not None else []
+        local_cursor = 0.0
+        for c_idx, clause in enumerate(seg.clauses):
+            timing = clause_timings[c_idx] if c_idx < len(clause_timings) else None
+            if clause.start_sec is not None:
+                local_start = clause.start_sec
+            elif timing is not None:
+                local_start = timing.start_sec
+            else:
+                local_start = local_cursor
+
+            if clause.duration_sec is not None:
+                c_dur: float | None = round(clause.duration_sec, 6)
+                auto_fit = False
+                local_cursor = local_start + clause.duration_sec
+            elif timing is not None and timing.end_sec > timing.start_sec:
+                c_dur = round(timing.end_sec - timing.start_sec, 6)
+                auto_fit = True
+                local_cursor = timing.end_sec + (registered.output_settings.inter_clause_pause_ms / 1000.0)
+            else:
+                c_dur = None
+                auto_fit = True
+                local_cursor = local_start + 1.5
+
+            cclip_id = _alloc_clip_id(f"cap_{seg.id}_{clause.id}")
+            caption_clips.append(
+                CaptionClip(
+                    id=cclip_id,
+                    start_sec=round(cursor + local_start, 6),
+                    duration_sec=c_dur,
+                    auto_fit_tts=auto_fit,
+                    display_text=clause.display_text,
+                    spoken_text_override=clause.spoken_text_override,
+                    tts_enabled=True,
+                    speed=seg.speed,
+                )
+            )
+
+        cursor += final_dur
+
+    v_track = VideoTrack(
+        id=existing_v1.id if existing_v1 is not None else "v1",
+        name=existing_v1.name if existing_v1 is not None else "Video 1",
+        visible=existing_v1.visible if existing_v1 is not None else True,
+        muted=existing_v1.muted if existing_v1 is not None else False,
+        locked=existing_v1.locked if existing_v1 is not None else False,
+        camera_follow=existing_v1.camera_follow if existing_v1 is not None else True,
+        clips=visual_clips,
+        transitions=[],
+    )
+    t_track = CaptionTrack(
+        id=existing_t1.id if existing_t1 is not None else "t1",
+        name=existing_t1.name if existing_t1 is not None else "Captions 1",
+        visible=existing_t1.visible if existing_t1 is not None else True,
+        muted=existing_t1.muted if existing_t1 is not None else False,
+        locked=existing_t1.locked if existing_t1 is not None else False,
+        clips=caption_clips,
+    )
+    a_track = existing_a1 if existing_a1 is not None else AudioTrack(id="a1", name="Audio 1", duck_under_narration=True)
+    other_tracks = [
+        t
+        for t in registered.tracks
+        if t.id not in {v_track.id, t_track.id, a_track.id}
+    ]
+    tracks: list[TimelineTrack] = [v_track, t_track, a_track, *other_tracks]
+
+    return registered.model_copy(
+        update={
+            "camera_keyframes": migrated_kfs,
+            "tracks": tracks,
+            "segments": [] if clear_segments else registered.segments,
+        }
+    )
+
+
 def create_project(
     project_id: str,
     title: str,
@@ -260,6 +469,9 @@ def create_project(
     language: str = "en-gb",
     output_settings: OutputSettings | None = None,
     caption_settings: CaptionSettings | None = None,
+    media_assets: dict[str, MediaAssetRef] | None = None,
+    camera_keyframes: list[CropKeyframe] | None = None,
+    tracks: list[TimelineTrack] | None = None,
     segments: list[SegmentInput] | None = None,
     data_dir: Path | None = None,
 ) -> ProjectInput:
@@ -273,6 +485,21 @@ def create_project(
         (project_dir / sub).mkdir(parents=True, exist_ok=True)
 
     seeded_pronunciations = dict(load_global_pronunciations(data_dir))
+    resolved_assets = (
+        dict(media_assets)
+        if media_assets is not None
+        else {
+            source_media.media_id: MediaAssetRef(
+                asset_id=source_media.media_id,
+                kind="video",
+                name=Path(source_media.path).name or "Primary Video",
+                path=source_media.path,
+                fingerprint=source_media.fingerprint,
+                copied_to_project=source_media.copied_to_project,
+            )
+        }
+    )
+    resolved_tracks = list(tracks) if tracks is not None else create_default_tracks()
     now = utc_now_iso()
     project = ProjectInput(
         schema_version=CURRENT_SCHEMA_VERSION,
@@ -282,11 +509,14 @@ def create_project(
         created_at=now,
         updated_at=now,
         source_media=source_media,
+        media_assets=resolved_assets,
         voice=voice,
         language=language,
         output_settings=output_settings if output_settings is not None else OutputSettings(),
         caption_settings=caption_settings if caption_settings is not None else CaptionSettings(),
         pronunciations=seeded_pronunciations,
+        camera_keyframes=camera_keyframes if camera_keyframes is not None else [],
+        tracks=resolved_tracks,
         segments=segments if segments is not None else [],
     )
     atomic_write_json(project_path, project.model_dump(mode="json"), create_backup=False)
@@ -378,6 +608,7 @@ def relink_source_media(
             shutil.copy2(target_path, dest_path)
         target_path = dest_path.resolve()
 
+    old_media_id = project.source_media.media_id
     fingerprint = compute_file_fingerprint(target_path)
     updated_ref = SourceMediaRef(
         media_id=media_id,
@@ -385,5 +616,34 @@ def relink_source_media(
         fingerprint=fingerprint,
         copied_to_project=copy_to_project,
     )
-    updated_project = project.model_copy(update={"source_media": updated_ref})
+    updated_assets = dict(project.media_assets)
+    if old_media_id != media_id:
+        updated_assets.pop(old_media_id, None)
+    updated_assets[media_id] = MediaAssetRef(
+        asset_id=media_id,
+        kind="video",
+        name=target_path.name or "Primary Video",
+        path=str(target_path),
+        fingerprint=fingerprint,
+        copied_to_project=copy_to_project,
+    )
+    updated_tracks: list[TimelineTrack] = []
+    for tr in project.tracks:
+        if isinstance(tr, (VideoTrack, AudioTrack)) and old_media_id != media_id:
+            new_clips = [
+                c.model_copy(update={"asset_id": media_id}) if c.asset_id == old_media_id else c
+                for c in tr.clips
+            ]
+            updated_tracks.append(tr.model_copy(update={"clips": new_clips}))
+        else:
+            updated_tracks.append(tr)
+
+    updated_project = project.model_copy(
+        update={
+            "source_media": updated_ref,
+            "media_assets": updated_assets,
+            "tracks": updated_tracks,
+        }
+    )
     return save_project(updated_project, expected_revision=project.revision, data_dir=data_dir)
+

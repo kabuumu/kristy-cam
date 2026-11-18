@@ -8,14 +8,22 @@ import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import soundfile as sf
 from kokoro_onnx import Kokoro
 
 from backend.bootstrap import ensure_kokoro_models, get_data_dir
-from backend.schemas import ClauseInput, ClauseTiming, SegmentInput
+from backend.schemas import (
+    CaptionArtifactState,
+    CaptionClip,
+    CaptionTrack,
+    ClauseInput,
+    ClauseTiming,
+    SegmentInput,
+    TimelineTrack,
+)
 
 SAMPLE_RATE = 24000
 
@@ -275,3 +283,190 @@ def synthesize_segment_tts(
         audio_path=combined_path,
         clause_wav_paths=clause_wav_paths,
     )
+
+
+def resolve_caption_spoken_text(
+    clip: CaptionClip,
+    pronunciations: Mapping[str, str],
+) -> str:
+    """Resolve spoken text for an independent CaptionClip."""
+    if clip.spoken_text_override is not None:
+        return clip.spoken_text_override
+    return apply_pronunciations(clip.display_text, pronunciations)
+
+
+def compute_caption_tts_hash(
+    clip: CaptionClip,
+    pronunciations: Mapping[str, str],
+    voice: str,
+    language: str,
+) -> str:
+    """Compute canonical 16-char hash for a CaptionClip's narration.
+
+    Intentionally excludes start_sec, duration_sec, auto_fit_tts, and style_override
+    so moving or resizing a caption block never invalidates cached Kokoro audio.
+    """
+    resolved_voice = clip.voice_override or voice
+    payload = {
+        "clip_id": clip.id,
+        "tts_enabled": bool(clip.tts_enabled),
+        "voice": resolved_voice,
+        "language": language,
+        "speed": float(clip.speed),
+        "display_text": clip.display_text,
+        "spoken_text_override": clip.spoken_text_override,
+        "resolved_spoken_text": resolve_caption_spoken_text(clip, pronunciations),
+        "pronunciations": sorted((str(k), str(v)) for k, v in pronunciations.items()),
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class CaptionTTSResult:
+    """Result of synthesizing an independent CaptionClip into a 24kHz PCM_16 WAV."""
+
+    clip_id: str
+    tts_hash: str
+    sample_rate: int
+    total_samples: int
+    audio_duration: float
+    audio_path: Path | None
+
+
+def synthesize_caption_tts(
+    clip: CaptionClip,
+    pronunciations: Mapping[str, str],
+    voice: str,
+    language: str,
+    output_dir: Path,
+    kokoro: Any | None = None,
+) -> CaptionTTSResult:
+    """Synthesize a single independent CaptionClip into PCM_16 24kHz WAV."""
+    import os
+
+    tts_hash = compute_caption_tts_hash(
+        clip=clip,
+        pronunciations=pronunciations,
+        voice=voice,
+        language=language,
+    )
+    spoken_text = resolve_caption_spoken_text(clip, pronunciations)
+    if not clip.tts_enabled or not spoken_text.strip():
+        return CaptionTTSResult(
+            clip_id=clip.id,
+            tts_hash=tts_hash,
+            sample_rate=SAMPLE_RATE,
+            total_samples=0,
+            audio_duration=0.0,
+            audio_path=None,
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = output_dir / f"cap_{clip.id}_{tts_hash}.wav"
+    if wav_path.is_file():
+        data, sr = sf.read(str(wav_path), dtype="int16")
+        if int(sr) == SAMPLE_RATE and int(data.shape[0]) > 0:
+            total_samples = int(data.shape[0])
+            return CaptionTTSResult(
+                clip_id=clip.id,
+                tts_hash=tts_hash,
+                sample_rate=SAMPLE_RATE,
+                total_samples=total_samples,
+                audio_duration=float(total_samples) / float(SAMPLE_RATE),
+                audio_path=wav_path,
+            )
+
+    inst = kokoro if kokoro is not None else get_kokoro()
+    resolved_voice = clip.voice_override or voice
+    with _kokoro_lock:
+        _verify_cpu_provider(inst)
+        samples, sr = inst.create(
+            spoken_text,
+            voice=resolved_voice,
+            speed=clip.speed,
+            lang=language,
+        )
+        if sr != SAMPLE_RATE:
+            raise RuntimeError(f"Expected {SAMPLE_RATE} Hz sample rate from Kokoro, got {sr}")
+
+    pcm16 = _float_to_pcm16(samples)
+    tmp_wav = output_dir / f".cap_{clip.id}_{tts_hash}.tmp.wav"
+    sf.write(str(tmp_wav), pcm16, SAMPLE_RATE, subtype="PCM_16")
+    os.replace(tmp_wav, wav_path)
+
+    total_samples = int(pcm16.shape[0])
+    return CaptionTTSResult(
+        clip_id=clip.id,
+        tts_hash=tts_hash,
+        sample_rate=SAMPLE_RATE,
+        total_samples=total_samples,
+        audio_duration=float(total_samples) / float(SAMPLE_RATE),
+        audio_path=wav_path,
+    )
+
+
+def mix_caption_tracks_audio(
+    tracks: Sequence[TimelineTrack],
+    caption_artifacts: Mapping[str, CaptionArtifactState],
+    project_dir: Path,
+    total_duration_sec: float,
+    output_wav_path: Path,
+) -> tuple[Path | None, list[tuple[float, float]]]:
+    """Place active synthesized CaptionClip WAVs at exact global timeline offsets into one 24kHz PCM_16 WAV."""
+    placed: list[tuple[int, np.ndarray, int]] = []
+    intervals: list[tuple[float, float]] = []
+
+    for track in tracks:
+        if not isinstance(track, CaptionTrack) or track.muted:
+            continue
+        for clip in track.clips:
+            if not clip.tts_enabled:
+                continue
+            art = caption_artifacts.get(clip.id)
+            if art is None or not art.audio_path:
+                continue
+            raw_path = Path(art.audio_path)
+            abs_path = raw_path if raw_path.is_absolute() else (project_dir / raw_path)
+            if not abs_path.is_file():
+                continue
+
+            pcm_raw, sr = sf.read(str(abs_path), dtype="int16")
+            arr = np.asarray(pcm_raw, dtype=np.int16)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=1).astype(np.int16)
+            if int(sr) != SAMPLE_RATE and int(sr) > 0 and arr.size > 0:
+                target_len = max(1, int(round(arr.shape[0] * (float(SAMPLE_RATE) / float(sr)))))
+                x_old = np.linspace(0.0, 1.0, num=arr.shape[0], endpoint=False)
+                x_new = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+                arr = np.round(np.interp(x_new, x_old, arr.astype(np.float32))).astype(np.int16)
+
+            if not clip.auto_fit_tts and clip.duration_sec is not None and clip.duration_sec > 0.0:
+                max_len = max(1, int(round(clip.duration_sec * SAMPLE_RATE)))
+                if arr.shape[0] > max_len:
+                    arr = arr[:max_len]
+
+            if arr.shape[0] <= 0:
+                continue
+            start_sample = max(0, int(round(clip.start_sec * SAMPLE_RATE)))
+            end_sample = start_sample + int(arr.shape[0])
+            placed.append((start_sample, arr, end_sample))
+            intervals.append(
+                (float(start_sample) / float(SAMPLE_RATE), float(end_sample) / float(SAMPLE_RATE))
+            )
+
+    if not placed:
+        return None, []
+
+    min_samples = max(1, int(round(max(0.0, total_duration_sec) * SAMPLE_RATE)))
+    total_samples = max(min_samples, max(end_s for _, _, end_s in placed))
+    mix = np.zeros(total_samples, dtype=np.int32)
+    for start_s, pcm, _ in placed:
+        end_s = min(total_samples, start_s + int(pcm.shape[0]))
+        if end_s > start_s:
+            mix[start_s:end_s] += pcm[: end_s - start_s].astype(np.int32)
+
+    combined = np.clip(mix, -32768, 32767).astype(np.int16)
+    output_wav_path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(output_wav_path), combined, SAMPLE_RATE, subtype="PCM_16")
+    return output_wav_path, sorted(intervals)

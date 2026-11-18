@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -14,6 +14,29 @@ DurationMode = Literal["preserve_video", "fit_narration"]
 ProxyStatus = Literal["pending", "running", "ready", "failed"]
 JobStatus = Literal["queued", "running", "succeeded", "failed", "cancelled", "interrupted"]
 JobType = Literal["proxy", "tts", "preview", "export"]
+MediaAssetKind = Literal["video", "image", "audio"]
+EdgeTransitionType = Literal[
+    "none",
+    "fade",
+    "slide_left",
+    "slide_right",
+    "slide_up",
+    "slide_down",
+    "wipe_left",
+    "wipe_right",
+    "zoom",
+]
+JunctionTransitionType = Literal[
+    "crossfade",
+    "dissolve",
+    "wipeleft",
+    "wiperight",
+    "slideleft",
+    "slideright",
+    "fadeblack",
+    "zoomin",
+]
+CaptionAlign = Literal["bottom", "center", "top"]
 
 
 def utc_now_iso() -> str:
@@ -168,6 +191,276 @@ class SegmentInput(BaseModel):
         return self
 
 
+class MediaAssetRef(BaseModel):
+    """Authoritative reference to a project media asset (video, image, or audio)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1)
+    kind: MediaAssetKind
+    name: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    fingerprint: str = Field(min_length=1)
+    copied_to_project: bool = False
+
+
+class VisualClipTransform(BaseModel):
+    """2D layer transform in output canvas space (normalized 0.5,0.5 = centered)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: float = Field(default=0.5, ge=-2.0, le=3.0)
+    y: float = Field(default=0.5, ge=-2.0, le=3.0)
+    scale: float = Field(default=1.0, ge=0.05, le=4.0)
+    rotation_deg: float = Field(default=0.0, ge=-360.0, le=360.0)
+    opacity: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @field_validator("x", "y", "scale", "rotation_deg", "opacity")
+    @classmethod
+    def _validate_finite_floats(cls, v: float, info: Any) -> float:
+        return _check_finite(v, info.field_name)
+
+
+class ClipEdgeTransition(BaseModel):
+    """In/out animation transition attached to the start or end edge of a VisualClip."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: EdgeTransitionType = "none"
+    duration_sec: float = Field(default=0.0, ge=0.0, le=10.0)
+
+    @field_validator("duration_sec")
+    @classmethod
+    def _validate_finite_dur(cls, v: float, info: Any) -> float:
+        return _check_finite(v, info.field_name)
+
+
+class TrackTransition(BaseModel):
+    """Junction transition between two sequential/overlapping clips on the same visual track."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    from_clip_id: str = Field(min_length=1)
+    to_clip_id: str = Field(min_length=1)
+    type: JunctionTransitionType = "crossfade"
+    duration_sec: float = Field(default=0.5, gt=0.0, le=10.0)
+
+    @field_validator("duration_sec")
+    @classmethod
+    def _validate_finite_dur(cls, v: float, info: Any) -> float:
+        return _check_finite(v, info.field_name)
+
+    @model_validator(mode="after")
+    def _validate_endpoints(self) -> TrackTransition:
+        if self.from_clip_id == self.to_clip_id:
+            raise ValueError("TrackTransition from_clip_id and to_clip_id must differ")
+        return self
+
+
+class VisualClip(BaseModel):
+    """Independent video or image layer clip placed at an arbitrary timeline timestamp."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    asset_id: str = Field(min_length=1)
+    kind: Literal["video", "image"] = "video"
+    start_sec: float = Field(ge=0.0)
+    duration_sec: float = Field(gt=0.0)
+    media_in: float = Field(default=0.0, ge=0.0)
+    media_out: float | None = Field(default=None, gt=0.0)
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    end_behavior: Literal["freeze", "loop"] = "freeze"
+    volume: float = Field(default=0.15, ge=0.0, le=2.0)
+    audio_fade_in_sec: float = Field(default=0.0, ge=0.0)
+    audio_fade_out_sec: float = Field(default=0.0, ge=0.0)
+    transform: VisualClipTransform = Field(default_factory=VisualClipTransform)
+    transition_in: ClipEdgeTransition = Field(default_factory=ClipEdgeTransition)
+    transition_out: ClipEdgeTransition = Field(default_factory=ClipEdgeTransition)
+
+    @field_validator(
+        "start_sec",
+        "duration_sec",
+        "media_in",
+        "speed",
+        "volume",
+        "audio_fade_in_sec",
+        "audio_fade_out_sec",
+    )
+    @classmethod
+    def _validate_finite_floats(cls, v: float, info: Any) -> float:
+        return _check_finite(v, info.field_name)
+
+    @field_validator("media_out")
+    @classmethod
+    def _validate_optional_finite(cls, v: float | None, info: Any) -> float | None:
+        if v is None:
+            return None
+        return _check_finite(v, info.field_name)
+
+    @model_validator(mode="after")
+    def _validate_trim(self) -> VisualClip:
+        if self.media_out is not None and self.media_out <= self.media_in:
+            raise ValueError(
+                f"media_out ({self.media_out}) must be greater than media_in ({self.media_in})"
+            )
+        return self
+
+
+class AudioClip(BaseModel):
+    """Independent music, SFX, or voiceover clip placed on an AudioTrack."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    asset_id: str = Field(min_length=1)
+    start_sec: float = Field(ge=0.0)
+    duration_sec: float = Field(gt=0.0)
+    media_in: float = Field(default=0.0, ge=0.0)
+    volume: float = Field(default=1.0, ge=0.0, le=2.0)
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    fade_in_sec: float = Field(default=0.0, ge=0.0)
+    fade_out_sec: float = Field(default=0.0, ge=0.0)
+    loop: bool = False
+
+    @field_validator(
+        "start_sec",
+        "duration_sec",
+        "media_in",
+        "volume",
+        "speed",
+        "fade_in_sec",
+        "fade_out_sec",
+    )
+    @classmethod
+    def _validate_finite_floats(cls, v: float, info: Any) -> float:
+        return _check_finite(v, info.field_name)
+
+
+class CaptionStyleOverride(BaseModel):
+    """Optional per-caption positioning and font size overrides."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    margin_v: int | None = Field(default=None, ge=0)
+    font_size: int | None = Field(default=None, gt=0)
+    align: CaptionAlign | None = None
+
+
+class CaptionClip(BaseModel):
+    """Independent caption and/or Kokoro narration clip placed on a CaptionTrack."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    start_sec: float = Field(ge=0.0)
+    duration_sec: float | None = Field(default=None, gt=0.0)
+    auto_fit_tts: bool = True
+    display_text: str = ""
+    spoken_text_override: str | None = None
+    tts_enabled: bool = True
+    speed: float = Field(default=1.0, ge=0.8, le=1.25)
+    voice_override: str | None = None
+    style_override: CaptionStyleOverride | None = None
+
+    @field_validator("start_sec", "speed")
+    @classmethod
+    def _validate_finite_floats(cls, v: float, info: Any) -> float:
+        return _check_finite(v, info.field_name)
+
+    @field_validator("duration_sec")
+    @classmethod
+    def _validate_optional_finite(cls, v: float | None, info: Any) -> float | None:
+        if v is None:
+            return None
+        return _check_finite(v, info.field_name)
+
+
+class VideoTrack(BaseModel):
+    """Visual layer track (V1 base gameplay or V2+ image/video overlays)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str = Field(default="Video 1", min_length=1)
+    kind: Literal["video"] = "video"
+    visible: bool = True
+    muted: bool = False
+    locked: bool = False
+    camera_follow: bool = True
+    clips: list[VisualClip] = Field(default_factory=list)
+    transitions: list[TrackTransition] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_track_refs(self) -> VideoTrack:
+        clip_ids = [c.id for c in self.clips]
+        if len(clip_ids) != len(set(clip_ids)):
+            raise ValueError(f"Clip IDs within VideoTrack {self.id!r} must be unique")
+        clip_set = set(clip_ids)
+        tr_ids = [t.id for t in self.transitions]
+        if len(tr_ids) != len(set(tr_ids)):
+            raise ValueError(f"Transition IDs within VideoTrack {self.id!r} must be unique")
+        for tr in self.transitions:
+            if tr.from_clip_id not in clip_set or tr.to_clip_id not in clip_set:
+                raise ValueError(
+                    f"TrackTransition {tr.id!r} references missing clip(s) on track {self.id!r}"
+                )
+        return self
+
+
+class AudioTrack(BaseModel):
+    """Independent audio track (music, SFX, or standalone voiceover)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str = Field(default="Audio 1", min_length=1)
+    kind: Literal["audio"] = "audio"
+    volume: float = Field(default=1.0, ge=0.0, le=2.0)
+    muted: bool = False
+    solo: bool = False
+    duck_under_narration: bool = True
+    locked: bool = False
+    clips: list[AudioClip] = Field(default_factory=list)
+
+    @field_validator("volume")
+    @classmethod
+    def _validate_finite_vol(cls, v: float, info: Any) -> float:
+        return _check_finite(v, info.field_name)
+
+    @model_validator(mode="after")
+    def _validate_clip_ids(self) -> AudioTrack:
+        clip_ids = [c.id for c in self.clips]
+        if len(clip_ids) != len(set(clip_ids)):
+            raise ValueError(f"Clip IDs within AudioTrack {self.id!r} must be unique")
+        return self
+
+
+class CaptionTrack(BaseModel):
+    """Independent caption and narration track."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str = Field(default="Captions 1", min_length=1)
+    kind: Literal["caption"] = "caption"
+    visible: bool = True
+    muted: bool = False
+    locked: bool = False
+    clips: list[CaptionClip] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_clip_ids(self) -> CaptionTrack:
+        clip_ids = [c.id for c in self.clips]
+        if len(clip_ids) != len(set(clip_ids)):
+            raise ValueError(f"Clip IDs within CaptionTrack {self.id!r} must be unique")
+        return self
+
+
+TimelineTrack = Annotated[Union[VideoTrack, AudioTrack, CaptionTrack], Field(discriminator="kind")]
+
+
 class ProjectInput(BaseModel):
     """Authoritative user-editable project state persisted in project.json."""
 
@@ -180,12 +473,14 @@ class ProjectInput(BaseModel):
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
     source_media: SourceMediaRef
+    media_assets: dict[str, MediaAssetRef] = Field(default_factory=dict)
     voice: str = Field(default="bf_emma", min_length=1)
     language: str = Field(default="en-gb", min_length=1)
     output_settings: OutputSettings = Field(default_factory=OutputSettings)
     caption_settings: CaptionSettings = Field(default_factory=CaptionSettings)
     pronunciations: dict[str, str] = Field(default_factory=dict)
     camera_keyframes: list[CropKeyframe] = Field(default_factory=list)
+    tracks: list[TimelineTrack] = Field(default_factory=list)
     segments: list[SegmentInput] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -193,11 +488,19 @@ class ProjectInput(BaseModel):
         seg_ids = [s.id for s in self.segments]
         if len(seg_ids) != len(set(seg_ids)):
             raise ValueError("Segment IDs within a project must be unique")
+
+        track_ids = [t.id for t in self.tracks]
+        if len(track_ids) != len(set(track_ids)):
+            raise ValueError("Track IDs within a project must be unique")
+
+        seen_clip_ids: set[str] = set()
+        for track in self.tracks:
+            for clip in track.clips:
+                if clip.id in seen_clip_ids:
+                    raise ValueError(f"Duplicate clip ID {clip.id!r} across timeline tracks")
+                seen_clip_ids.add(clip.id)
+
         if self.camera_keyframes:
-            if self.camera_keyframes[0].t != 0.0:
-                raise ValueError(
-                    f"First project camera keyframe must start at t == 0.0, got {self.camera_keyframes[0].t}"
-                )
             for idx in range(1, len(self.camera_keyframes)):
                 prev_t = self.camera_keyframes[idx - 1].t
                 curr_t = self.camera_keyframes[idx].t
@@ -226,8 +529,33 @@ class SourceMetadata(BaseModel):
     audio_channels: int | None = None
 
 
+class MediaAssetMetadata(BaseModel):
+    """ffprobe-derived metadata for any project MediaAsset (video, image, or audio)."""
+
+    kind: MediaAssetKind
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    fps: float | None = Field(default=None, gt=0.0)
+    duration: float = Field(gt=0.0)
+    has_audio: bool = False
+    has_alpha: bool = False
+    codec_name: str | None = None
+    pix_fmt: str | None = None
+    audio_sample_rate: int | None = None
+    audio_channels: int | None = None
+
+
 class ProxyState(BaseModel):
     """Derived proxy video state in manifest.json."""
+
+    status: ProxyStatus = "pending"
+    artifact_id: str | None = None
+    path: str | None = None
+    error: str | None = None
+
+
+class MediaProxyState(BaseModel):
+    """Derived proxy state for an imported video asset in manifest.json."""
 
     status: ProxyStatus = "pending"
     artifact_id: str | None = None
@@ -243,6 +571,17 @@ class ClauseTiming(BaseModel):
     end_sample: int = Field(ge=0)
     start_sec: float = Field(ge=0.0)
     end_sec: float = Field(ge=0.0)
+
+
+class CaptionArtifactState(BaseModel):
+    """Derived synthesized TTS WAV state for an independent CaptionClip."""
+
+    tts_hash: str | None = None
+    audio_artifact_id: str | None = None
+    audio_path: str | None = None
+    sample_rate: int = 24000
+    total_samples: int = 0
+    audio_duration: float = 0.0
 
 
 class SegmentArtifactState(BaseModel):
@@ -268,6 +607,9 @@ class ArtifactManifest(BaseModel):
     project_id: str
     source_metadata: SourceMetadata | None = None
     proxy: ProxyState = Field(default_factory=ProxyState)
+    media_metadata: dict[str, MediaAssetMetadata] = Field(default_factory=dict)
+    media_proxies: dict[str, MediaProxyState] = Field(default_factory=dict)
+    caption_artifacts: dict[str, CaptionArtifactState] = Field(default_factory=dict)
     segments: dict[str, SegmentArtifactState] = Field(default_factory=dict)
     latest_preview_artifact_id: str | None = None
     latest_preview_path: str | None = None

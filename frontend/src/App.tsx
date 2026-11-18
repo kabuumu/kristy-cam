@@ -16,34 +16,43 @@ import {
 } from "lucide-react";
 import { ApiError, apiClient } from "./api/client";
 import { ActivityLogModal } from "./components/ActivityLogModal";
-import { CropCanvas } from "./components/CropCanvas";
 import { ContextualInspector } from "./components/ContextualInspector";
+import { CropCanvas } from "./components/CropCanvas";
 import { JobStatusBar } from "./components/JobStatusBar";
+import { MediaBin } from "./components/MediaBin";
 import { Timeline } from "./components/Timeline";
 import type {
   ArtifactManifest,
+  AudioClip,
+  AudioTrack,
   Capabilities,
+  CaptionClip,
   CropKeyframe,
   JobState,
+  MediaAssetKind,
+  MediaAssetRef,
   MediaSelectResult,
   ProjectBundle,
   ProjectInput,
   ProjectSummary,
-  SegmentInput,
   SourceStatus,
   TimelineSelection,
+  TimelineTrack,
+  VideoTrack,
+  VisualClip,
 } from "./types/studio";
 import {
   clampCropPosition,
-  computeClientProjectPreviewSignature,
-  computeClientTtsSignature,
+  computeCaptionClipTtsSignature,
   computeIdealCrop,
-  computeTimelineLayout,
+  computeMultiTrackPreviewSignature,
+  ensureDefaultTracks,
+  findNextClipId,
+  findNextTrackId,
   formatAspectRatio,
-  resolveClauseSpokenText,
-  resolveProjectTime,
-  splitSegmentAt,
-  toProjectTime,
+  getProjectDuration,
+  migrateProjectToMultiTrack,
+  resolveCaptionClipSpokenText,
 } from "./utils/studioMath";
 import {
   beginHistoryTransaction,
@@ -67,13 +76,110 @@ const OUTPUT_ASPECT_PRESETS = [
   { label: "4:3 (1440×1080)", width: 1440, height: 1080 },
 ] as const;
 
+function pickValidSelection(
+  prevSel: TimelineSelection,
+  proj: ProjectInput
+): TimelineSelection {
+  const tracks = proj.tracks ?? [];
+  if (prevSel) {
+    if (prevSel.type === "video-clip") {
+      const tr = tracks.find((t) => t.id === prevSel.trackId && t.kind === "video");
+      if (tr && tr.clips.some((c) => c.id === prevSel.clipId)) return prevSel;
+    } else if (prevSel.type === "audio-clip") {
+      const tr = tracks.find((t) => t.id === prevSel.trackId && t.kind === "audio");
+      if (tr && tr.clips.some((c) => c.id === prevSel.clipId)) return prevSel;
+    } else if (prevSel.type === "caption-clip") {
+      const tr = tracks.find((t) => t.id === prevSel.trackId && t.kind === "caption");
+      if (tr && tr.clips.some((c) => c.id === prevSel.clipId)) return prevSel;
+    } else if (prevSel.type === "transition") {
+      const tr = tracks.find((t) => t.id === prevSel.trackId && t.kind === "video");
+      if (
+        tr &&
+        tr.kind === "video" &&
+        tr.transitions.some((x) => x.id === prevSel.transitionId)
+      ) {
+        return prevSel;
+      }
+    } else if (prevSel.type === "track") {
+      if (tracks.some((t) => t.id === prevSel.trackId)) return prevSel;
+    } else if (prevSel.type === "keyframe") {
+      const kfs = proj.camera_keyframes ?? [];
+      if (prevSel.index >= 0 && prevSel.index < kfs.length) return prevSel;
+    }
+  }
+
+  const firstVideoTrack = tracks.find(
+    (t): t is VideoTrack => t.kind === "video" && t.clips.length > 0
+  );
+  if (firstVideoTrack && firstVideoTrack.clips[0]) {
+    return {
+      type: "video-clip",
+      trackId: firstVideoTrack.id,
+      clipId: firstVideoTrack.clips[0].id,
+    };
+  }
+  const firstCapTrack = tracks.find((t) => t.kind === "caption" && t.clips.length > 0);
+  if (firstCapTrack && firstCapTrack.clips[0]) {
+    return {
+      type: "caption-clip",
+      trackId: firstCapTrack.id,
+      clipId: firstCapTrack.clips[0].id,
+    };
+  }
+  return null;
+}
+
+function buildCaptionSignatureMap(
+  proj: ProjectInput,
+  manifest: ArtifactManifest,
+  staleList?: string[]
+): Record<string, string> {
+  const staleSet = new Set(staleList ?? []);
+  const sigs: Record<string, string> = {};
+  for (const tr of proj.tracks ?? []) {
+    if (tr.kind !== "caption") continue;
+    for (const clip of tr.clips) {
+      if (
+        clip.tts_enabled &&
+        !staleSet.has(clip.id) &&
+        manifest.caption_artifacts?.[clip.id]?.audio_artifact_id
+      ) {
+        sigs[clip.id] = computeCaptionClipTtsSignature(
+          clip,
+          proj.pronunciations,
+          proj.voice,
+          proj.language
+        );
+      }
+    }
+  }
+  return sigs;
+}
+
+function findNonOverlappingStart(
+  existingClips: Array<{ start_sec: number; duration_sec: number }>,
+  preferredStart: number,
+  duration: number
+): number {
+  const start = Math.max(0, Number(preferredStart.toFixed(3)));
+  const end = start + Math.max(0.05, duration);
+  const overlaps = existingClips.some(
+    (c) => start < c.start_sec + c.duration_sec - 0.02 && end > c.start_sec + 0.02
+  );
+  if (!overlaps) return start;
+  const maxEnd = Math.max(
+    0,
+    ...existingClips.map((c) => c.start_sec + c.duration_sec)
+  );
+  return Number(maxEnd.toFixed(3));
+}
+
 export default function App() {
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState<ProjectInput | null>(null);
   const [manifest, setManifest] = useState<ArtifactManifest | null>(null);
   const [sourceStatus, setSourceStatus] = useState<SourceStatus | null>(null);
-  const [selectedSegId, setSelectedSegId] = useState<string | null>(null);
   const [selection, setSelection] = useState<TimelineSelection>(null);
 
   const [dirty, setDirty] = useState(false);
@@ -84,27 +190,30 @@ export default function App() {
   const [sourceTime, setSourceTime] = useState(0);
   const [projectTime, setProjectTime] = useState(0);
   const [monitorMode, setMonitorMode] = useState<"timeline" | "source">("timeline");
+  const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isProjectPlaying, setIsProjectPlaying] = useState(false);
   const [preparingPlayback, setPreparingPlayback] = useState(false);
 
   const [activeJob, setActiveJob] = useState<JobState | null>(null);
   const [ttsError, setTtsError] = useState<string | null>(null);
-  const [lastSynthesizedSignatures, setLastSynthesizedSignatures] = useState<
-    Record<string, string>
-  >({});
+  const [synthesizingClipId, setSynthesizingClipId] = useState<string | null>(null);
+  const [lastSynthesizedCaptionSignatures, setLastSynthesizedCaptionSignatures] =
+    useState<Record<string, string>>({});
   const [
     lastRenderedProjectPreviewSignature,
     setLastRenderedProjectPreviewSignature,
   ] = useState<string | null>(null);
 
+  // Asset Bin state
+  const [assetImportBusy, setAssetImportBusy] = useState(false);
+  const [assetImportError, setAssetImportError] = useState<string | null>(null);
+
   // Modals
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [copyToProject, setCopyToProject] = useState(false);
-  const [selectedMedia, setSelectedMedia] = useState<MediaSelectResult | null>(
-    null
-  );
+  const [selectedMedia, setSelectedMedia] = useState<MediaSelectResult | null>(null);
   const [newProjectError, setNewProjectError] = useState<string | null>(null);
   const [mediaSelectBusy, setMediaSelectBusy] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
@@ -130,56 +239,27 @@ export default function App() {
   projectRef.current = project;
   const manifestRef = useRef<ArtifactManifest | null>(null);
   manifestRef.current = manifest;
-  const selectedSegIdRef = useRef<string | null>(null);
-  selectedSegIdRef.current = selectedSegId;
   const selectionRef = useRef<TimelineSelection>(null);
   selectionRef.current = selection;
 
   useEffect(() => {
     usageLogger.init(() => ({
       projectId: projectRef.current?.project_id ?? null,
-      segId: selectedSegIdRef.current ?? null,
+      segId:
+        selectionRef.current && "clipId" in selectionRef.current
+          ? selectionRef.current.clipId
+          : null,
     }));
   }, []);
 
   const applyBundle = useCallback(
     (bundle: ProjectBundle, options?: { resetHistory?: boolean }) => {
       const resetHistory = options?.resetHistory ?? true;
-      let normalizedProject = bundle.project;
-      if (
-        (!normalizedProject.camera_keyframes ||
-          normalizedProject.camera_keyframes.length === 0) &&
-        normalizedProject.segments.length > 0
-      ) {
-        const srcDur = bundle.manifest.source_metadata?.duration ?? 0;
-        const layout = computeTimelineLayout(
-          normalizedProject.segments,
-          bundle.manifest,
-          srcDur,
-          normalizedProject.output_settings.tail_padding_sec
-        );
-        const migrated: CropKeyframe[] = [];
-        for (const clip of layout.clips) {
-          for (const kf of clip.seg.crop_keyframes) {
-            const globalT = Number((clip.startSec + kf.t).toFixed(2));
-            if (
-              migrated.length === 0 ||
-              globalT > migrated[migrated.length - 1].t + 1e-4
-            ) {
-              migrated.push({
-                ...kf,
-                t: migrated.length === 0 ? 0.0 : globalT,
-              });
-            }
-          }
-        }
-        if (migrated.length > 0) {
-          normalizedProject = {
-            ...normalizedProject,
-            camera_keyframes: migrated,
-          };
-        }
-      }
+      const normalizedProject = migrateProjectToMultiTrack(
+        bundle.project,
+        bundle.manifest
+      );
+
       projectRef.current = normalizedProject;
       setProject(normalizedProject);
       setManifest(bundle.manifest);
@@ -187,41 +267,35 @@ export default function App() {
       savedBaselineRef.current = serializeProjectContent(normalizedProject);
       setDirty(false);
       setRevisionConflict(false);
+
       if (resetHistory) {
         const fresh = createInitialHistoryState();
         historyRef.current = fresh;
         setHistoryState(fresh);
       }
-      setSelectedSegId((prev) => {
-        if (
-          prev &&
-          normalizedProject.segments.some((s) => s.id === prev)
-        ) {
-          return prev;
-        }
-        return normalizedProject.segments[0]?.id ?? null;
-      });
-      const staleSet = new Set(bundle.stale_tts_segments ?? []);
-      const sigs: Record<string, string> = {};
-      for (const seg of normalizedProject.segments) {
-        if (
-          !staleSet.has(seg.id) &&
-          bundle.manifest.segments[seg.id]?.audio_artifact_id
-        ) {
-          sigs[seg.id] = computeClientTtsSignature(
-            seg,
-            normalizedProject.pronunciations,
-            normalizedProject.voice,
-            normalizedProject.language,
-            normalizedProject.output_settings.inter_clause_pause_ms
-          );
-        }
-      }
-      setLastSynthesizedSignatures(sigs);
+
+      const nextSel = pickValidSelection(selectionRef.current, normalizedProject);
+      selectionRef.current = nextSel;
+      setSelection(nextSel);
+
+      setPreviewAssetId((prev) =>
+        prev && normalizedProject.media_assets?.[prev]
+          ? prev
+          : normalizedProject.source_media.media_id
+      );
+
+      setLastSynthesizedCaptionSignatures(
+        buildCaptionSignatureMap(
+          normalizedProject,
+          bundle.manifest,
+          bundle.stale_tts_captions
+        )
+      );
+
       if (bundle.manifest.latest_preview_artifact_id) {
         setLastRenderedProjectPreviewSignature(
           (prev) =>
-            prev ?? computeClientProjectPreviewSignature(normalizedProject)
+            prev ?? computeMultiTrackPreviewSignature(normalizedProject)
         );
       } else {
         setLastRenderedProjectPreviewSignature(null);
@@ -232,13 +306,15 @@ export default function App() {
 
   const loadProject = useCallback(
     async (projectId: string) => {
-      usageLogger.logIntention("Load project", "project.load", {
-        projectId,
-      });
+      usageLogger.logIntention("Load project", "project.load", { projectId });
       try {
         setBannerError(null);
+        setAssetImportError(null);
         const bundle = await apiClient.getProject(projectId);
         applyBundle(bundle);
+        setProjectTime(0);
+        setSourceTime(0);
+        setMonitorMode("timeline");
         const url = new URL(window.location.href);
         url.searchParams.set("project", projectId);
         window.history.replaceState({}, "", url.toString());
@@ -248,7 +324,7 @@ export default function App() {
           {
             title: bundle.project.title,
             revision: bundle.project.revision,
-            segment_count: bundle.project.segments.length,
+            track_count: bundle.project.tracks?.length ?? 0,
             source_status: bundle.source_status?.status ?? "unknown",
           },
           { projectId }
@@ -274,7 +350,7 @@ export default function App() {
     }
   }, []);
 
-  // Initial bootstrap: capabilities + project list + ?project= query param
+  // Bootstrap capabilities + projects + ?project= param
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -338,24 +414,17 @@ export default function App() {
               projectRef.current
             ) {
               setTtsError(null);
-              const sigs: Record<string, string> = {};
-              for (const seg of projectRef.current.segments) {
-                if (bundle.manifest.segments[seg.id]?.audio_artifact_id) {
-                  sigs[seg.id] = computeClientTtsSignature(
-                    seg,
-                    projectRef.current.pronunciations,
-                    projectRef.current.voice,
-                    projectRef.current.language,
-                    projectRef.current.output_settings.inter_clause_pause_ms
-                  );
-                }
-              }
-              setLastSynthesizedSignatures((prev) => ({ ...prev, ...sigs }));
+              const sigs = buildCaptionSignatureMap(
+                projectRef.current,
+                bundle.manifest,
+                bundle.stale_tts_captions
+              );
+              setLastSynthesizedCaptionSignatures((prev) => ({ ...prev, ...sigs }));
             }
             if (updated.job_type === "preview") {
               if (projectRef.current) {
                 setLastRenderedProjectPreviewSignature(
-                  computeClientProjectPreviewSignature(projectRef.current)
+                  computeMultiTrackPreviewSignature(projectRef.current)
                 );
               }
               setPreviewModalOpen(true);
@@ -391,17 +460,6 @@ export default function App() {
                   },
                 }
               );
-            } else {
-              usageLogger.logActionOutput(
-                `Job ${updated.job_type} ${updated.status}`,
-                `job.${updated.job_type}.${updated.status}`,
-                { status: updated.status, stage: updated.stage },
-                {
-                  projectId: updated.project_id,
-                  segId: updated.seg_id,
-                  jobId: updated.job_id,
-                }
-              );
             }
           }
         }
@@ -412,29 +470,18 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [activeJob]);
 
-  const timelineLayout = useMemo(() => {
-    if (!project) return { clips: [], totalDuration: 0 };
-    const srcDur = manifest?.source_metadata?.duration ?? 0;
-    return computeTimelineLayout(
-      project.segments,
-      manifest,
-      srcDur,
-      project.output_settings.tail_padding_sec
-    );
+  const totalProjectDuration = useMemo(() => {
+    if (!project) return 0;
+    return getProjectDuration(project, manifest, 0);
   }, [project, manifest]);
 
-  const resolvedProjectTime = useMemo(
-    () => resolveProjectTime(timelineLayout, projectTime),
-    [timelineLayout, projectTime]
-  );
-
-  // Continuous global project playback timer across all clips
+  // Continuous global multi-track playback loop
   useEffect(() => {
     if (
       !isProjectPlaying ||
       !project ||
       !manifest ||
-      timelineLayout.clips.length === 0
+      totalProjectDuration <= 0
     ) {
       return;
     }
@@ -448,31 +495,19 @@ export default function App() {
       lastTick = now;
 
       setProjectTime((prev) => {
-        const startFrom =
-          prev >= timelineLayout.totalDuration - 0.02 ? 0 : prev;
+        const startFrom = prev >= totalProjectDuration - 0.02 ? 0 : prev;
         const next = startFrom + dt;
-        if (next >= timelineLayout.totalDuration) {
+        if (next >= totalProjectDuration) {
           setIsProjectPlaying(false);
           setIsPlaying(false);
-          return timelineLayout.totalDuration;
-        }
-        const res = resolveProjectTime(timelineLayout, next);
-        if (res.clip && res.clip.seg.id !== selectedSegIdRef.current) {
-          setSelectedSegId(res.clip.seg.id);
+          return totalProjectDuration;
         }
         return next;
       });
     }, 33);
 
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [isProjectPlaying, project, manifest, timelineLayout]);
-
-  const selectedSegment = useMemo(() => {
-    if (!project || !selectedSegId) return null;
-    return project.segments.find((s) => s.id === selectedSegId) ?? null;
-  }, [project, selectedSegId]);
+    return () => window.clearInterval(timer);
+  }, [isProjectPlaying, project, manifest, totalProjectDuration]);
 
   const isModalOpenRef = useRef(false);
 
@@ -487,30 +522,22 @@ export default function App() {
       const nextProject = updater(prevProject);
       const prevSnapshot: HistorySnapshot = {
         project: prevProject,
-        selectedSegId: selectedSegIdRef.current,
+        selectedSegId: null,
         selection: selectionRef.current,
       };
-      const nextSelectedSegId =
-        nextSel?.selectedSegId !== undefined
-          ? nextSel.selectedSegId
-          : selectedSegIdRef.current;
       const nextSelection =
         nextSel?.selection !== undefined
           ? nextSel.selection
           : selectionRef.current;
       const nextSnapshot: HistorySnapshot = {
         project: nextProject,
-        selectedSegId: nextSelectedSegId,
+        selectedSegId: null,
         selection: nextSelection,
       };
 
       projectRef.current = nextProject;
-      selectedSegIdRef.current = nextSelectedSegId;
       selectionRef.current = nextSelection;
       setProject(nextProject);
-      if (nextSel?.selectedSegId !== undefined) {
-        setSelectedSegId(nextSelectedSegId);
-      }
       if (nextSel?.selection !== undefined) {
         setSelection(nextSelection);
       }
@@ -535,14 +562,20 @@ export default function App() {
     []
   );
 
-  const handleUpdateSegment = useCallback(
-    (updated: SegmentInput, meta?: UpdateMeta) => {
+  const handleUpdateTracks = useCallback(
+    (
+      updater: (tracks: TimelineTrack[]) => TimelineTrack[],
+      meta?: UpdateMeta,
+      nextSelection?: TimelineSelection
+    ) => {
       handleUpdateProject(
         (prev) => ({
           ...prev,
-          segments: prev.segments.map((s) => (s.id === updated.id ? updated : s)),
+          tracks: updater(ensureDefaultTracks(prev)),
+          segments: [], // Prevent legacy segment resurrection once multi-track edits are committed
         }),
-        meta ?? { label: "Edit clip" }
+        meta ?? { label: "Edit timeline" },
+        nextSelection !== undefined ? { selection: nextSelection } : undefined
       );
     },
     [handleUpdateProject]
@@ -568,7 +601,7 @@ export default function App() {
       historyRef.current,
       {
         project: cur,
-        selectedSegId: selectedSegIdRef.current,
+        selectedSegId: null,
         selection: selectionRef.current,
       },
       label
@@ -582,7 +615,7 @@ export default function App() {
     if (!cur) return;
     const nextHistory = endHistoryTransaction(historyRef.current, {
       project: cur,
-      selectedSegId: selectedSegIdRef.current,
+      selectedSegId: null,
       selection: selectionRef.current,
     });
     if (nextHistory !== historyRef.current) {
@@ -599,10 +632,8 @@ export default function App() {
     historyRef.current = res.state;
     setHistoryState(res.state);
     projectRef.current = res.restored.project;
-    selectedSegIdRef.current = res.restored.selectedSegId;
     selectionRef.current = res.restored.selection;
     setProject(res.restored.project);
-    setSelectedSegId(res.restored.selectedSegId);
     setSelection(res.restored.selection);
     const nextDirty =
       savedBaselineRef.current !== null
@@ -625,10 +656,8 @@ export default function App() {
     historyRef.current = res.state;
     setHistoryState(res.state);
     projectRef.current = res.restored.project;
-    selectedSegIdRef.current = res.restored.selectedSegId;
     selectionRef.current = res.restored.selection;
     setProject(res.restored.project);
-    setSelectedSegId(res.restored.selectedSegId);
     setSelection(res.restored.selection);
     const nextDirty =
       savedBaselineRef.current !== null
@@ -643,7 +672,7 @@ export default function App() {
     );
   }, []);
 
-  // Global Undo/Redo keyboard shortcuts (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y)
+  // Global Undo/Redo shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!projectRef.current || isModalOpenRef.current) return;
@@ -672,7 +701,7 @@ export default function App() {
       projectId: current.project_id,
       input: {
         expected_revision: current.revision,
-        segment_count: current.segments.length,
+        track_count: current.tracks?.length ?? 0,
       },
     });
     setSaving(true);
@@ -691,7 +720,7 @@ export default function App() {
         "project.save",
         {
           revision: bundle.project.revision,
-          segment_count: bundle.project.segments.length,
+          track_count: bundle.project.tracks?.length ?? 0,
         },
         { projectId: bundle.project.project_id }
       );
@@ -718,84 +747,92 @@ export default function App() {
   };
 
   const ensureSavedBeforeJob = async (): Promise<ProjectInput | null> => {
-    if (!project) return null;
-    if (!dirty) return project;
+    const cur = projectRef.current;
+    if (!cur) return null;
+    if (!dirty) return cur;
     return handleSave();
   };
 
-  const ensureStaleAudioBeforePlayback = async (
-    targetSegments: SegmentInput[]
-  ): Promise<boolean> => {
-    if (!project || !manifest) return true;
-    const staleSegments = targetSegments.filter((seg) => {
-      const hasSpoken = seg.clauses.some(
-        (c) =>
-          resolveClauseSpokenText(c, project.pronunciations).trim().length > 0
-      );
-      const sig = computeClientTtsSignature(
-        seg,
-        project.pronunciations,
-        project.voice,
-        project.language,
-        project.output_settings.inter_clause_pause_ms
-      );
-      const segArt = manifest.segments[seg.id];
-      const hasAudio = Boolean(segArt?.audio_artifact_id);
-      const lastSig = lastSynthesizedSignatures[seg.id];
-      return (hasSpoken && (!hasAudio || lastSig !== sig)) || (!hasSpoken && hasAudio);
-    });
+  const runCaptionTtsSynthesis = async (clipIds?: string[]): Promise<boolean> => {
+    const cur = projectRef.current;
+    const curManifest = manifestRef.current;
+    if (!cur || !curManifest) return true;
 
-    if (staleSegments.length === 0) return true;
+    const captionClips: CaptionClip[] = [];
+    for (const tr of cur.tracks ?? []) {
+      if (tr.kind !== "caption" || tr.muted) continue;
+      for (const c of tr.clips) {
+        if (clipIds && !clipIds.includes(c.id)) continue;
+        captionClips.push(c);
+      }
+    }
 
-    setPreparingPlayback(true);
+    const staleIds: string[] = [];
+    for (const clip of captionClips) {
+      const spoken = resolveCaptionClipSpokenText(clip, cur.pronunciations).trim();
+      if (!clip.tts_enabled || !spoken) continue;
+      const sig = computeCaptionClipTtsSignature(
+        clip,
+        cur.pronunciations,
+        cur.voice,
+        cur.language
+      );
+      const hasAudio = Boolean(curManifest.caption_artifacts?.[clip.id]?.audio_artifact_id);
+      const lastSig = lastSynthesizedCaptionSignatures[clip.id];
+      if (!hasAudio || lastSig !== sig) {
+        staleIds.push(clip.id);
+      }
+    }
+
+    if (staleIds.length === 0) return true;
+
     setTtsError(null);
     setBannerError(null);
     try {
       const saved = await ensureSavedBeforeJob();
       if (!saved) return false;
 
-      for (const seg of staleSegments) {
-        const accepted = await apiClient.synthesizeTts(saved.project_id, seg.id);
-        let job = await apiClient.getJob(accepted.job_id);
+      const accepted = await apiClient.synthesizeProjectTts(saved.project_id, staleIds);
+      let job = await apiClient.getJob(accepted.job_id);
+      setActiveJob(job);
+      while (job.status === "queued" || job.status === "running") {
+        await new Promise((r) => window.setTimeout(r, 300));
+        job = await apiClient.getJob(accepted.job_id);
         setActiveJob(job);
-        while (job.status === "queued" || job.status === "running") {
-          await new Promise((r) => window.setTimeout(r, 300));
-          job = await apiClient.getJob(accepted.job_id);
-          setActiveJob(job);
-        }
-        if (job.status !== "succeeded") {
-          const msg = job.error || `Audio synthesis ${job.status}`;
-          setTtsError(msg);
-          setBannerError(msg);
-          return false;
-        }
+      }
+      if (job.status !== "succeeded") {
+        const msg = job.error || `Audio synthesis ${job.status}`;
+        setTtsError(msg);
+        setBannerError(msg);
+        return false;
       }
 
       const bundle = await apiClient.getProject(saved.project_id);
       setManifest(bundle.manifest);
       setSourceStatus(bundle.source_status ?? null);
-      const sigs: Record<string, string> = {};
-      for (const seg of bundle.project.segments) {
-        if (bundle.manifest.segments[seg.id]?.audio_artifact_id) {
-          sigs[seg.id] = computeClientTtsSignature(
-            seg,
-            bundle.project.pronunciations,
-            bundle.project.voice,
-            bundle.project.language,
-            bundle.project.output_settings.inter_clause_pause_ms
-          );
-        }
-      }
-      setLastSynthesizedSignatures((prev) => ({ ...prev, ...sigs }));
+      const normalized = migrateProjectToMultiTrack(bundle.project, bundle.manifest);
+      const sigs = buildCaptionSignatureMap(
+        normalized,
+        bundle.manifest,
+        bundle.stale_tts_captions
+      );
+      setLastSynthesizedCaptionSignatures((prev) => ({ ...prev, ...sigs }));
       return true;
     } catch (err) {
       const msg =
-        err instanceof Error ? err.message : "Failed to regenerate narration audio";
+        err instanceof Error ? err.message : "Failed to synthesize caption narration";
       setTtsError(msg);
       setBannerError(msg);
       return false;
+    }
+  };
+
+  const handleSynthesizeCaptionTts = async (clipId?: string) => {
+    setSynthesizingClipId(clipId ?? "all");
+    try {
+      await runCaptionTtsSynthesis(clipId ? [clipId] : undefined);
     } finally {
-      setPreparingPlayback(false);
+      setSynthesizingClipId(null);
     }
   };
 
@@ -805,18 +842,20 @@ export default function App() {
       setIsPlaying(false);
       return;
     }
-    if (monitorMode === "timeline" && project && project.segments.length > 0) {
-      const ok = await ensureStaleAudioBeforePlayback(project.segments);
-      if (ok) {
-        setIsProjectPlaying(true);
+    if (monitorMode === "timeline") {
+      if (totalProjectDuration <= 0) return;
+      setPreparingPlayback(true);
+      try {
+        const ok = await runCaptionTtsSynthesis();
+        if (ok) {
+          setIsProjectPlaying(true);
+        }
+      } finally {
+        setPreparingPlayback(false);
       }
       return;
     }
-    const targets = selectedSegment ? [selectedSegment] : [];
-    const ok = await ensureStaleAudioBeforePlayback(targets);
-    if (ok) {
-      setIsPlaying(true);
-    }
+    setIsPlaying(true);
   };
 
   const handleToggleProjectPlayback = async () => {
@@ -825,29 +864,27 @@ export default function App() {
       setIsPlaying(false);
       return;
     }
-    if (!project || project.segments.length === 0) return;
-    const ok = await ensureStaleAudioBeforePlayback(project.segments);
-    if (ok) {
-      setIsProjectPlaying(true);
+    if (totalProjectDuration <= 0) return;
+    setPreparingPlayback(true);
+    try {
+      const ok = await runCaptionTtsSynthesis();
+      if (ok) {
+        setIsProjectPlaying(true);
+      }
+    } finally {
+      setPreparingPlayback(false);
     }
   };
 
   const handleRenderPreview = async () => {
-    if (!project || project.segments.length === 0) return;
+    if (!project || totalProjectDuration <= 0) return;
     usageLogger.logIntention("Render project preview", "preview.render");
     if (
       !dirty &&
       manifest?.latest_preview_artifact_id &&
-      lastRenderedProjectPreviewSignature ===
-        computeClientProjectPreviewSignature(project)
+      lastRenderedProjectPreviewSignature === computeMultiTrackPreviewSignature(project)
     ) {
       setPreviewModalOpen(true);
-      usageLogger.logActionOutput(
-        "Open cached project preview",
-        "preview.cached",
-        { artifact_id: manifest.latest_preview_artifact_id },
-        { projectId: project.project_id }
-      );
       return;
     }
     const saved = await ensureSavedBeforeJob();
@@ -856,70 +893,35 @@ export default function App() {
       const res = await apiClient.renderPreview(saved.project_id);
       const job = await apiClient.getJob(res.job_id);
       setActiveJob(job);
-      usageLogger.logActionOutput(
-        "Queue project preview job",
-        "preview.queued",
-        { job_id: job.job_id, status: job.status },
-        { projectId: saved.project_id, jobId: job.job_id }
-      );
     } catch (err) {
-      setBannerError(
-        err instanceof Error ? err.message : "Failed to start preview"
-      );
-      usageLogger.logError("Render project preview", "preview.start_failed", err, {
-        projectId: saved.project_id,
-      });
+      setBannerError(err instanceof Error ? err.message : "Failed to start preview");
     }
   };
 
   const handleExport = async () => {
-    usageLogger.logIntention("Export final vertical MP4", "export.render");
+    if (!project || totalProjectDuration <= 0) return;
+    usageLogger.logIntention("Export final MP4", "export.render");
     const saved = await ensureSavedBeforeJob();
     if (!saved) return;
     try {
       const res = await apiClient.exportProject(saved.project_id);
       const job = await apiClient.getJob(res.job_id);
       setActiveJob(job);
-      usageLogger.logActionOutput(
-        "Queue final export job",
-        "export.queued",
-        { job_id: job.job_id, status: job.status },
-        { projectId: saved.project_id, jobId: job.job_id }
-      );
     } catch (err) {
-      setBannerError(
-        err instanceof Error ? err.message : "Failed to start export"
-      );
-      usageLogger.logError("Export final vertical MP4", "export.start_failed", err, {
-        projectId: saved.project_id,
-      });
+      setBannerError(err instanceof Error ? err.message : "Failed to start export");
     }
   };
 
   const handleCancelJob = async (jobId: string) => {
-    usageLogger.logIntention("Cancel active background job", "job.cancel", {
-      jobId,
-    });
     try {
       const job = await apiClient.cancelJob(jobId);
       setActiveJob(job);
-      usageLogger.logActionOutput(
-        "Cancel background job",
-        "job.cancel",
-        { job_id: job.job_id, status: job.status },
-        { jobId: job.job_id }
-      );
     } catch (err) {
-      setBannerError(
-        err instanceof Error ? err.message : "Failed to cancel job"
-      );
-      usageLogger.logError("Cancel background job", "job.cancel_failed", err, {
-        jobId,
-      });
+      setBannerError(err instanceof Error ? err.message : "Failed to cancel job");
     }
   };
 
-  // Output resolution / aspect ratio change (re-clamps existing keyframes)
+  // Output resolution / aspect ratio change (re-clamps keyframes)
   const handleChangeOutputResolution = (
     rawW: number,
     rawH: number,
@@ -941,15 +943,7 @@ export default function App() {
           height: nextH,
         },
         camera_keyframes: (prev.camera_keyframes ?? []).map((kf) => {
-          const clamped = clampCropPosition(
-            kf.x,
-            kf.y,
-            kf.zoom,
-            srcW,
-            srcH,
-            nextW,
-            nextH
-          );
+          const clamped = clampCropPosition(kf.x, kf.y, kf.zoom, srcW, srcH, nextW, nextH);
           return {
             ...kf,
             x: Number(clamped.x.toFixed(4)),
@@ -957,47 +951,105 @@ export default function App() {
             zoom: Number(clamped.zoom.toFixed(3)),
           };
         }),
-        segments: prev.segments.map((seg) => ({
-          ...seg,
-          crop_keyframes: seg.crop_keyframes.map((kf) => {
-            const clamped = clampCropPosition(
-              kf.x,
-              kf.y,
-              kf.zoom,
-              srcW,
-              srcH,
-              nextW,
-              nextH
-            );
-            return {
-              ...kf,
-              x: Number(clamped.x.toFixed(4)),
-              y: Number(clamped.y.toFixed(4)),
-              zoom: Number(clamped.zoom.toFixed(3)),
-            };
-          }),
-        })),
       }),
       {
         label: `Change output resolution (${nextW}×${nextH})`,
         coalesceKey,
       }
     );
-    usageLogger.logActionOutput(
-      "Change output resolution",
-      "project.resolution_change",
-      { width: nextW, height: nextH },
-      { projectId: project.project_id }
-    );
   };
 
-  // Segment CRUD
-  const handleAddSegment = (videoIn: number, videoOut: number) => {
+  // Media Bin Asset Handlers
+  const handleImportAsset = async (options: {
+    path?: string;
+    file?: File;
+    kind?: MediaAssetKind;
+    copyToProject?: boolean;
+  }) => {
     if (!project) return;
-    const existing = new Set(project.segments.map((s) => s.id));
-    let n = project.segments.length + 1;
-    while (existing.has(`seg_${String(n).padStart(2, "0")}`)) n += 1;
-    const id = `seg_${String(n).padStart(2, "0")}`;
+    setAssetImportBusy(true);
+    setAssetImportError(null);
+    try {
+      const baseProj = dirty ? await handleSave() : project;
+      if (!baseProj) return;
+      const res = await apiClient.importProjectAsset(baseProj.project_id, options);
+      applyBundle(res, { resetHistory: false });
+      if (res.asset.kind === "video") {
+        setPreviewAssetId(res.asset.asset_id);
+      }
+      if (res.job_id) {
+        const job = await apiClient.getJob(res.job_id);
+        setActiveJob(job);
+      }
+    } catch (err) {
+      const isCancelled =
+        err instanceof ApiError &&
+        err.status === 400 &&
+        err.detail.toLowerCase().includes("cancel");
+      if (!isCancelled) {
+        setAssetImportError(
+          err instanceof Error ? err.message : "Failed to import asset"
+        );
+      }
+    } finally {
+      setAssetImportBusy(false);
+    }
+  };
+
+  const handleDeleteAsset = async (assetId: string) => {
+    if (!project) return;
+    setAssetImportError(null);
+    try {
+      const baseProj = dirty ? await handleSave() : project;
+      if (!baseProj) return;
+      const res = await apiClient.deleteProjectAsset(baseProj.project_id, assetId);
+      applyBundle(res, { resetHistory: false });
+      if (previewAssetId === assetId) {
+        setPreviewAssetId(res.project.source_media.media_id);
+      }
+    } catch (err) {
+      setAssetImportError(
+        err instanceof Error ? err.message : "Failed to remove asset"
+      );
+    }
+  };
+
+  const handleAddSourceClip = (
+    assetId: string,
+    videoIn: number,
+    videoOut: number,
+    startSec?: number,
+    trackId?: string
+  ) => {
+    if (!project) return;
+    const dur = Math.max(0.2, Number((videoOut - videoIn).toFixed(3)));
+    const newId = findNextClipId(project, "vclip");
+    const tracks = ensureDefaultTracks(project);
+
+    let resolvedTrackId = trackId;
+    if (!resolvedTrackId) {
+      const unlocked = tracks.find((t): t is VideoTrack => t.kind === "video" && !t.locked);
+      resolvedTrackId = unlocked?.id ?? findNextTrackId(project, "v");
+    }
+
+    const newClip: VisualClip = {
+      id: newId,
+      asset_id: assetId,
+      kind: "video",
+      start_sec: 0,
+      duration_sec: dur,
+      media_in: Number(videoIn.toFixed(3)),
+      media_out: Number(videoOut.toFixed(3)),
+      speed: 1.0,
+      end_behavior: "freeze",
+      volume: project.output_settings.default_source_volume,
+      audio_fade_in_sec: 0,
+      audio_fade_out_sec: 0,
+      transform: { x: 0.5, y: 0.5, scale: 1.0, rotation_deg: 0, opacity: 1.0 },
+      transition_in: { type: "none", duration_sec: 0 },
+      transition_out: { type: "none", duration_sec: 0 },
+    };
+
     const srcW = manifest?.source_metadata?.width ?? 1920;
     const srcH = manifest?.source_metadata?.height ?? 1080;
     const ideal = computeIdealCrop(
@@ -1007,169 +1059,261 @@ export default function App() {
       project.output_settings.width,
       project.output_settings.height
     );
-    const initialX = Number((ideal.maxNormX / 2).toFixed(4));
-    const initialY = Number((ideal.maxNormY / 2).toFixed(4));
-    const newSeg: SegmentInput = {
-      id,
-      video_in: videoIn,
-      video_out: videoOut,
-      duration_mode: "preserve_video",
-      source_audio_volume: project.output_settings.default_source_volume,
-      speed: 1.0,
-      crop_keyframes: [{ t: 0.0, x: initialX, y: initialY, zoom: 1.0 }],
-      clauses: [],
-    };
+
     handleUpdateProject(
-      (prev) => ({
-        ...prev,
-        camera_keyframes:
-          prev.camera_keyframes && prev.camera_keyframes.length > 0
-            ? prev.camera_keyframes
-            : [{ t: 0.0, x: initialX, y: initialY, zoom: 1.0, transition: "tween" }],
-        segments: [...prev.segments, newSeg],
-      }),
-      { label: `Add clip ${id}` },
-      { selectedSegId: id, selection: { type: "video", segId: id } }
+      (prev) => {
+        const curTracks = ensureDefaultTracks(prev);
+        let targetTrack = curTracks.find(
+          (t): t is VideoTrack => t.kind === "video" && t.id === resolvedTrackId
+        );
+        let nextTracks: TimelineTrack[];
+        if (!targetTrack) {
+          targetTrack = {
+            id: resolvedTrackId!,
+            name: `Video ${curTracks.filter((t) => t.kind === "video").length + 1}`,
+            kind: "video",
+            visible: true,
+            muted: false,
+            locked: false,
+            camera_follow: true,
+            clips: [],
+            transitions: [],
+          };
+          nextTracks = [...curTracks, targetTrack];
+        } else {
+          nextTracks = curTracks;
+        }
+        const computedStart =
+          startSec !== undefined
+            ? Math.max(0, Number(startSec.toFixed(3)))
+            : findNonOverlappingStart(targetTrack.clips, projectTime, dur);
+        const placedClip: VisualClip = { ...newClip, start_sec: computedStart };
+
+        nextTracks = nextTracks.map((tr) =>
+          tr.kind === "video" && tr.id === resolvedTrackId
+            ? {
+                ...tr,
+                clips: [...tr.clips, placedClip].sort((a, b) => a.start_sec - b.start_sec),
+              }
+            : tr
+        );
+
+        const hasKfs = (prev.camera_keyframes ?? []).length > 0;
+        const kfs = hasKfs
+          ? prev.camera_keyframes!
+          : [
+              {
+                t: 0,
+                x: Number((ideal.maxNormX / 2).toFixed(4)),
+                y: Number((ideal.maxNormY / 2).toFixed(4)),
+                zoom: 1.0,
+                transition: "tween" as const,
+              },
+            ];
+
+        return {
+          ...prev,
+          tracks: nextTracks,
+          segments: [],
+          camera_keyframes: kfs,
+        };
+      },
+      { label: `Add video clip ${newId}` },
+      { selection: { type: "video-clip", trackId: resolvedTrackId, clipId: newId } }
     );
     setMonitorMode("timeline");
-    setProjectTime(timelineLayout.totalDuration);
-    setSourceTime(videoIn);
-    usageLogger.logActionOutput(
-      "Add segment to timeline",
-      "segment.add",
-      { seg_id: id, video_in: videoIn, video_out: videoOut },
-      { projectId: project.project_id, segId: id }
-    );
   };
 
-  const handleDuplicateSegment = (index: number) => {
+  const handlePlaceAssetOnTrack = (
+    assetId: string,
+    kind: MediaAssetKind,
+    trackId: string,
+    startSec: number
+  ) => {
     if (!project) return;
-    const orig = project.segments[index];
-    const existing = new Set(project.segments.map((s) => s.id));
-    let n = project.segments.length + 1;
-    while (existing.has(`seg_${String(n).padStart(2, "0")}`)) n += 1;
-    const newId = `seg_${String(n).padStart(2, "0")}`;
-    const copy: SegmentInput = {
-      ...orig,
-      id: newId,
-      crop_keyframes: orig.crop_keyframes.map((k) => ({ ...k })),
-      clauses: orig.clauses.map((c) => ({ ...c })),
-    };
-    handleUpdateProject(
-      (prev) => {
-        const next = [...prev.segments];
-        next.splice(index + 1, 0, copy);
-        return { ...prev, segments: next };
-      },
-      { label: `Duplicate clip ${orig.id}` },
-      { selectedSegId: newId, selection: { type: "video", segId: newId } }
-    );
-    usageLogger.logActionOutput(
-      "Duplicate segment",
-      "segment.duplicate",
-      { source_seg_id: orig.id, new_seg_id: newId },
-      { projectId: project.project_id, segId: newId }
-    );
-  };
-
-  const handleDeleteSegment = (index: number) => {
-    if (!project) return;
-    const removed = project.segments[index];
-    const next = project.segments.filter((_, i) => i !== index);
-    const nextSelId =
-      selectedSegId === removed.id
-        ? next[Math.max(0, index - 1)]?.id ?? null
-        : selectedSegId;
-    const nextSel: TimelineSelection =
-      selectedSegId === removed.id ? null : selection;
-    handleUpdateProject(
-      (prev) => ({ ...prev, segments: next }),
-      { label: `Delete clip ${removed.id}` },
-      { selectedSegId: nextSelId, selection: nextSel }
-    );
-    usageLogger.logActionOutput(
-      "Delete segment",
-      "segment.delete",
-      { deleted_seg_id: removed.id, remaining_count: next.length },
-      { projectId: project.project_id, segId: removed.id }
-    );
-  };
-
-  const handleReorderSegments = (fromIndex: number, toIndex: number) => {
-    if (!project) return;
-    if (
-      fromIndex < 0 ||
-      toIndex < 0 ||
-      fromIndex >= project.segments.length ||
-      toIndex >= project.segments.length ||
-      fromIndex === toIndex
-    ) {
+    const meta = manifest?.media_metadata?.[assetId];
+    if (kind === "audio") {
+      const dur = Math.max(0.5, Number((meta?.duration || 3.0).toFixed(3)));
+      const newId = findNextClipId(project, "aclip");
+      handleUpdateTracks(
+        (prevTracks) =>
+          prevTracks.map((tr) => {
+            if (tr.kind !== "audio" || tr.id !== trackId || tr.locked) return tr;
+            const clip: AudioClip = {
+              id: newId,
+              asset_id: assetId,
+              start_sec: Math.max(0, Number(startSec.toFixed(3))),
+              duration_sec: dur,
+              media_in: 0,
+              volume: 1.0,
+              speed: 1.0,
+              fade_in_sec: 0,
+              fade_out_sec: 0,
+              loop: false,
+            };
+            return {
+              ...tr,
+              clips: [...tr.clips, clip].sort((a, b) => a.start_sec - b.start_sec),
+            };
+          }),
+        { label: `Add audio clip ${newId}` },
+        { type: "audio-clip", trackId, clipId: newId }
+      );
       return;
     }
-    const moved = project.segments[fromIndex];
-    handleUpdateProject(
-      (prev) => {
-        const next = [...prev.segments];
-        const [item] = next.splice(fromIndex, 1);
-        next.splice(toIndex, 0, item);
-        return { ...prev, segments: next };
-      },
-      { label: `Reorder clip ${moved?.id ?? ""}`.trim() },
-      moved
-        ? { selectedSegId: moved.id, selection: { type: "video", segId: moved.id } }
-        : undefined
-    );
-    usageLogger.logActionOutput(
-      "Reorder timeline clips",
-      "segment.reorder",
-      { from_index: fromIndex, to_index: toIndex, seg_id: moved?.id },
-      { projectId: project.project_id, segId: moved?.id ?? null }
-    );
+
+    if (kind === "image") {
+      const newId = findNextClipId(project, "vclip");
+      handleUpdateTracks(
+        (prevTracks) =>
+          prevTracks.map((tr) => {
+            if (tr.kind !== "video" || tr.id !== trackId || tr.locked) return tr;
+            const clip: VisualClip = {
+              id: newId,
+              asset_id: assetId,
+              kind: "image",
+              start_sec: Math.max(0, Number(startSec.toFixed(3))),
+              duration_sec: 3.0,
+              media_in: 0,
+              media_out: null,
+              speed: 1.0,
+              end_behavior: "freeze",
+              volume: 1.0,
+              audio_fade_in_sec: 0,
+              audio_fade_out_sec: 0,
+              transform: { x: 0.5, y: 0.5, scale: 1.0, rotation_deg: 0, opacity: 1.0 },
+              transition_in: { type: "none", duration_sec: 0 },
+              transition_out: { type: "none", duration_sec: 0 },
+            };
+            return {
+              ...tr,
+              clips: [...tr.clips, clip].sort((a, b) => a.start_sec - b.start_sec),
+            };
+          }),
+        { label: `Add image overlay ${newId}` },
+        { type: "video-clip", trackId, clipId: newId }
+      );
+      setMonitorMode("timeline");
+      return;
+    }
+
+    const dur = Math.max(0.2, Number((meta?.duration || 3.0).toFixed(3)));
+    handleAddSourceClip(assetId, 0, dur, startSec, trackId);
   };
 
-  const handleSplitSegment = (segId: string, localTime: number) => {
+  const handleAddAssetAtPlayhead = (asset: MediaAssetRef) => {
     if (!project) return;
-    const idx = project.segments.findIndex((s) => s.id === segId);
-    if (idx < 0) return;
-    const seg = project.segments[idx];
-    const existing = new Set(project.segments.map((s) => s.id));
-    let n = project.segments.length + 1;
-    while (existing.has(`seg_${String(n).padStart(2, "0")}`)) n += 1;
-    const newId = `seg_${String(n).padStart(2, "0")}`;
+    const tracks = ensureDefaultTracks(project);
 
-    const srcW = manifest?.source_metadata?.width ?? 1920;
-    const srcH = manifest?.source_metadata?.height ?? 1080;
-    const split = splitSegmentAt(
-      seg,
-      localTime,
-      newId,
-      srcW,
-      srcH,
-      project.output_settings.width,
-      project.output_settings.height
-    );
-    if (!split) return;
-    const [firstSeg, secondSeg] = split;
-    handleUpdateProject(
-      (prev) => {
-        const next = [...prev.segments];
-        next.splice(idx, 1, firstSeg, secondSeg);
-        return { ...prev, segments: next };
-      },
-      { label: `Split clip ${segId}` },
-      { selectedSegId: secondSeg.id, selection: { type: "video", segId: secondSeg.id } }
-    );
-    usageLogger.logActionOutput(
-      "Split clip at playhead",
-      "segment.split",
-      { seg_id: segId, new_seg_id: secondSeg.id, local_time: localTime },
-      { projectId: project.project_id, segId: secondSeg.id }
-    );
+    if (asset.kind === "audio") {
+      const existingA = tracks.find((t): t is AudioTrack => t.kind === "audio" && !t.locked);
+      if (existingA) {
+        const meta = manifest?.media_metadata?.[asset.asset_id];
+        const start = findNonOverlappingStart(
+          existingA.clips,
+          projectTime,
+          meta?.duration || 3.0
+        );
+        handlePlaceAssetOnTrack(asset.asset_id, "audio", existingA.id, start);
+      } else {
+        const newTid = findNextTrackId(project, "a");
+        const meta = manifest?.media_metadata?.[asset.asset_id];
+        const newCid = findNextClipId(project, "aclip");
+        const newClip: AudioClip = {
+          id: newCid,
+          asset_id: asset.asset_id,
+          start_sec: Math.max(0, Number(projectTime.toFixed(3))),
+          duration_sec: Math.max(0.5, Number((meta?.duration || 3.0).toFixed(3))),
+          media_in: 0,
+          volume: 1.0,
+          speed: 1.0,
+          fade_in_sec: 0,
+          fade_out_sec: 0,
+          loop: false,
+        };
+        handleUpdateTracks(
+          (prev) => [
+            ...prev,
+            {
+              id: newTid,
+              name: `Audio ${prev.filter((t) => t.kind === "audio").length + 1}`,
+              kind: "audio",
+              volume: 1.0,
+              muted: false,
+              solo: false,
+              duck_under_narration: true,
+              locked: false,
+              clips: [newClip],
+            },
+          ],
+          { label: `Add audio track & clip ${newCid}` },
+          { type: "audio-clip", trackId: newTid, clipId: newCid }
+        );
+      }
+      return;
+    }
+
+    if (asset.kind === "image") {
+      // Layer image overlays on an overlay track (!camera_follow) above V1 automatically
+      const overlayTrack = tracks.find(
+        (t): t is VideoTrack => t.kind === "video" && !t.camera_follow && !t.locked
+      );
+      if (overlayTrack) {
+        const start = findNonOverlappingStart(overlayTrack.clips, projectTime, 3.0);
+        handlePlaceAssetOnTrack(asset.asset_id, "image", overlayTrack.id, start);
+      } else {
+        const newTid = findNextTrackId(project, "v");
+        const newCid = findNextClipId(project, "vclip");
+        const newClip: VisualClip = {
+          id: newCid,
+          asset_id: asset.asset_id,
+          kind: "image",
+          start_sec: Math.max(0, Number(projectTime.toFixed(3))),
+          duration_sec: 3.0,
+          media_in: 0,
+          media_out: null,
+          speed: 1.0,
+          end_behavior: "freeze",
+          volume: 1.0,
+          audio_fade_in_sec: 0,
+          audio_fade_out_sec: 0,
+          transform: { x: 0.5, y: 0.5, scale: 0.65, rotation_deg: 0, opacity: 1.0 },
+          transition_in: { type: "none", duration_sec: 0 },
+          transition_out: { type: "none", duration_sec: 0 },
+        };
+        handleUpdateTracks(
+          (prev) => [
+            ...prev,
+            {
+              id: newTid,
+              name: `Overlay ${prev.filter((t) => t.kind === "video").length + 1}`,
+              kind: "video",
+              visible: true,
+              muted: false,
+              locked: false,
+              camera_follow: false,
+              clips: [newClip],
+              transitions: [],
+            },
+          ],
+          { label: `Add image overlay layer ${newCid}` },
+          { type: "video-clip", trackId: newTid, clipId: newCid }
+        );
+        setMonitorMode("timeline");
+      }
+      return;
+    }
+
+    // Video asset
+    const meta =
+      manifest?.media_metadata?.[asset.asset_id] ??
+      (asset.asset_id === project.source_media.media_id ? manifest?.source_metadata : undefined);
+    const dur = Math.max(0.5, Number((meta?.duration || 3.0).toFixed(3)));
+    handleAddSourceClip(asset.asset_id, 0, Math.min(dur, meta?.duration || dur));
   };
 
-  // New Project Media Selection (native OS picker primary, browser file fallback)
+  // New Project Media Selection
   const handleSelectMediaNative = async () => {
-    usageLogger.logIntention("Select gameplay recording", "media.select.native", {});
     setMediaSelectBusy(true);
     setNewProjectError(null);
     try {
@@ -1177,40 +1321,17 @@ export default function App() {
       setSelectedMedia(res);
       if (!newTitle.trim()) {
         const base =
-          res.path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") ||
-          "New Sims Project";
+          res.path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") || "New Sims Project";
         setNewTitle(base);
       }
-      usageLogger.logActionOutput(
-        "Select and validate gameplay recording",
-        "media.select.native",
-        {
-          media_id: res.media_id,
-          width: res.metadata.width,
-          height: res.metadata.height,
-          fps: res.metadata.fps,
-          duration: res.metadata.duration,
-        }
-      );
     } catch (err) {
       const isCancelled =
         err instanceof ApiError &&
         err.status === 400 &&
         err.detail.toLowerCase().includes("cancel");
-      if (isCancelled) {
-        usageLogger.logActionOutput(
-          "Cancelled recording selection",
-          "media.select.cancelled",
-          {}
-        );
-      } else {
+      if (!isCancelled) {
         setNewProjectError(
           err instanceof Error ? err.message : "Media selection failed"
-        );
-        usageLogger.logError(
-          "Select gameplay recording",
-          "media.select_failed",
-          err
         );
       }
     } finally {
@@ -1219,17 +1340,11 @@ export default function App() {
   };
 
   const handleUploadMedia = async (file: File) => {
-    usageLogger.logIntention("Import gameplay recording", "media.upload", {
-      input: { name: file.name, size: file.size, type: file.type },
-    });
     setMediaSelectBusy(true);
     setNewProjectError(null);
     setSelectedMedia(null);
     try {
-      const res = await apiClient.selectMedia({
-        file,
-        copyToProject,
-      });
+      const res = await apiClient.selectMedia({ file, copyToProject });
       setSelectedMedia(res);
       if (!newTitle.trim()) {
         const base =
@@ -1238,24 +1353,8 @@ export default function App() {
           "New Sims Project";
         setNewTitle(base);
       }
-      usageLogger.logActionOutput(
-        "Import and validate gameplay recording",
-        "media.upload",
-        {
-          media_id: res.media_id,
-          width: res.metadata.width,
-          height: res.metadata.height,
-          fps: res.metadata.fps,
-          duration: res.metadata.duration,
-        }
-      );
     } catch (err) {
-      setNewProjectError(
-        err instanceof Error ? err.message : "Media import failed"
-      );
-      usageLogger.logError("Import gameplay recording", "media.upload_failed", err, {
-        input: { name: file.name, size: file.size },
-      });
+      setNewProjectError(err instanceof Error ? err.message : "Media import failed");
     } finally {
       setMediaSelectBusy(false);
     }
@@ -1264,9 +1363,6 @@ export default function App() {
   const handleCreateProject = async () => {
     if (!selectedMedia) return;
     const title = newTitle.trim() || "Untitled Sims Short";
-    usageLogger.logIntention("Create new project", "project.create", {
-      input: { title, media_id: selectedMedia.media_id, copy_to_project: copyToProject },
-    });
     setCreateBusy(true);
     setNewProjectError(null);
     try {
@@ -1280,12 +1376,6 @@ export default function App() {
         const job = await apiClient.getJob(res.job_id);
         setActiveJob(job);
       }
-      usageLogger.logActionOutput(
-        "Create new project",
-        "project.create",
-        { project_id: pid, title, job_id: res.job_id },
-        { projectId: pid ?? null, jobId: res.job_id ?? null }
-      );
       setNewProjectOpen(false);
       setSelectedMedia(null);
       setNewProjectError(null);
@@ -1298,9 +1388,6 @@ export default function App() {
       setNewProjectError(
         err instanceof Error ? err.message : "Failed to create project"
       );
-      usageLogger.logError("Create new project", "project.create_failed", err, {
-        input: { title },
-      });
     } finally {
       setCreateBusy(false);
     }
@@ -1308,10 +1395,6 @@ export default function App() {
 
   const handleRelink = async (mode: "native" | "path" | "file") => {
     if (!project) return;
-    usageLogger.logIntention("Relink missing source media", "source.relink", {
-      projectId: project.project_id,
-      input: { mode },
-    });
     setRelinkBusy(true);
     setBannerError(null);
     try {
@@ -1324,27 +1407,11 @@ export default function App() {
         const job = await apiClient.getJob(res.job_id);
         setActiveJob(job);
       }
-      usageLogger.logActionOutput(
-        "Relink source media",
-        "source.relink",
-        {
-          status: res.source_status?.status,
-          path: res.project.source_media.path,
-          job_id: res.job_id,
-        },
-        { projectId: project.project_id, jobId: res.job_id ?? null }
-      );
       setRelinkOpen(false);
       setRelinkPath("");
       setRelinkFile(null);
     } catch (err) {
-      setBannerError(
-        err instanceof Error ? err.message : "Source relink failed"
-      );
-      usageLogger.logError("Relink source media", "source.relink_failed", err, {
-        projectId: project.project_id,
-        input: { mode },
-      });
+      setBannerError(err instanceof Error ? err.message : "Source relink failed");
     } finally {
       setRelinkBusy(false);
     }
@@ -1369,6 +1436,7 @@ export default function App() {
     ? historyState.past[historyState.past.length - 1].label
     : null;
   const nextRedoLabel = canRedo ? historyState.future[0].label : null;
+  const hasTimelineContent = totalProjectDuration > 0;
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#0f1115] text-zinc-100">
@@ -1571,12 +1639,17 @@ export default function App() {
 
               <button
                 type="button"
-                disabled={isJobBusy || project.segments.length === 0}
+                disabled={isJobBusy || !hasTimelineContent}
                 onClick={handleExport}
                 className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Download className="h-3.5 w-3.5" />
-                Export {formatAspectRatio(project.output_settings.width, project.output_settings.height)} MP4
+                Export{" "}
+                {formatAspectRatio(
+                  project.output_settings.width,
+                  project.output_settings.height
+                )}{" "}
+                MP4
               </button>
             </>
           )}
@@ -1639,7 +1712,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Three-Zone Studio Workspace */}
+      {/* Main Three-Zone Multi-Track NLE Workspace */}
       {!project || !manifest ? (
         <main className="flex flex-1 flex-col items-center justify-center gap-4 p-6 text-center">
           <Film className="h-12 w-12 text-zinc-600" />
@@ -1648,9 +1721,8 @@ export default function App() {
               No Project Loaded
             </h1>
             <p className="max-w-md text-xs text-zinc-400">
-              Import a gameplay recording of any aspect ratio to start slicing
-              segments, animating crop keyframes, and synthesizing offline
-              Kokoro voiceovers.
+              Import gameplay recordings, overlay images, audio tracks, and edit
+              decoupled captions &amp; camera keyframes across multi-layer tracks.
             </p>
           </div>
           <button
@@ -1664,146 +1736,89 @@ export default function App() {
         </main>
       ) : (
         <main className="flex min-h-0 flex-1 flex-col gap-3 p-3 overflow-hidden">
-          {/* Upper Stage + Inspector */}
+          {/* Upper Zone: Media Bin + Stage Compositor + Contextual Inspector */}
           <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
-            {(() => {
-              const stageSeg =
-                monitorMode === "timeline"
-                  ? resolvedProjectTime.clip?.seg ?? selectedSegment
-                  : selectedSegment;
-              const stageSourceTime =
-                monitorMode === "timeline" && resolvedProjectTime.clip
-                  ? resolvedProjectTime.sourceTime
-                  : sourceTime;
-              const stageSegTime =
-                monitorMode === "timeline" && resolvedProjectTime.clip
-                  ? resolvedProjectTime.localTime
-                  : stageSeg
-                    ? Math.max(0, sourceTime - stageSeg.video_in)
-                    : 0;
-              const selectedClipLayout = selectedSegment
-                ? timelineLayout.clips.find((c) => c.seg.id === selectedSegment.id) ?? null
-                : null;
-              const canSplitSelected = Boolean(
-                resolvedProjectTime.clip &&
-                  resolvedProjectTime.localTime > 0.15 &&
-                  resolvedProjectTime.localTime <
-                    resolvedProjectTime.clip.plan.rawVideoDur - 0.15
-              );
+            <MediaBin
+              project={project}
+              manifest={manifest}
+              nativePickerSupported={capabilities?.native_picker_supported}
+              importBusy={assetImportBusy}
+              importError={assetImportError}
+              previewAssetId={previewAssetId}
+              onImportAsset={handleImportAsset}
+              onDeleteAsset={handleDeleteAsset}
+              onAddAssetAtPlayhead={handleAddAssetAtPlayhead}
+              onPreviewVideoAsset={(assetId) => {
+                setPreviewAssetId(assetId);
+                setMonitorMode("source");
+                setSourceTime(0);
+                setIsProjectPlaying(false);
+                setIsPlaying(false);
+              }}
+            />
 
-              return (
-                <>
-                  <CropCanvas
-                    projectId={project.project_id}
-                    segment={stageSeg}
-                    manifest={manifest}
-                    captionSettings={project.caption_settings}
-                    outputWidth={project.output_settings.width}
-                    outputHeight={project.output_settings.height}
-                    tailPaddingSec={project.output_settings.tail_padding_sec}
-                    sourceTime={stageSourceTime}
-                    segTime={stageSegTime}
-                    projectTime={projectTime}
-                    cameraKeyframes={project.camera_keyframes ?? []}
-                    isPlaying={isPlaying}
-                    isProjectPlaying={isProjectPlaying}
-                    preparingPlayback={preparingPlayback}
-                    monitorMode={monitorMode}
-                    onTogglePlay={handleTogglePlay}
-                    onSourceTimeChange={(t) => {
-                      setSourceTime(t);
-                    }}
-                    onUpdateSegment={handleUpdateSegment}
-                    onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
-                    onBeginHistoryTransaction={handleBeginHistoryTransaction}
-                    onEndHistoryTransaction={handleEndHistoryTransaction}
-                    onRenderPreview={handleRenderPreview}
-                    canPreview={project.segments.length > 0}
-                    previewBusy={
-                      Boolean(isJobBusy && activeJob?.job_type === "preview")
-                    }
-                    previewModalOpen={previewModalOpen}
-                    onSetPreviewModalOpen={setPreviewModalOpen}
-                  />
+            <CropCanvas
+              project={project}
+              manifest={manifest}
+              selection={selection}
+              projectTime={projectTime}
+              sourceTime={sourceTime}
+              monitorMode={monitorMode}
+              previewAssetId={previewAssetId}
+              isPlaying={isPlaying}
+              isProjectPlaying={isProjectPlaying}
+              preparingPlayback={preparingPlayback}
+              canPreview={hasTimelineContent}
+              previewBusy={Boolean(isJobBusy && activeJob?.job_type === "preview")}
+              previewModalOpen={previewModalOpen}
+              onTogglePlay={handleTogglePlay}
+              onSourceTimeChange={(t) => setSourceTime(t)}
+              onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
+              onUpdateTracks={handleUpdateTracks}
+              onBeginHistoryTransaction={handleBeginHistoryTransaction}
+              onEndHistoryTransaction={handleEndHistoryTransaction}
+              onRenderPreview={handleRenderPreview}
+              onSetPreviewModalOpen={setPreviewModalOpen}
+              onSelectItem={setSelection}
+              onSetMonitorMode={(mode) => {
+                setMonitorMode(mode);
+                setIsPlaying(false);
+                setIsProjectPlaying(false);
+              }}
+            />
 
-                  <ContextualInspector
-                    project={project}
-                    manifest={manifest}
-                    selectedSegment={selectedSegment}
-                    clipLayout={selectedClipLayout}
-                    canSplitAtPlayhead={canSplitSelected}
-                    selection={
-                      selection ??
-                      (selectedSegment
-                        ? { type: "video", segId: selectedSegment.id }
-                        : null)
-                    }
-                    voices={capabilities?.voices ?? []}
-                    ttsError={ttsError}
-                    lastSynthesizedSignatures={lastSynthesizedSignatures}
-                    onUpdateProject={handleUpdateProject}
-                    onUpdateSegment={handleUpdateSegment}
-                    onDuplicateSegment={(segId) => {
-                      const idx = project.segments.findIndex((s) => s.id === segId);
-                      if (idx >= 0) handleDuplicateSegment(idx);
-                    }}
-                    onDeleteSegment={(segId) => {
-                      const idx = project.segments.findIndex((s) => s.id === segId);
-                      if (idx >= 0) handleDeleteSegment(idx);
-                    }}
-                    onSplitSegment={() => {
-                      if (canSplitSelected && resolvedProjectTime.clip) {
-                        handleSplitSegment(
-                          resolvedProjectTime.clip.seg.id,
-                          resolvedProjectTime.localTime
-                        );
-                      }
-                    }}
-                    onReorderSegment={handleReorderSegments}
-                    onSelectItem={setSelection}
-                  />
-                </>
-              );
-            })()}
+            <ContextualInspector
+              project={project}
+              manifest={manifest}
+              selection={selection}
+              projectTime={projectTime}
+              voices={capabilities?.voices ?? []}
+              ttsError={ttsError}
+              synthesizingClipId={synthesizingClipId}
+              lastSynthesizedCaptionSignatures={lastSynthesizedCaptionSignatures}
+              onUpdateProject={handleUpdateProject}
+              onUpdateTracks={handleUpdateTracks}
+              onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
+              onSynthesizeCaptionTts={handleSynthesizeCaptionTts}
+              onSelectItem={setSelection}
+            />
           </div>
 
-          {/* Lower Unified Multi-Track NLE Timeline */}
+          {/* Lower Multi-Track Layered NLE Timeline */}
           <Timeline
-            segments={project.segments}
-            cameraKeyframes={project.camera_keyframes ?? []}
+            project={project}
             manifest={manifest}
-            selectedSegId={selectedSegId}
-            selection={
-              selection ??
-              (selectedSegment
-                ? { type: "video", segId: selectedSegment.id }
-                : null)
-            }
-            tailPaddingSec={project.output_settings.tail_padding_sec}
-            outputWidth={project.output_settings.width}
-            outputHeight={project.output_settings.height}
+            selection={selection}
             projectTime={projectTime}
             sourceTime={sourceTime}
+            previewAssetId={previewAssetId}
             isModalOpen={isModalOpen}
             isProjectPlaying={isProjectPlaying}
             preparingPlayback={preparingPlayback}
-            onSelectSegment={(segId) => {
-              setSelectedSegId(segId);
-              setSelection({ type: "video", segId });
-              setMonitorMode("timeline");
-              const res = resolveProjectTime(timelineLayout, projectTime);
-              if (res.clip?.seg.id !== segId) {
-                setProjectTime(toProjectTime(timelineLayout, segId, 0));
-              }
-            }}
             onSelectItem={setSelection}
             onProjectTimeChange={(t) => {
               setMonitorMode("timeline");
               setProjectTime(t);
-              const res = resolveProjectTime(timelineLayout, t);
-              if (res.clip) {
-                setSelectedSegId(res.clip.seg.id);
-              }
             }}
             onSourceTimeChange={(t) => {
               setIsProjectPlaying(false);
@@ -1811,17 +1826,12 @@ export default function App() {
               setMonitorMode("source");
               setSourceTime(t);
             }}
-            onAddSegment={handleAddSegment}
-            onDeleteSegment={(segId) => {
-              const idx = project.segments.findIndex((s) => s.id === segId);
-              if (idx >= 0) handleDeleteSegment(idx);
-            }}
-            onUpdateSegment={handleUpdateSegment}
+            onUpdateTracks={handleUpdateTracks}
             onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
             onBeginHistoryTransaction={handleBeginHistoryTransaction}
             onEndHistoryTransaction={handleEndHistoryTransaction}
-            onReorderSegments={handleReorderSegments}
-            onSplitSegment={handleSplitSegment}
+            onAddSourceClip={handleAddSourceClip}
+            onDropMediaAsset={handlePlaceAssetOnTrack}
             onToggleProjectPlayback={handleToggleProjectPlayback}
           />
         </main>
@@ -2057,7 +2067,8 @@ export default function App() {
           <div className="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-xl border border-zinc-700 bg-[#151821] shadow-2xl">
             <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5">
               <span className="text-sm font-semibold text-zinc-100">
-                Export Ready ({project.output_settings.width}×{project.output_settings.height} MP4)
+                Export Ready ({project.output_settings.width}×
+                {project.output_settings.height} MP4)
               </span>
               <button
                 type="button"

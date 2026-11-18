@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
-from backend.schemas import CaptionSettings, ClauseInput, ClauseTiming
+from backend.schemas import (
+    CaptionAlign,
+    CaptionArtifactState,
+    CaptionSettings,
+    CaptionTrack,
+    ClauseInput,
+    ClauseTiming,
+    TimelineTrack,
+)
 
 
 @dataclass(frozen=True)
@@ -16,6 +24,9 @@ class SubtitleEvent:
     start_sec: float
     end_sec: float
     text: str
+    margin_v: int | None = None
+    font_size: int | None = None
+    align: CaptionAlign | None = None
 
 
 def escape_ass_text(text: str) -> str:
@@ -78,6 +89,47 @@ def build_segment_subtitle_events(
     return events
 
 
+def build_timeline_subtitle_events(
+    tracks: Sequence[TimelineTrack],
+    caption_artifacts: Mapping[str, CaptionArtifactState],
+) -> list[SubtitleEvent]:
+    """Build sorted subtitle events across all visible independent CaptionTracks."""
+    events: list[SubtitleEvent] = []
+    for track in tracks:
+        if not isinstance(track, CaptionTrack) or not track.visible:
+            continue
+        for clip in track.clips:
+            if not clip.display_text.strip():
+                continue
+            dur: float | None = None
+            if not clip.auto_fit_tts and clip.duration_sec is not None and clip.duration_sec > 0.0:
+                dur = clip.duration_sec
+            elif clip.tts_enabled:
+                art = caption_artifacts.get(clip.id)
+                if art is not None and art.audio_duration > 0.0:
+                    dur = art.audio_duration
+            if dur is None:
+                if clip.duration_sec is not None and clip.duration_sec > 0.0:
+                    dur = clip.duration_sec
+                else:
+                    words = max(1, len(clip.display_text.split()))
+                    dur = max(1.2, min(8.0, words * 0.42))
+
+            override = clip.style_override
+            events.append(
+                SubtitleEvent(
+                    start_sec=clip.start_sec,
+                    end_sec=clip.start_sec + dur,
+                    text=clip.display_text,
+                    margin_v=override.margin_v if override is not None else None,
+                    font_size=override.font_size if override is not None else None,
+                    align=override.align if override is not None else None,
+                )
+            )
+    events.sort(key=lambda e: (e.start_sec, e.end_sec))
+    return events
+
+
 def render_ass_content(
     events: Sequence[SubtitleEvent],
     caption_settings: CaptionSettings,
@@ -115,11 +167,20 @@ def render_ass_content(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
+    align_codes: dict[CaptionAlign, int] = {"bottom": 2, "center": 5, "top": 8}
+
     for ev in events:
         start_ts = format_ass_timestamp(ev.start_sec)
         end_ts = format_ass_timestamp(ev.end_sec)
         text = escape_ass_text(ev.text)
-        lines.append(f"Dialogue: 0,{start_ts},{end_ts},Default,,0,0,0,,{text}")
+        override_tags: list[str] = []
+        if ev.align is not None and ev.align in align_codes:
+            override_tags.append(f"\\an{align_codes[ev.align]}")
+        if ev.font_size is not None and ev.font_size > 0:
+            override_tags.append(f"\\fs{ev.font_size}")
+        prefix = "{" + "".join(override_tags) + "}" if override_tags else ""
+        margin_v_col = ev.margin_v if ev.margin_v is not None else 0
+        lines.append(f"Dialogue: 0,{start_ts},{end_ts},Default,,0,0,{margin_v_col},,{prefix}{text}")
 
     lines.append("")
     return "\n".join(lines)

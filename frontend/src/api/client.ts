@@ -3,6 +3,8 @@ import type {
   Capabilities,
   JobAccepted,
   JobState,
+  MediaAssetImportResult,
+  MediaAssetKind,
   MediaSelectResult,
   ProjectBundle,
   ProjectInput,
@@ -228,11 +230,68 @@ export const apiClient = {
     );
   },
 
+  importProjectAsset(
+    projectId: string,
+    options?: {
+      path?: string;
+      file?: File;
+      kind?: MediaAssetKind;
+      name?: string;
+      copyToProject?: boolean;
+    }
+  ): Promise<MediaAssetImportResult> {
+    if (options?.file) {
+      const form = new FormData();
+      form.append("file", options.file);
+      if (options.kind) {
+        form.append("kind", options.kind);
+      }
+      if (options.name) {
+        form.append("name", options.name);
+      }
+      if (options.copyToProject !== undefined) {
+        form.append("copy_to_project", String(options.copyToProject));
+      }
+      return request(`/api/projects/${encodeURIComponent(projectId)}/assets`, {
+        method: "POST",
+        body: form,
+      });
+    }
+    const body: Record<string, unknown> = {};
+    if (options?.path) body.path = options.path;
+    if (options?.kind) body.kind = options.kind;
+    if (options?.name) body.name = options.name;
+    if (options?.copyToProject !== undefined) {
+      body.copy_to_project = options.copyToProject;
+    }
+    return request(`/api/projects/${encodeURIComponent(projectId)}/assets`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+
+  deleteProjectAsset(projectId: string, assetId: string): Promise<ProjectBundle> {
+    return request(
+      `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`,
+      { method: "DELETE" }
+    );
+  },
+
   synthesizeTts(projectId: string, segId: string): Promise<JobAccepted> {
     return request(
       `/api/projects/${encodeURIComponent(projectId)}/segments/${encodeURIComponent(segId)}/tts`,
       { method: "POST" }
     );
+  },
+
+  synthesizeProjectTts(
+    projectId: string,
+    clipIds?: string[]
+  ): Promise<JobAccepted & { target_clip_ids?: string[] }> {
+    return request(`/api/projects/${encodeURIComponent(projectId)}/tts`, {
+      method: "POST",
+      body: clipIds ? JSON.stringify({ clip_ids: clipIds }) : undefined,
+    });
   },
 
   renderPreview(projectId: string): Promise<JobAccepted> {
