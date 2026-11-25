@@ -1,0 +1,105 @@
+name: Build & Release Windows App
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync Python dependencies and install packaging tools
+        run: |
+          uv sync --frozen
+          uv pip install pyinstaller pywebview
+
+      - name: Pre-fetch Windows FFmpeg binaries for bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path packaging\bin | Out-Null
+          uv run python -c "import shutil; from pathlib import Path; from static_ffmpeg.run import get_or_fetch_platform_executables_else_raise; ff, fp = get_or_fetch_platform_executables_else_raise(); shutil.copy2(ff, Path('packaging/bin/ffmpeg.exe')); shutil.copy2(fp, Path('packaging/bin/ffprobe.exe')); print('Bundled:', ff, fp)"
+
+      - name: Build native Windows executable with PyInstaller
+        run: |
+          uv run pyinstaller --noconfirm --clean packaging/sims_studio.spec
+
+      - name: Build Windows installer with Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $candidate = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+            if (Test-Path $candidate) {
+              $iscc = $candidate
+            } else {
+              choco install innosetup -y --no-progress
+              $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+            }
+          } else {
+            $iscc = $iscc.Source
+          }
+          $ver = "0.1.${{ github.run_number }}"
+          & $iscc "/DAppVersion=$ver" packaging\installer.iss
+
+      - name: Prepare release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $tag = "build-${{ github.run_number }}-$shortSha"
+          $commitTitle = (git log -1 --pretty=%s)
+          "short_sha=$shortSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "commit_title=$commitTitle" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "Windows Build #${{ github.run_number }} (${{ steps.meta.outputs.short_sha }})"
+          body: |
+            Automated Windows native desktop build for commit `${{ github.sha }}`.
+
+            **Commit:** ${{ steps.meta.outputs.commit_title }}
+
+            ### Installation
+            1. Download **`SimsVerticalStudio-Setup.exe`** below.
+            2. Run the installer (installs per-user in `%LOCALAPPDATA%\Programs\SimsVerticalStudio` — no admin rights required).
+            3. Launch **Sims 4 Vertical Video Studio** from your Start Menu or Desktop shortcut.
+
+            > **Note:** On first launch, Kokoro TTS voice models (~330 MB) are downloaded automatically into `%LOCALAPPDATA%\SimsVerticalStudio\models`.
+          files: |
+            release-out/SimsVerticalStudio-Setup.exe
+          draft: false
+          prerelease: false

@@ -1,33 +1,45 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  Copy,
   Download,
   Film,
   FolderOpen,
   FolderPlus,
+  Keyboard,
   Link2,
   Loader2,
+  Pencil,
   Redo2,
   RefreshCw,
   Save,
   ScrollText,
+  Trash2,
   Undo2,
   X,
 } from "lucide-react";
 import { ApiError, apiClient } from "./api/client";
 import { ActivityLogModal } from "./components/ActivityLogModal";
+import { BulkScriptModal } from "./components/BulkScriptModal";
 import { ContextualInspector } from "./components/ContextualInspector";
 import { CropCanvas } from "./components/CropCanvas";
+import { ExportConfigModal } from "./components/ExportModal";
 import { JobStatusBar } from "./components/JobStatusBar";
 import { MediaBin } from "./components/MediaBin";
+import { ShortcutModal } from "./components/ShortcutModal";
 import { Timeline } from "./components/Timeline";
+import { ToastContainer, type ToastItem } from "./components/ToastContainer";
 import type {
   ArtifactManifest,
   AudioClip,
   AudioTrack,
   Capabilities,
   CaptionClip,
+  CaptionStyleOverride,
+  CaptionTrack,
+  ClipEdgeTransition,
   CropKeyframe,
+  ExportOptions,
   JobState,
   MediaAssetKind,
   MediaAssetRef,
@@ -36,22 +48,27 @@ import type {
   ProjectInput,
   ProjectSummary,
   SourceStatus,
+  TimelineMarker,
   TimelineSelection,
   TimelineTrack,
   VideoTrack,
   VisualClip,
+  VisualClipColorAdjust,
+  VisualClipTransform,
 } from "./types/studio";
 import {
   clampCropPosition,
   computeCaptionClipTtsSignature,
   computeIdealCrop,
   computeMultiTrackPreviewSignature,
+  computeVisualSourceTime,
   ensureDefaultTracks,
   findNextClipId,
   findNextTrackId,
   formatAspectRatio,
   getProjectDuration,
   migrateProjectToMultiTrack,
+  parseBulkScriptToCaptionClips,
   resolveCaptionClipSpokenText,
 } from "./utils/studioMath";
 import {
@@ -75,6 +92,24 @@ const OUTPUT_ASPECT_PRESETS = [
   { label: "4:5 (1080×1350)", width: 1080, height: 1350 },
   { label: "4:3 (1440×1080)", width: 1440, height: 1080 },
 ] as const;
+
+type CopiedClipPayload =
+  | { kind: "video"; clip: VisualClip }
+  | { kind: "audio"; clip: AudioClip }
+  | { kind: "caption"; clip: CaptionClip };
+
+type CopiedAttributesPayload =
+  | {
+      kind: "video";
+      transform: VisualClipTransform;
+      color_adjust?: VisualClipColorAdjust;
+      transition_in: ClipEdgeTransition;
+      transition_out: ClipEdgeTransition;
+    }
+  | {
+      kind: "caption";
+      style_override?: CaptionStyleOverride | null;
+    };
 
 function pickValidSelection(
   prevSel: TimelineSelection,
@@ -184,6 +219,7 @@ export default function App() {
 
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [autoSaveEnabled, setAutoSaveEnabled] = useState(true);
   const [bannerError, setBannerError] = useState<string | null>(null);
   const [revisionConflict, setRevisionConflict] = useState(false);
 
@@ -194,6 +230,10 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isProjectPlaying, setIsProjectPlaying] = useState(false);
   const [preparingPlayback, setPreparingPlayback] = useState(false);
+  const [loopPlayback, setLoopPlayback] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [masterVolume, setMasterVolume] = useState(1.0);
+  const [masterMuted, setMasterMuted] = useState(false);
 
   const [activeJob, setActiveJob] = useState<JobState | null>(null);
   const [ttsError, setTtsError] = useState<string | null>(null);
@@ -204,6 +244,12 @@ export default function App() {
     lastRenderedProjectPreviewSignature,
     setLastRenderedProjectPreviewSignature,
   ] = useState<string | null>(null);
+
+  // Clipboard & Toasts
+  const [copiedClip, setCopiedClip] = useState<CopiedClipPayload | null>(null);
+  const [copiedAttributes, setCopiedAttributes] =
+    useState<CopiedAttributesPayload | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   // Asset Bin state
   const [assetImportBusy, setAssetImportBusy] = useState(false);
@@ -226,6 +272,9 @@ export default function App() {
 
   const [previewModalOpen, setPreviewModalOpen] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [exportConfigOpen, setExportConfigOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [bulkScriptOpen, setBulkScriptOpen] = useState(false);
   const [logModalOpen, setLogModalOpen] = useState(false);
   const [customResolutionMode, setCustomResolutionMode] = useState(false);
 
@@ -241,6 +290,17 @@ export default function App() {
   manifestRef.current = manifest;
   const selectionRef = useRef<TimelineSelection>(null);
   selectionRef.current = selection;
+
+  const pushToast = useCallback(
+    (message: string, kind: ToastItem["kind"] = "info") => {
+      const id = `t_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      setToasts((prev) => [...prev.slice(-3), { id, message, kind }]);
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, 2800);
+    },
+    []
+  );
 
   useEffect(() => {
     usageLogger.init(() => ({
@@ -491,13 +551,16 @@ export default function App() {
     let lastTick = performance.now();
     const timer = window.setInterval(() => {
       const now = performance.now();
-      const dt = (now - lastTick) / 1000;
+      const dt = ((now - lastTick) / 1000) * playbackRate;
       lastTick = now;
 
       setProjectTime((prev) => {
         const startFrom = prev >= totalProjectDuration - 0.02 ? 0 : prev;
         const next = startFrom + dt;
         if (next >= totalProjectDuration) {
+          if (loopPlayback) {
+            return 0;
+          }
           setIsProjectPlaying(false);
           setIsPlaying(false);
           return totalProjectDuration;
@@ -507,7 +570,7 @@ export default function App() {
     }, 33);
 
     return () => window.clearInterval(timer);
-  }, [isProjectPlaying, project, manifest, totalProjectDuration]);
+  }, [isProjectPlaying, project, manifest, totalProjectDuration, playbackRate, loopPlayback]);
 
   const isModalOpenRef = useRef(false);
 
@@ -898,17 +961,544 @@ export default function App() {
     }
   };
 
-  const handleExport = async () => {
+  const handleExport = async (options?: ExportOptions) => {
     if (!project || totalProjectDuration <= 0) return;
     usageLogger.logIntention("Export final MP4", "export.render");
     const saved = await ensureSavedBeforeJob();
     if (!saved) return;
     try {
-      const res = await apiClient.exportProject(saved.project_id);
+      const res = await apiClient.exportProject(saved.project_id, options);
       const job = await apiClient.getJob(res.job_id);
       setActiveJob(job);
+      pushToast("Export started", "info");
     } catch (err) {
       setBannerError(err instanceof Error ? err.message : "Failed to start export");
+    }
+  };
+
+  // Debounced Auto-Save (~1.5s idle) when enabled; attempt at most once per project state to avoid error loops
+  const lastAutoSaveProjectRef = useRef<ProjectInput | null>(null);
+  useEffect(() => {
+    if (!autoSaveEnabled || !dirty || saving || revisionConflict || !project) return;
+    if (lastAutoSaveProjectRef.current === project) return;
+    if (activeJob && (activeJob.status === "queued" || activeJob.status === "running")) {
+      return;
+    }
+    const targetProject = project;
+    const timer = window.setTimeout(() => {
+      lastAutoSaveProjectRef.current = targetProject;
+      void handleSave();
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [autoSaveEnabled, dirty, saving, revisionConflict, project, activeJob]);
+
+  // Warn before closing tab with unsaved changes
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+
+  const handleUpdateMarkers = useCallback(
+    (markers: TimelineMarker[], meta?: UpdateMeta) => {
+      handleUpdateProject(
+        (prev) => ({ ...prev, markers }),
+        meta ?? { label: "Edit timeline markers" }
+      );
+    },
+    [handleUpdateProject]
+  );
+
+  // Copy / Paste / Duplicate Clips & Attributes
+  const handleCopySelectedClip = useCallback(() => {
+    const cur = projectRef.current;
+    const sel = selectionRef.current;
+    if (!cur || !sel) return;
+    const tracks = cur.tracks ?? [];
+    if (sel.type === "video-clip") {
+      const tr = tracks.find((t): t is VideoTrack => t.kind === "video" && t.id === sel.trackId);
+      const clip = tr?.clips.find((c) => c.id === sel.clipId);
+      if (clip) {
+        setCopiedClip({ kind: "video", clip: structuredClone(clip) });
+        pushToast(`Copied clip ${clip.id}`, "info");
+      }
+    } else if (sel.type === "audio-clip") {
+      const tr = tracks.find((t): t is AudioTrack => t.kind === "audio" && t.id === sel.trackId);
+      const clip = tr?.clips.find((c) => c.id === sel.clipId);
+      if (clip) {
+        setCopiedClip({ kind: "audio", clip: structuredClone(clip) });
+        pushToast(`Copied audio ${clip.id}`, "info");
+      }
+    } else if (sel.type === "caption-clip") {
+      const tr = tracks.find((t): t is CaptionTrack => t.kind === "caption" && t.id === sel.trackId);
+      const clip = tr?.clips.find((c) => c.id === sel.clipId);
+      if (clip) {
+        setCopiedClip({ kind: "caption", clip: structuredClone(clip) });
+        pushToast(`Copied caption ${clip.id}`, "info");
+      }
+    }
+  }, [pushToast]);
+
+  const handlePasteClipAtPlayhead = useCallback(() => {
+    const cur = projectRef.current;
+    if (!cur || !copiedClip) return;
+    const tracks = ensureDefaultTracks(cur);
+    const startSec = Number(Math.max(0, projectTime).toFixed(3));
+
+    if (copiedClip.kind === "video") {
+      const targetTr = tracks.find((t): t is VideoTrack => t.kind === "video" && !t.locked);
+      if (!targetTr) return;
+      const newId = findNextClipId(cur, "vclip");
+      const pasted: VisualClip = {
+        ...structuredClone(copiedClip.clip),
+        id: newId,
+        start_sec: startSec,
+      };
+      handleUpdateTracks(
+        (prev) =>
+          prev.map((tr) =>
+            tr.kind === "video" && tr.id === targetTr.id
+              ? { ...tr, clips: [...tr.clips, pasted].sort((a, b) => a.start_sec - b.start_sec) }
+              : tr
+          ),
+        { label: `Paste clip ${newId}` },
+        { type: "video-clip", trackId: targetTr.id, clipId: newId }
+      );
+      pushToast(`Pasted clip ${newId}`, "success");
+    } else if (copiedClip.kind === "audio") {
+      const targetTr = tracks.find((t): t is AudioTrack => t.kind === "audio" && !t.locked);
+      if (!targetTr) return;
+      const newId = findNextClipId(cur, "aclip");
+      const pasted: AudioClip = {
+        ...structuredClone(copiedClip.clip),
+        id: newId,
+        start_sec: startSec,
+      };
+      handleUpdateTracks(
+        (prev) =>
+          prev.map((tr) =>
+            tr.kind === "audio" && tr.id === targetTr.id
+              ? { ...tr, clips: [...tr.clips, pasted].sort((a, b) => a.start_sec - b.start_sec) }
+              : tr
+          ),
+        { label: `Paste audio ${newId}` },
+        { type: "audio-clip", trackId: targetTr.id, clipId: newId }
+      );
+      pushToast(`Pasted audio ${newId}`, "success");
+    } else {
+      const targetTr = tracks.find((t): t is CaptionTrack => t.kind === "caption" && !t.locked);
+      if (!targetTr) return;
+      const newId = findNextClipId(cur, "cap");
+      const pasted: CaptionClip = {
+        ...structuredClone(copiedClip.clip),
+        id: newId,
+        start_sec: startSec,
+      };
+      handleUpdateTracks(
+        (prev) =>
+          prev.map((tr) =>
+            tr.kind === "caption" && tr.id === targetTr.id
+              ? { ...tr, clips: [...tr.clips, pasted].sort((a, b) => a.start_sec - b.start_sec) }
+              : tr
+          ),
+        { label: `Paste caption ${newId}` },
+        { type: "caption-clip", trackId: targetTr.id, clipId: newId }
+      );
+      pushToast(`Pasted caption ${newId}`, "success");
+    }
+  }, [copiedClip, projectTime, handleUpdateTracks, pushToast]);
+
+  const handleDuplicateSelectedClip = useCallback(() => {
+    const cur = projectRef.current;
+    const sel = selectionRef.current;
+    if (!cur || !sel) return;
+    const tracks = cur.tracks ?? [];
+    if (sel.type === "video-clip") {
+      const tr = tracks.find((t): t is VideoTrack => t.kind === "video" && t.id === sel.trackId);
+      const clip = tr?.clips.find((c) => c.id === sel.clipId);
+      if (!tr || tr.locked || !clip) return;
+      const newId = findNextClipId(cur, "vclip");
+      const clone: VisualClip = {
+        ...structuredClone(clip),
+        id: newId,
+        start_sec: Number((clip.start_sec + clip.duration_sec).toFixed(3)),
+      };
+      handleUpdateTracks(
+        (prev) =>
+          prev.map((t) =>
+            t.kind === "video" && t.id === tr.id
+              ? { ...t, clips: [...t.clips, clone].sort((a, b) => a.start_sec - b.start_sec) }
+              : t
+          ),
+        { label: `Duplicate clip ${clip.id}` },
+        { type: "video-clip", trackId: tr.id, clipId: newId }
+      );
+      pushToast(`Duplicated ${clip.id}`, "info");
+    } else if (sel.type === "audio-clip") {
+      const tr = tracks.find((t): t is AudioTrack => t.kind === "audio" && t.id === sel.trackId);
+      const clip = tr?.clips.find((c) => c.id === sel.clipId);
+      if (!tr || tr.locked || !clip) return;
+      const newId = findNextClipId(cur, "aclip");
+      const clone: AudioClip = {
+        ...structuredClone(clip),
+        id: newId,
+        start_sec: Number((clip.start_sec + clip.duration_sec).toFixed(3)),
+      };
+      handleUpdateTracks(
+        (prev) =>
+          prev.map((t) =>
+            t.kind === "audio" && t.id === tr.id
+              ? { ...t, clips: [...t.clips, clone].sort((a, b) => a.start_sec - b.start_sec) }
+              : t
+          ),
+        { label: `Duplicate audio ${clip.id}` },
+        { type: "audio-clip", trackId: tr.id, clipId: newId }
+      );
+      pushToast(`Duplicated ${clip.id}`, "info");
+    } else if (sel.type === "caption-clip") {
+      const tr = tracks.find((t): t is CaptionTrack => t.kind === "caption" && t.id === sel.trackId);
+      const clip = tr?.clips.find((c) => c.id === sel.clipId);
+      if (!tr || tr.locked || !clip) return;
+      const newId = findNextClipId(cur, "cap");
+      const clone: CaptionClip = {
+        ...structuredClone(clip),
+        id: newId,
+        start_sec: Number((clip.start_sec + (clip.duration_sec ?? 2.0)).toFixed(3)),
+      };
+      handleUpdateTracks(
+        (prev) =>
+          prev.map((t) =>
+            t.kind === "caption" && t.id === tr.id
+              ? { ...t, clips: [...t.clips, clone].sort((a, b) => a.start_sec - b.start_sec) }
+              : t
+          ),
+        { label: `Duplicate caption ${clip.id}` },
+        { type: "caption-clip", trackId: tr.id, clipId: newId }
+      );
+      pushToast(`Duplicated ${clip.id}`, "info");
+    }
+  }, [handleUpdateTracks, pushToast]);
+
+  const handleCopyAttributes = useCallback(() => {
+    const cur = projectRef.current;
+    const sel = selectionRef.current;
+    if (!cur || !sel) return;
+    const tracks = cur.tracks ?? [];
+    if (sel.type === "video-clip") {
+      const tr = tracks.find((t): t is VideoTrack => t.kind === "video" && t.id === sel.trackId);
+      const clip = tr?.clips.find((c) => c.id === sel.clipId);
+      if (!clip) return;
+      setCopiedAttributes({
+        kind: "video",
+        transform: structuredClone(clip.transform),
+        color_adjust: clip.color_adjust ? structuredClone(clip.color_adjust) : undefined,
+        transition_in: structuredClone(clip.transition_in),
+        transition_out: structuredClone(clip.transition_out),
+      });
+      pushToast("Copied visual attributes", "info");
+    } else if (sel.type === "caption-clip") {
+      const tr = tracks.find((t): t is CaptionTrack => t.kind === "caption" && t.id === sel.trackId);
+      const clip = tr?.clips.find((c) => c.id === sel.clipId);
+      if (!clip) return;
+      setCopiedAttributes({
+        kind: "caption",
+        style_override: clip.style_override ? structuredClone(clip.style_override) : null,
+      });
+      pushToast("Copied caption style attributes", "info");
+    }
+  }, [pushToast]);
+
+  const handlePasteAttributes = useCallback(() => {
+    const sel = selectionRef.current;
+    if (!sel || !copiedAttributes) return;
+    if (sel.type === "video-clip" && copiedAttributes.kind === "video") {
+      handleUpdateTracks(
+        (prev) =>
+          prev.map((tr) =>
+            tr.kind === "video" && tr.id === sel.trackId
+              ? {
+                  ...tr,
+                  clips: tr.clips.map((c) =>
+                    c.id === sel.clipId
+                      ? {
+                          ...c,
+                          transform: structuredClone(copiedAttributes.transform),
+                          color_adjust: copiedAttributes.color_adjust
+                            ? structuredClone(copiedAttributes.color_adjust)
+                            : c.color_adjust,
+                          transition_in: structuredClone(copiedAttributes.transition_in),
+                          transition_out: structuredClone(copiedAttributes.transition_out),
+                        }
+                      : c
+                  ),
+                }
+              : tr
+          ),
+        { label: `Paste attributes onto ${sel.clipId}` }
+      );
+      pushToast("Pasted visual attributes", "success");
+    } else if (sel.type === "caption-clip" && copiedAttributes.kind === "caption") {
+      handleUpdateTracks(
+        (prev) =>
+          prev.map((tr) =>
+            tr.kind === "caption" && tr.id === sel.trackId
+              ? {
+                  ...tr,
+                  clips: tr.clips.map((c) =>
+                    c.id === sel.clipId
+                      ? {
+                          ...c,
+                          style_override: copiedAttributes.style_override
+                            ? structuredClone(copiedAttributes.style_override)
+                            : null,
+                        }
+                      : c
+                  ),
+                }
+              : tr
+          ),
+        { label: `Paste caption style onto ${sel.clipId}` }
+      );
+      pushToast("Pasted caption style", "success");
+    }
+  }, [copiedAttributes, handleUpdateTracks, pushToast]);
+
+  const handleDetachAudio = useCallback(
+    (trackId: string, clipId: string) => {
+      const cur = projectRef.current;
+      if (!cur) return;
+      const tracks = ensureDefaultTracks(cur);
+      const vTrack = tracks.find((t): t is VideoTrack => t.kind === "video" && t.id === trackId);
+      const clip = vTrack?.clips.find((c) => c.id === clipId);
+      if (!vTrack || !clip || clip.kind !== "video") return;
+
+      const existingAudioTrack = tracks.find(
+        (t): t is AudioTrack => t.kind === "audio" && !t.locked
+      );
+      const newAudioClipId = findNextClipId(cur, "aclip");
+      const audioClip: AudioClip = {
+        id: newAudioClipId,
+        asset_id: clip.asset_id,
+        start_sec: clip.start_sec,
+        duration_sec: clip.duration_sec,
+        media_in: clip.media_in,
+        volume: Math.max(0.15, clip.volume || 1.0),
+        speed: clip.speed,
+        fade_in_sec: clip.audio_fade_in_sec,
+        fade_out_sec: clip.audio_fade_out_sec,
+        loop: false,
+      };
+      const targetAudioTrackId = existingAudioTrack?.id ?? findNextTrackId(cur, "a");
+
+      handleUpdateTracks(
+        (prev) => {
+          const mutedTracks = prev.map((tr) =>
+            tr.kind === "video" && tr.id === trackId
+              ? {
+                  ...tr,
+                  clips: tr.clips.map((c) => (c.id === clipId ? { ...c, volume: 0 } : c)),
+                }
+              : tr
+          );
+          if (existingAudioTrack) {
+            return mutedTracks.map((tr) =>
+              tr.kind === "audio" && tr.id === existingAudioTrack.id
+                ? {
+                    ...tr,
+                    clips: [...tr.clips, audioClip].sort((a, b) => a.start_sec - b.start_sec),
+                  }
+                : tr
+            );
+          }
+          return [
+            ...mutedTracks,
+            {
+              id: targetAudioTrackId,
+              name: `Audio ${mutedTracks.filter((t) => t.kind === "audio").length + 1}`,
+              kind: "audio" as const,
+              volume: 1.0,
+              muted: false,
+              solo: false,
+              duck_under_narration: false,
+              locked: false,
+              clips: [audioClip],
+            },
+          ];
+        },
+        { label: `Detach audio from ${clipId}` },
+        { type: "audio-clip", trackId: targetAudioTrackId, clipId: newAudioClipId }
+      );
+      pushToast(`Detached audio to ${newAudioClipId}`, "success");
+    },
+    [handleUpdateTracks, pushToast]
+  );
+
+  const handleFreezeFrame = useCallback(
+    (trackId: string, clipId: string) => {
+      const cur = projectRef.current;
+      const curMan = manifestRef.current;
+      if (!cur) return;
+      const tracks = ensureDefaultTracks(cur);
+      const vTrack = tracks.find((t): t is VideoTrack => t.kind === "video" && t.id === trackId);
+      const clip = vTrack?.clips.find((c) => c.id === clipId);
+      if (!vTrack || vTrack.locked || !clip || clip.kind !== "video") return;
+
+      const meta =
+        curMan?.media_metadata?.[clip.asset_id] ??
+        (clip.asset_id === cur.source_media.media_id ? curMan?.source_metadata : undefined);
+      const srcState = computeVisualSourceTime(clip, projectTime, meta?.duration ?? 60);
+      const freezeT = Number(Math.max(0, srcState.sourceTime).toFixed(3));
+      const newId = findNextClipId(cur, "vclip");
+      const freezeClip: VisualClip = {
+        ...structuredClone(clip),
+        id: newId,
+        start_sec: Number(Math.max(0, projectTime).toFixed(3)),
+        duration_sec: 2.0,
+        media_in: freezeT,
+        media_out: Number((freezeT + 0.04).toFixed(3)),
+        end_behavior: "freeze",
+        volume: 0,
+      };
+      handleUpdateTracks(
+        (prev) =>
+          prev.map((tr) =>
+            tr.kind === "video" && tr.id === trackId
+              ? {
+                  ...tr,
+                  clips: [...tr.clips, freezeClip].sort((a, b) => a.start_sec - b.start_sec),
+                }
+              : tr
+          ),
+        { label: `Insert freeze frame ${newId}` },
+        { type: "video-clip", trackId, clipId: newId }
+      );
+      pushToast(`Inserted 2.0s freeze frame (${newId})`, "success");
+    },
+    [projectTime, handleUpdateTracks, pushToast]
+  );
+
+  const runCaptionTtsSynthesisRef = useRef(runCaptionTtsSynthesis);
+  runCaptionTtsSynthesisRef.current = runCaptionTtsSynthesis;
+
+  const handleInsertBulkScript = useCallback(
+    async (options: {
+      scriptText: string;
+      startSec: number;
+      ttsEnabled: boolean;
+      speed: number;
+      autoSynthesize: boolean;
+    }) => {
+      const cur = projectRef.current;
+      if (!cur) return;
+      const newClips = parseBulkScriptToCaptionClips(
+        options.scriptText,
+        options.startSec,
+        cur,
+        { ttsEnabled: options.ttsEnabled, speed: options.speed }
+      );
+      if (newClips.length === 0) return;
+
+      const tracks = ensureDefaultTracks(cur);
+      const existingCapTrack = tracks.find(
+        (t): t is CaptionTrack => t.kind === "caption" && !t.locked
+      );
+      const targetTrackId = existingCapTrack?.id ?? findNextTrackId(cur, "t");
+
+      handleUpdateTracks(
+        (prev) => {
+          if (existingCapTrack) {
+            return prev.map((tr) =>
+              tr.kind === "caption" && tr.id === existingCapTrack.id
+                ? {
+                    ...tr,
+                    clips: [...tr.clips, ...newClips].sort(
+                      (a, b) => a.start_sec - b.start_sec
+                    ),
+                  }
+                : tr
+            );
+          }
+          return [
+            ...prev,
+            {
+              id: targetTrackId,
+              name: "Captions 1",
+              kind: "caption" as const,
+              visible: true,
+              muted: false,
+              locked: false,
+              clips: newClips,
+            },
+          ];
+        },
+        { label: `Import script (${newClips.length} captions)` },
+        { type: "caption-clip", trackId: targetTrackId, clipId: newClips[0].id }
+      );
+      pushToast(`Inserted ${newClips.length} caption block(s)`, "success");
+      if (options.ttsEnabled && options.autoSynthesize) {
+        window.setTimeout(() => {
+          void runCaptionTtsSynthesisRef.current(newClips.map((c) => c.id));
+        }, 150);
+      }
+    },
+    [handleUpdateTracks, pushToast]
+  );
+
+  const handleRenameProject = async () => {
+    if (!project) return;
+    const nextTitle = window.prompt("Rename project:", project.title);
+    if (!nextTitle || !nextTitle.trim() || nextTitle.trim() === project.title) return;
+    try {
+      const saved = dirty ? await handleSave() : project;
+      if (!saved) return;
+      const bundle = await apiClient.renameProject(saved.project_id, nextTitle.trim());
+      applyBundle(bundle, { resetHistory: false });
+      await refreshProjectList();
+      pushToast(`Renamed to "${bundle.project.title}"`, "success");
+    } catch (err) {
+      setBannerError(err instanceof Error ? err.message : "Failed to rename project");
+    }
+  };
+
+  const handleDuplicateProject = async () => {
+    if (!project) return;
+    try {
+      const saved = dirty ? await handleSave() : project;
+      if (!saved) return;
+      const bundle = await apiClient.duplicateProject(saved.project_id);
+      await refreshProjectList();
+      applyBundle(bundle);
+      pushToast(`Duplicated as "${bundle.project.title}"`, "success");
+    } catch (err) {
+      setBannerError(err instanceof Error ? err.message : "Failed to duplicate project");
+    }
+  };
+
+  const handleDeleteProject = async () => {
+    if (!project) return;
+    const ok = window.confirm(
+      `Permanently delete project "${project.title}" and its local artifacts?`
+    );
+    if (!ok) return;
+    try {
+      const deletedId = project.project_id;
+      await apiClient.deleteProject(deletedId);
+      const remaining = await refreshProjectList();
+      pushToast(`Deleted "${project.title}"`, "warning");
+      if (remaining.length > 0) {
+        await loadProject(remaining[0].project_id);
+      } else {
+        setProject(null);
+        setManifest(null);
+        setSelection(null);
+        setDirty(false);
+      }
+    } catch (err) {
+      setBannerError(err instanceof Error ? err.message : "Failed to delete project");
     }
   };
 
@@ -1424,6 +2014,9 @@ export default function App() {
     relinkOpen ||
     previewModalOpen ||
     exportModalOpen ||
+    exportConfigOpen ||
+    shortcutsOpen ||
+    bulkScriptOpen ||
     logModalOpen;
   isModalOpenRef.current = isModalOpen;
   const sourceBroken =
@@ -1441,11 +2034,11 @@ export default function App() {
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#0f1115] text-zinc-100">
       {/* Persistent Top Header */}
-      <header className="flex h-13 shrink-0 items-center justify-between gap-3 border-b border-zinc-800 bg-[#13161c] px-4">
-        <div className="flex items-center gap-3">
+      <header className="flex h-13 shrink-0 items-center justify-between gap-2 border-b border-zinc-800 bg-[#13161c] px-4">
+        <div className="flex items-center gap-2">
           <div className="flex items-center gap-2">
             <Film className="h-5 w-5 text-emerald-400" />
-            <span className="text-sm font-bold tracking-tight text-zinc-100">
+            <span className="hidden xl:inline text-sm font-bold tracking-tight text-zinc-100">
               Sims 4 Vertical Video Studio
             </span>
           </div>
@@ -1454,9 +2047,14 @@ export default function App() {
             aria-label="Project Selector"
             value={project?.project_id ?? ""}
             onChange={(e) => {
-              if (e.target.value) loadProject(e.target.value);
+              const targetId = e.target.value;
+              if (!targetId || targetId === project?.project_id) return;
+              if (dirty && !window.confirm("You have unsaved changes. Switch projects anyway?")) {
+                return;
+              }
+              void loadProject(targetId);
             }}
-            className="max-w-[220px] rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-100 focus:border-emerald-500 focus:outline-none"
+            className="max-w-[200px] rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-100 focus:border-emerald-500 focus:outline-none"
           >
             <option value="" disabled>
               Select a project...
@@ -1467,6 +2065,38 @@ export default function App() {
               </option>
             ))}
           </select>
+
+          {project && (
+            <div className="flex items-center gap-0.5">
+              <button
+                type="button"
+                onClick={() => void handleRenameProject()}
+                title="Rename Project"
+                aria-label="Rename Project"
+                className="rounded border border-zinc-700 bg-zinc-800/80 p-1 text-zinc-300 hover:bg-zinc-700"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDuplicateProject()}
+                title="Duplicate Project"
+                aria-label="Duplicate Project"
+                className="rounded border border-zinc-700 bg-zinc-800/80 p-1 text-zinc-300 hover:bg-zinc-700"
+              >
+                <Copy className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDeleteProject()}
+                title="Delete Project"
+                aria-label="Delete Project"
+                className="rounded border border-zinc-700 bg-zinc-800/80 p-1 text-zinc-400 hover:border-rose-500/50 hover:text-rose-300"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
 
           <button
             type="button"
@@ -1479,12 +2109,22 @@ export default function App() {
 
           <button
             type="button"
+            onClick={() => setShortcutsOpen(true)}
+            title="Keyboard Shortcuts (?)"
+            aria-label="Keyboard Shortcuts"
+            className="rounded border border-zinc-700 bg-zinc-800 p-1 text-zinc-300 hover:bg-zinc-700"
+          >
+            <Keyboard className="h-3.5 w-3.5 text-emerald-400" />
+          </button>
+
+          <button
+            type="button"
             data-log-intent="Open Usage & Debug Log"
             onClick={() => setLogModalOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-200 hover:bg-zinc-700"
+            className="inline-flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs font-medium text-zinc-200 hover:bg-zinc-700"
           >
             <ScrollText className="h-3.5 w-3.5 text-sky-400" />
-            Logs
+            <span className="hidden md:inline">Logs</span>
           </button>
         </div>
 
@@ -1610,8 +2250,31 @@ export default function App() {
 
               <button
                 type="button"
+                onClick={() => {
+                  setAutoSaveEnabled((v) => {
+                    const next = !v;
+                    pushToast(`Auto-Save ${next ? "ON" : "OFF"}`, "info");
+                    return next;
+                  });
+                }}
+                title="Toggle automatic saving after edits"
+                className={`hidden md:inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] font-medium transition ${
+                  autoSaveEnabled
+                    ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200"
+                    : "border-zinc-700 bg-zinc-800 text-zinc-400"
+                }`}
+              >
+                Auto {autoSaveEnabled ? "ON" : "OFF"}
+              </button>
+
+              <button
+                type="button"
                 disabled={saving}
-                onClick={handleSave}
+                onClick={async () => {
+                  const res = await handleSave();
+                  if (res) pushToast("Project saved", "success");
+                }}
+                title="Save Project (Ctrl+S)"
                 className={`inline-flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition ${
                   dirty
                     ? "bg-amber-500 text-zinc-950 hover:bg-amber-400"
@@ -1640,7 +2303,7 @@ export default function App() {
               <button
                 type="button"
                 disabled={isJobBusy || !hasTimelineContent}
-                onClick={handleExport}
+                onClick={() => setExportConfigOpen(true)}
                 className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Download className="h-3.5 w-3.5" />
@@ -1768,10 +2431,25 @@ export default function App() {
               isPlaying={isPlaying}
               isProjectPlaying={isProjectPlaying}
               preparingPlayback={preparingPlayback}
+              loopPlayback={loopPlayback}
+              playbackRate={playbackRate}
+              masterVolume={masterVolume}
+              masterMuted={masterMuted}
               canPreview={hasTimelineContent}
               previewBusy={Boolean(isJobBusy && activeJob?.job_type === "preview")}
               previewModalOpen={previewModalOpen}
               onTogglePlay={handleTogglePlay}
+              onToggleLoop={() => setLoopPlayback((v) => !v)}
+              onPlaybackRateChange={setPlaybackRate}
+              onMasterVolumeChange={(v) => {
+                setMasterVolume(v);
+                if (v > 0 && masterMuted) setMasterMuted(false);
+              }}
+              onToggleMasterMute={() => setMasterMuted((m) => !m)}
+              onProjectTimeChange={(t) => {
+                setMonitorMode("timeline");
+                setProjectTime(t);
+              }}
               onSourceTimeChange={(t) => setSourceTime(t)}
               onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
               onUpdateTracks={handleUpdateTracks}
@@ -1801,6 +2479,9 @@ export default function App() {
               onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
               onSynthesizeCaptionTts={handleSynthesizeCaptionTts}
               onSelectItem={setSelection}
+              onOpenBulkScript={() => setBulkScriptOpen(true)}
+              onDetachAudio={handleDetachAudio}
+              onFreezeFrame={handleFreezeFrame}
             />
           </div>
 
@@ -1815,6 +2496,8 @@ export default function App() {
             isModalOpen={isModalOpen}
             isProjectPlaying={isProjectPlaying}
             preparingPlayback={preparingPlayback}
+            canPasteClip={Boolean(copiedClip)}
+            canPasteAttributes={Boolean(copiedAttributes)}
             onSelectItem={setSelection}
             onProjectTimeChange={(t) => {
               setMonitorMode("timeline");
@@ -1828,11 +2511,26 @@ export default function App() {
             }}
             onUpdateTracks={handleUpdateTracks}
             onUpdateCameraKeyframes={handleUpdateCameraKeyframes}
+            onUpdateMarkers={handleUpdateMarkers}
             onBeginHistoryTransaction={handleBeginHistoryTransaction}
             onEndHistoryTransaction={handleEndHistoryTransaction}
             onAddSourceClip={handleAddSourceClip}
             onDropMediaAsset={handlePlaceAssetOnTrack}
             onToggleProjectPlayback={handleToggleProjectPlayback}
+            onSaveProject={async () => {
+              const res = await handleSave();
+              if (res) pushToast("Project saved", "success");
+            }}
+            onCopySelectedClip={handleCopySelectedClip}
+            onPasteClipAtPlayhead={handlePasteClipAtPlayhead}
+            onDuplicateSelectedClip={handleDuplicateSelectedClip}
+            onCopyAttributes={handleCopyAttributes}
+            onPasteAttributes={handlePasteAttributes}
+            onDetachAudio={handleDetachAudio}
+            onFreezeFrame={handleFreezeFrame}
+            onOpenShortcuts={() => setShortcutsOpen(true)}
+            onOpenBulkScript={() => setBulkScriptOpen(true)}
+            onToast={pushToast}
           />
         </main>
       )}
@@ -2098,7 +2796,10 @@ export default function App() {
                   project.project_id,
                   manifest.latest_export_artifact_id
                 )}
-                download={`${project.project_id}.mp4`}
+                download={
+                  manifest.latest_export_path?.split(/[/\\]/).pop() ||
+                  `${project.project_id}.mp4`
+                }
                 className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-1.5 font-medium text-white hover:bg-emerald-500"
               >
                 <Download className="h-3.5 w-3.5" />
@@ -2113,6 +2814,36 @@ export default function App() {
         open={logModalOpen}
         projectId={project?.project_id ?? null}
         onClose={() => setLogModalOpen(false)}
+      />
+
+      {project && (
+        <ExportConfigModal
+          open={exportConfigOpen}
+          project={project}
+          durationSec={totalProjectDuration}
+          onClose={() => setExportConfigOpen(false)}
+          onStartExport={(opts) => void handleExport(opts)}
+        />
+      )}
+
+      {project && (
+        <BulkScriptModal
+          open={bulkScriptOpen}
+          project={project}
+          defaultStartSec={projectTime}
+          onClose={() => setBulkScriptOpen(false)}
+          onInsertScript={(opts) => void handleInsertBulkScript(opts)}
+        />
+      )}
+
+      <ShortcutModal
+        open={shortcutsOpen}
+        onClose={() => setShortcutsOpen(false)}
+      />
+
+      <ToastContainer
+        toasts={toasts}
+        onDismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))}
       />
     </div>
   );

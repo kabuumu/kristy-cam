@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -7,11 +7,15 @@ import {
   Image as ImageIcon,
   Loader2,
   Music,
+  Pause,
+  Play,
   Plus,
+  Search,
   Sparkles,
   Trash2,
   Upload,
 } from "lucide-react";
+import { apiClient } from "../api/client";
 import type {
   ArtifactManifest,
   MediaAssetKind,
@@ -71,11 +75,44 @@ export function MediaBin({
 }: MediaBinProps) {
   const [collapsed, setCollapsed] = useState(false);
   const [filter, setFilter] = useState<"all" | MediaAssetKind>("all");
+  const [searchQuery, setSearchQuery] = useState("");
   const [showPathForm, setShowPathForm] = useState(false);
   const [pathInput, setPathInput] = useState("");
   const [copyToProject, setCopyToProject] = useState(true);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [osDropActive, setOsDropActive] = useState(false);
+  const [auditioningAssetId, setAuditioningAssetId] = useState<string | null>(null);
+  const [brokenThumbs, setBrokenThumbs] = useState<Record<string, boolean>>({});
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const auditionAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    setAuditioningAssetId(null);
+    setBrokenThumbs({});
+    if (auditionAudioRef.current) {
+      auditionAudioRef.current.pause();
+    }
+    return () => {
+      if (auditionAudioRef.current) {
+        auditionAudioRef.current.pause();
+      }
+    };
+  }, [project.project_id]);
+
+  const toggleAudioAudition = (assetId: string) => {
+    const el = auditionAudioRef.current;
+    if (!el) return;
+    if (auditioningAssetId === assetId) {
+      el.pause();
+      setAuditioningAssetId(null);
+      return;
+    }
+    el.src = apiClient.mediaUrl(project.project_id, assetId);
+    el.currentTime = 0;
+    el.play()
+      .then(() => setAuditioningAssetId(assetId))
+      .catch(() => setAuditioningAssetId(null));
+  };
 
   const referencedIds = useMemo(() => {
     const ids = new Set<string>([project.source_media.media_id]);
@@ -97,8 +134,10 @@ export function MediaBin({
       if (b.asset_id === primaryId) return 1;
       return a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name);
     });
-    return filter === "all" ? list : list.filter((a) => a.kind === filter);
-  }, [project, filter]);
+    const byKind = filter === "all" ? list : list.filter((a) => a.kind === filter);
+    const q = searchQuery.trim().toLowerCase();
+    return q ? byKind.filter((a) => a.name.toLowerCase().includes(q)) : byKind;
+  }, [project, filter, searchQuery]);
 
   const getAssetMeta = (asset: MediaAssetRef): MediaAssetMetadata | undefined => {
     const direct = manifest.media_metadata?.[asset.asset_id];
@@ -128,6 +167,28 @@ export function MediaBin({
     return manifest.media_proxies?.[asset.asset_id]?.status ?? null;
   };
 
+  const handleOsDragOver = (e: React.DragEvent) => {
+    if (
+      e.dataTransfer.types.includes("Files") &&
+      !e.dataTransfer.types.includes(MEDIA_BIN_DND_MIME)
+    ) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      if (!osDropActive) setOsDropActive(true);
+    }
+  };
+
+  const handleOsDrop = async (e: React.DragEvent) => {
+    setOsDropActive(false);
+    if (e.dataTransfer.types.includes(MEDIA_BIN_DND_MIME)) return;
+    const files = Array.from(e.dataTransfer.files ?? []);
+    if (files.length === 0) return;
+    e.preventDefault();
+    for (const file of files) {
+      await onImportAsset({ file, copyToProject: true });
+    }
+  };
+
   if (collapsed) {
     return (
       <aside className="flex shrink-0 flex-row lg:flex-col items-center justify-between lg:justify-start gap-2 rounded-xl border border-zinc-800 bg-[#151821] px-2 py-2 lg:w-11">
@@ -150,8 +211,33 @@ export function MediaBin({
   return (
     <aside
       data-testid="media-bin"
-      className="flex w-full lg:w-[245px] xl:w-[270px] shrink-0 flex-col overflow-hidden rounded-xl border border-zinc-800 bg-[#151821]"
+      onDragOver={handleOsDragOver}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setOsDropActive(false);
+        }
+      }}
+      onDrop={(e) => void handleOsDrop(e)}
+      className={`relative flex w-full lg:w-[255px] xl:w-[275px] shrink-0 flex-col overflow-hidden rounded-xl border bg-[#151821] transition-colors ${
+        osDropActive
+          ? "border-emerald-400 ring-2 ring-emerald-400/40"
+          : "border-zinc-800"
+      }`}
     >
+      <audio
+        ref={auditionAudioRef}
+        onEnded={() => setAuditioningAssetId(null)}
+        className="hidden"
+      />
+
+      {osDropActive && (
+        <div className="pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center gap-2 bg-emerald-950/80 backdrop-blur-[1px] text-emerald-100">
+          <Upload className="h-7 w-7 text-emerald-400" />
+          <span className="text-xs font-semibold">Drop files to import</span>
+          <span className="text-[10px] text-emerald-300">Video, Image, or Audio</span>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-2">
         <div className="flex items-center gap-1.5">
@@ -168,13 +254,14 @@ export function MediaBin({
           <input
             ref={fileInputRef}
             type="file"
+            multiple
             accept="video/*,image/*,audio/*"
             className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
+            onChange={async (e) => {
+              const files = Array.from(e.target.files ?? []);
               e.target.value = "";
-              if (file) {
-                void onImportAsset({ file, copyToProject: true });
+              for (const file of files) {
+                await onImportAsset({ file, copyToProject: true });
               }
             }}
           />
@@ -188,7 +275,7 @@ export function MediaBin({
                 fileInputRef.current?.click();
               }
             }}
-            title="Import video, PNG/WebP overlay, or WAV/MP3 audio"
+            title="Import video, PNG/WebP overlay, or WAV/MP3 audio (or drag files here)"
             className="inline-flex items-center gap-1 rounded bg-emerald-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
           >
             {importBusy ? (
@@ -260,29 +347,44 @@ export function MediaBin({
         </div>
       )}
 
-      {/* Kind Filter Tabs */}
-      <div className="flex gap-1 border-b border-zinc-800 px-2 py-1.5 text-[10px]">
-        {(["all", "video", "image", "audio"] as const).map((tab) => (
-          <button
-            key={tab}
-            type="button"
-            onClick={() => setFilter(tab)}
-            className={`rounded px-2 py-0.5 font-medium capitalize transition ${
-              filter === tab
-                ? "bg-emerald-500/20 text-emerald-200 border border-emerald-500/40"
-                : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
-            }`}
-          >
-            {tab}
-          </button>
-        ))}
+      {/* Kind Filter Tabs + Search */}
+      <div className="space-y-1.5 border-b border-zinc-800 px-2 py-1.5">
+        <div className="flex gap-1 text-[10px]">
+          {(["all", "video", "image", "audio"] as const).map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => setFilter(tab)}
+              className={`rounded px-2 py-0.5 font-medium capitalize transition ${
+                filter === tab
+                  ? "bg-emerald-500/20 text-emerald-200 border border-emerald-500/40"
+                  : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+              }`}
+            >
+              {tab}
+            </button>
+          ))}
+        </div>
+        <div className="relative">
+          <Search className="pointer-events-none absolute top-1/2 left-2 h-3 w-3 -translate-y-1/2 text-zinc-500" />
+          <input
+            type="text"
+            aria-label="Search media assets"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search assets..."
+            className="w-full rounded border border-zinc-800 bg-zinc-900/90 py-1 pr-2 pl-6 text-[11px] text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none"
+          />
+        </div>
       </div>
 
       {/* Asset List */}
       <div className="flex-1 space-y-1.5 overflow-y-auto p-2">
         {assets.length === 0 ? (
           <div className="rounded-lg border border-dashed border-zinc-800 p-4 text-center text-[11px] text-zinc-500">
-            No {filter === "all" ? "media assets" : `${filter} assets`} yet. Import videos, RGBA overlays, or audio tracks.
+            {searchQuery.trim()
+              ? "No assets match your search."
+              : `No ${filter === "all" ? "media assets" : `${filter} assets`} yet. Drag files here or click Import.`}
           </div>
         ) : (
           assets.map((asset) => {
@@ -291,6 +393,10 @@ export function MediaBin({
             const isPrimary = asset.asset_id === project.source_media.media_id;
             const isInUse = referencedIds.has(asset.asset_id);
             const isPreviewed = previewAssetId === asset.asset_id;
+            const isAuditioning = auditioningAssetId === asset.asset_id;
+            const showThumb =
+              (asset.kind === "video" || asset.kind === "image") &&
+              !brokenThumbs[asset.asset_id];
             const KindIcon =
               asset.kind === "image"
                 ? ImageIcon
@@ -325,50 +431,91 @@ export function MediaBin({
                     : "border-zinc-800 bg-[#11141b] hover:border-zinc-700"
                 }`}
               >
-                <div className="flex items-start justify-between gap-1.5">
-                  <div className="flex min-w-0 items-center gap-1.5">
-                    <KindIcon
-                      className={`h-3.5 w-3.5 shrink-0 ${
-                        asset.kind === "image"
-                          ? "text-purple-400"
-                          : asset.kind === "audio"
-                            ? "text-amber-400"
-                            : "text-emerald-400"
-                      }`}
-                    />
-                    <span
-                      className="truncate font-medium text-zinc-200"
-                      title={asset.name}
-                    >
-                      {asset.name}
-                    </span>
+                <div className="flex gap-2">
+                  {/* Visual Thumbnail / Audio Icon */}
+                  <div className="relative h-10 w-14 shrink-0 overflow-hidden rounded border border-zinc-800 bg-zinc-950 flex items-center justify-center">
+                    {showThumb ? (
+                      <img
+                        src={apiClient.assetThumbnailUrl(
+                          project.project_id,
+                          asset.asset_id
+                        )}
+                        alt={asset.name}
+                        loading="lazy"
+                        onError={() =>
+                          setBrokenThumbs((prev) => ({
+                            ...prev,
+                            [asset.asset_id]: true,
+                          }))
+                        }
+                        className="h-full w-full object-cover pointer-events-none"
+                      />
+                    ) : (
+                      <KindIcon
+                        className={`h-4 w-4 ${
+                          asset.kind === "image"
+                            ? "text-purple-400"
+                            : asset.kind === "audio"
+                              ? "text-amber-400"
+                              : "text-emerald-400"
+                        }`}
+                      />
+                    )}
+                    {asset.kind === "audio" && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleAudioAudition(asset.asset_id);
+                        }}
+                        title={isAuditioning ? "Stop audio preview" : "Audition audio"}
+                        className="absolute inset-0 flex items-center justify-center bg-black/45 text-amber-200 hover:bg-black/65"
+                      >
+                        {isAuditioning ? (
+                          <Pause className="h-4 w-4" />
+                        ) : (
+                          <Play className="h-4 w-4" />
+                        )}
+                      </button>
+                    )}
                   </div>
-                  <span
-                    className={`shrink-0 rounded border px-1 py-0.2 text-[9px] font-semibold uppercase ${badgeColor}`}
-                  >
-                    {isPrimary ? "MAIN" : asset.kind}
-                  </span>
-                </div>
 
-                <div className="mt-1 flex flex-wrap items-center justify-between gap-1 text-[10px] font-mono text-zinc-400">
-                  <span>{formatMetaSummary(asset, meta)}</span>
-                  {proxyStatus && (
-                    <span
-                      className={
-                        proxyStatus === "ready"
-                          ? "text-emerald-400"
-                          : proxyStatus === "failed"
-                            ? "text-rose-400"
-                            : "text-amber-300"
-                      }
-                    >
-                      {proxyStatus === "ready"
-                        ? "Proxy ✓"
-                        : proxyStatus === "failed"
-                          ? "Proxy ✕"
-                          : "Proxy…"}
-                    </span>
-                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-start justify-between gap-1">
+                      <span
+                        className="truncate font-medium text-zinc-200"
+                        title={asset.name}
+                      >
+                        {asset.name}
+                      </span>
+                      <span
+                        className={`shrink-0 rounded border px-1 py-0.2 text-[9px] font-semibold uppercase ${badgeColor}`}
+                      >
+                        {isPrimary ? "MAIN" : asset.kind}
+                      </span>
+                    </div>
+
+                    <div className="mt-0.5 flex flex-wrap items-center justify-between gap-1 text-[10px] font-mono text-zinc-400">
+                      <span>{formatMetaSummary(asset, meta)}</span>
+                      {proxyStatus && (
+                        <span
+                          className={
+                            proxyStatus === "ready"
+                              ? "text-emerald-400"
+                              : proxyStatus === "failed"
+                                ? "text-rose-400"
+                                : "text-amber-300"
+                          }
+                        >
+                          {proxyStatus === "ready"
+                            ? "Proxy ✓"
+                            : proxyStatus === "failed"
+                              ? "Proxy ✕"
+                              : "Proxy…"}
+                        </span>
+                      )}
+                    </div>
+                  </div>
                 </div>
 
                 <div className="mt-1.5 flex items-center justify-between gap-1">

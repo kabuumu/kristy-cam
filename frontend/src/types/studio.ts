@@ -29,6 +29,8 @@ export type JunctionTransitionType =
   | "fadeblack"
   | "zoomin";
 export type CaptionAlign = "bottom" | "center" | "top";
+export type CaptionAnimation = "none" | "pop" | "fade";
+export type ExportQuality = "draft" | "standard" | "high";
 
 export interface SourceMediaRef {
   media_id: string;
@@ -61,11 +63,22 @@ export interface CaptionSettings {
   font_size: number;
   primary_color: string;
   outline_color: string;
+  back_color?: string;
   outline_width: number;
+  shadow?: number;
+  border_style?: number;
   margin_v: number;
+  karaoke_highlight?: boolean;
+  highlight_color?: string;
+  animation?: CaptionAnimation;
 }
 
-export type KeyframeTransition = "tween" | "snap";
+export type KeyframeTransition =
+  | "tween"
+  | "snap"
+  | "ease_in"
+  | "ease_out"
+  | "ease_in_out";
 
 export interface CropKeyframe {
   t: number;
@@ -89,6 +102,14 @@ export interface VisualClipTransform {
   scale: number;
   rotation_deg: number;
   opacity: number;
+  flip_h?: boolean;
+  flip_v?: boolean;
+}
+
+export interface VisualClipColorAdjust {
+  brightness: number;
+  contrast: number;
+  saturation: number;
 }
 
 export interface ClipEdgeTransition {
@@ -118,6 +139,7 @@ export interface VisualClip {
   audio_fade_in_sec: number;
   audio_fade_out_sec: number;
   transform: VisualClipTransform;
+  color_adjust?: VisualClipColorAdjust;
   transition_in: ClipEdgeTransition;
   transition_out: ClipEdgeTransition;
 }
@@ -139,6 +161,12 @@ export interface CaptionStyleOverride {
   margin_v?: number | null;
   font_size?: number | null;
   align?: CaptionAlign | null;
+  primary_color?: string | null;
+  outline_color?: string | null;
+  back_color?: string | null;
+  border_style?: number | null;
+  karaoke_highlight?: boolean | null;
+  animation?: CaptionAnimation | null;
 }
 
 export interface CaptionClip {
@@ -190,6 +218,19 @@ export interface CaptionTrack {
 
 export type TimelineTrack = VideoTrack | AudioTrack | CaptionTrack;
 
+export interface TimelineMarker {
+  id: string;
+  t: number;
+  label: string;
+  color: string;
+}
+
+export interface ExportOptions {
+  filename?: string;
+  quality?: ExportQuality;
+  fps?: number;
+}
+
 export type TimelineSelection =
   | { type: "video-clip"; trackId: string; clipId: string }
   | { type: "audio-clip"; trackId: string; clipId: string }
@@ -227,6 +268,7 @@ export interface ProjectInput {
   caption_settings: CaptionSettings;
   pronunciations: Record<string, string>;
   camera_keyframes?: CropKeyframe[];
+  markers?: TimelineMarker[];
   tracks?: TimelineTrack[];
   segments: SegmentInput[];
 }

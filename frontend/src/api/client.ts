@@ -1,6 +1,7 @@
 import { usageLogger, type UsageLogEvent } from "../utils/usageLogger";
 import type {
   Capabilities,
+  ExportOptions,
   JobAccepted,
   JobState,
   MediaAssetImportResult,
@@ -301,10 +302,61 @@ export const apiClient = {
     );
   },
 
-  exportProject(projectId: string): Promise<JobAccepted> {
+  exportProject(projectId: string, options?: ExportOptions): Promise<JobAccepted> {
     return request(`/api/projects/${encodeURIComponent(projectId)}/export`, {
       method: "POST",
+      body: options ? JSON.stringify(options) : undefined,
     });
+  },
+
+  renameProject(projectId: string, title: string): Promise<ProjectBundle> {
+    return request(`/api/projects/${encodeURIComponent(projectId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+    });
+  },
+
+  duplicateProject(projectId: string, title?: string): Promise<ProjectBundle> {
+    return request(`/api/projects/${encodeURIComponent(projectId)}/duplicate`, {
+      method: "POST",
+      body: title ? JSON.stringify({ title }) : undefined,
+    });
+  },
+
+  deleteProject(projectId: string): Promise<{ deleted: boolean; project_id: string }> {
+    return request(`/api/projects/${encodeURIComponent(projectId)}`, {
+      method: "DELETE",
+    });
+  },
+
+  subtitlesSrtUrl(projectId: string): string {
+    return `/api/projects/${encodeURIComponent(projectId)}/subtitles.srt`;
+  },
+
+  assetThumbnailUrl(projectId: string, assetId: string): string {
+    return `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}/thumbnail`;
+  },
+
+  getAssetWaveform(
+    projectId: string,
+    assetId: string,
+    buckets = 120
+  ): Promise<{ asset_id: string; peaks: number[] }> {
+    return request(
+      `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}/waveform?buckets=${buckets}`,
+      { method: "GET" }
+    );
+  },
+
+  getMediaWaveform(
+    projectId: string,
+    artifactId: string,
+    buckets = 80
+  ): Promise<{ artifact_id: string; peaks: number[] }> {
+    return request(
+      `/api/projects/${encodeURIComponent(projectId)}/media/${encodeURIComponent(artifactId)}/waveform?buckets=${buckets}`,
+      { method: "GET" }
+    );
   },
 
   getJob(jobId: string): Promise<JobState> {

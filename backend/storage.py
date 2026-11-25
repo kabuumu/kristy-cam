@@ -647,3 +647,125 @@ def relink_source_media(
     )
     return save_project(updated_project, expected_revision=project.revision, data_dir=data_dir)
 
+
+def rename_project(
+    project_id: str,
+    new_title: str,
+    data_dir: Path | None = None,
+) -> ProjectInput:
+    """Rename a project's title atomically, bumping its revision."""
+    clean_title = new_title.strip()
+    if not clean_title:
+        raise StorageError("Project title must not be empty")
+    project = load_project(project_id, data_dir)
+    updated = project.model_copy(update={"title": clean_title})
+    return save_project(updated, expected_revision=project.revision, data_dir=data_dir)
+
+
+def duplicate_project(
+    project_id: str,
+    new_project_id: str,
+    new_title: str | None = None,
+    data_dir: Path | None = None,
+) -> tuple[ProjectInput, ArtifactManifest]:
+    """Deep-copy an existing project directory (project.json, manifest.json, artifacts, source) to new_project_id."""
+    src_dir = get_project_dir(project_id, data_dir)
+    src_project = load_project(project_id, data_dir)
+    src_manifest = load_manifest(project_id, data_dir)
+
+    dst_dir = get_project_dir(new_project_id, data_dir)
+    if dst_dir.exists():
+        raise StorageError(f"Target project directory already exists: {new_project_id}")
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for sub in ("artifacts", "exports", "tmp", "source"):
+        src_sub = src_dir / sub
+        dst_sub = dst_dir / sub
+        if sub in ("artifacts", "source") and src_sub.is_dir():
+            shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
+        else:
+            dst_sub.mkdir(parents=True, exist_ok=True)
+
+    # Rewrite any paths that pointed inside src_dir so the duplicate is self-contained
+    src_resolved = src_dir.resolve()
+    dst_resolved = dst_dir.resolve()
+
+    def _remap_path(p: str | None) -> str | None:
+        if not p:
+            return p
+        try:
+            rel = Path(p).resolve().relative_to(src_resolved)
+            return str(dst_resolved / rel)
+        except Exception:
+            return p
+
+    now_iso = utc_now_iso()
+    title = (new_title or "").strip() or f"{src_project.title} (Copy)"
+
+    remapped_source = src_project.source_media.model_copy(
+        update={"path": _remap_path(src_project.source_media.path) or src_project.source_media.path}
+    )
+    remapped_assets = {
+        aid: ref.model_copy(update={"path": _remap_path(ref.path) or ref.path})
+        for aid, ref in src_project.media_assets.items()
+    }
+    new_project = src_project.model_copy(
+        update={
+            "project_id": new_project_id,
+            "revision": 1,
+            "title": title,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "source_media": remapped_source,
+            "media_assets": remapped_assets,
+        }
+    )
+
+    remapped_proxy = src_manifest.proxy.model_copy(
+        update={"path": _remap_path(src_manifest.proxy.path)}
+    )
+    remapped_media_proxies = {
+        aid: mp.model_copy(update={"path": _remap_path(mp.path)})
+        for aid, mp in src_manifest.media_proxies.items()
+    }
+    remapped_cap_arts = {
+        cid: ca.model_copy(update={"audio_path": _remap_path(ca.audio_path)})
+        for cid, ca in src_manifest.caption_artifacts.items()
+    }
+    remapped_segments = {
+        sid: seg_art.model_copy(
+            update={
+                "audio_path": _remap_path(seg_art.audio_path),
+                "rendered_segment_path": _remap_path(seg_art.rendered_segment_path),
+                "preview_path": _remap_path(seg_art.preview_path),
+            }
+        )
+        for sid, seg_art in src_manifest.segments.items()
+    }
+    new_manifest = src_manifest.model_copy(
+        update={
+            "project_id": new_project_id,
+            "proxy": remapped_proxy,
+            "media_proxies": remapped_media_proxies,
+            "caption_artifacts": remapped_cap_arts,
+            "segments": remapped_segments,
+            "latest_preview_artifact_id": None,
+            "latest_preview_path": None,
+            "latest_export_artifact_id": None,
+            "latest_export_path": None,
+        }
+    )
+
+    atomic_write_json(dst_dir / "project.json", new_project.model_dump(mode="json"), create_backup=False)
+    save_manifest(new_manifest, data_dir=data_dir)
+    return new_project, new_manifest
+
+
+def delete_project(project_id: str, data_dir: Path | None = None) -> None:
+    """Permanently delete a project directory and all its local artifacts."""
+    project_dir = get_project_dir(project_id, data_dir)
+    if not project_dir.exists():
+        raise ProjectNotFoundError(f"Project {project_id!r} not found")
+    shutil.rmtree(project_dir)
+
+

@@ -6,7 +6,10 @@ import {
   Captions,
   CheckCircle2,
   Copy,
+  FileText,
   Film,
+  FlipHorizontal2,
+  FlipVertical2,
   KeyRound,
   Layers,
   Loader2,
@@ -15,6 +18,7 @@ import {
   RotateCcw,
   Scissors,
   SlidersHorizontal,
+  Snowflake,
   Sparkles,
   Trash2,
   Volume2,
@@ -26,6 +30,7 @@ import type {
   AudioClip,
   AudioTrack,
   CaptionAlign,
+  CaptionAnimation,
   CaptionClip,
   CaptionTrack,
   CropKeyframe,
@@ -39,12 +44,15 @@ import type {
   VisualClip,
 } from "../types/studio";
 import {
+  CAPTION_STYLE_PRESETS,
+  assColorToHex,
   autoSplitTextToClauses,
   clampCropPosition,
   computeCaptionClipTtsSignature,
   findNextClipId,
   formatTimecode,
   getCaptionClipEffectiveDuration,
+  hexToAssColor,
   resolveCaptionClipSpokenText,
   splitAudioClipAt,
   splitVisualClipAt,
@@ -75,6 +83,9 @@ interface ContextualInspectorProps {
   ) => void;
   onSynthesizeCaptionTts: (clipId?: string) => Promise<void>;
   onSelectItem: (sel: TimelineSelection) => void;
+  onOpenBulkScript?: () => void;
+  onDetachAudio?: (trackId: string, clipId: string) => void;
+  onFreezeFrame?: (trackId: string, clipId: string) => void;
 }
 
 const EDGE_TRANSITIONS: Array<{ value: EdgeTransitionType; label: string }> = [
@@ -236,6 +247,9 @@ export function ContextualInspector({
   onUpdateCameraKeyframes,
   onSynthesizeCaptionTts,
   onSelectItem,
+  onOpenBulkScript,
+  onDetachAudio,
+  onFreezeFrame,
 }: ContextualInspectorProps) {
   const [newPronKey, setNewPronKey] = useState("");
   const [newPronVal, setNewPronVal] = useState("");
@@ -572,19 +586,94 @@ export function ContextualInspector({
         <div className="space-y-2 rounded-lg border border-zinc-800 bg-[#11141b] p-3">
           <div className="flex items-center justify-between">
             <span className="font-semibold text-zinc-200">Layer Transform</span>
-            <button
-              type="button"
-              onClick={() =>
-                patchClip(
-                  { transform: { x: 0.5, y: 0.5, scale: 1.0, rotation_deg: 0, opacity: 1.0 } },
-                  "Reset layer transform"
-                )
-              }
-              className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-300 hover:bg-zinc-700"
-            >
-              <RotateCcw className="h-3 w-3" />
-              Reset
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() =>
+                  patchClip(
+                    {
+                      transform: {
+                        ...clip.transform,
+                        flip_h: !clip.transform.flip_h,
+                      },
+                    },
+                    "Flip layer horizontally"
+                  )
+                }
+                title="Flip Horizontal"
+                className={`rounded border px-1.5 py-0.5 text-[10px] ${
+                  clip.transform.flip_h
+                    ? "border-emerald-500/50 bg-emerald-500/20 text-emerald-200"
+                    : "border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+                }`}
+              >
+                <FlipHorizontal2 className="h-3 w-3" />
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  patchClip(
+                    {
+                      transform: {
+                        ...clip.transform,
+                        flip_v: !clip.transform.flip_v,
+                      },
+                    },
+                    "Flip layer vertically"
+                  )
+                }
+                title="Flip Vertical"
+                className={`rounded border px-1.5 py-0.5 text-[10px] ${
+                  clip.transform.flip_v
+                    ? "border-emerald-500/50 bg-emerald-500/20 text-emerald-200"
+                    : "border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+                }`}
+              >
+                <FlipVertical2 className="h-3 w-3" />
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  patchClip(
+                    {
+                      transform: {
+                        ...clip.transform,
+                        x: 0.5,
+                        y: 0.5,
+                      },
+                    },
+                    "Center layer"
+                  )
+                }
+                title="Center layer (0.5, 0.5)"
+                className="rounded border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-300 hover:bg-zinc-700"
+              >
+                Center
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  patchClip(
+                    {
+                      transform: {
+                        x: 0.5,
+                        y: 0.5,
+                        scale: 1.0,
+                        rotation_deg: 0,
+                        opacity: 1.0,
+                        flip_h: false,
+                        flip_v: false,
+                      },
+                    },
+                    "Reset layer transform"
+                  )
+                }
+                className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-300 hover:bg-zinc-700"
+              >
+                <RotateCcw className="h-3 w-3" />
+                Reset
+              </button>
+            </div>
           </div>
           <div className="grid grid-cols-3 gap-2">
             <label className="flex flex-col gap-1">
@@ -670,6 +759,93 @@ export function ContextualInspector({
             </label>
           </div>
         </div>
+
+        {/* Basic Color Adjustments */}
+        {(() => {
+          const ca = clip.color_adjust ?? { brightness: 0, contrast: 1, saturation: 1 };
+          return (
+            <div className="space-y-2 rounded-lg border border-zinc-800 bg-[#11141b] p-3">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-zinc-200">Color Adjust</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    patchClip(
+                      { color_adjust: { brightness: 0, contrast: 1, saturation: 1 } },
+                      "Reset color adjustments"
+                    )
+                  }
+                  className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-300 hover:bg-zinc-700"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  Reset
+                </button>
+              </div>
+              <div className="space-y-1.5 text-[11px]">
+                <label className="flex flex-col gap-0.5">
+                  <div className="flex justify-between text-zinc-400">
+                    <span>Brightness</span>
+                    <span className="font-mono text-zinc-200">{Math.round(ca.brightness * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={-0.5}
+                    max={0.5}
+                    step={0.02}
+                    value={ca.brightness}
+                    onChange={(e) =>
+                      patchClip(
+                        { color_adjust: { ...ca, brightness: parseFloat(e.target.value) } },
+                        "Adjust brightness",
+                        `vc-br-${clip.id}`
+                      )
+                    }
+                  />
+                </label>
+                <label className="flex flex-col gap-0.5">
+                  <div className="flex justify-between text-zinc-400">
+                    <span>Contrast</span>
+                    <span className="font-mono text-zinc-200">{Math.round(ca.contrast * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={2.0}
+                    step={0.05}
+                    value={ca.contrast}
+                    onChange={(e) =>
+                      patchClip(
+                        { color_adjust: { ...ca, contrast: parseFloat(e.target.value) } },
+                        "Adjust contrast",
+                        `vc-ct-${clip.id}`
+                      )
+                    }
+                  />
+                </label>
+                <label className="flex flex-col gap-0.5">
+                  <div className="flex justify-between text-zinc-400">
+                    <span>Saturation</span>
+                    <span className="font-mono text-zinc-200">{Math.round(ca.saturation * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={2.5}
+                    step={0.05}
+                    value={ca.saturation}
+                    onChange={(e) =>
+                      patchClip(
+                        { color_adjust: { ...ca, saturation: parseFloat(e.target.value) } },
+                        "Adjust saturation",
+                        `vc-st-${clip.id}`
+                      )
+                    }
+                  />
+                </label>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Clip Edge Transitions */}
         <div className="space-y-2 rounded-lg border border-zinc-800 bg-[#11141b] p-3">
@@ -855,6 +1031,33 @@ export function ContextualInspector({
             Delete
           </button>
         </div>
+
+        {clip.kind === "video" && (onDetachAudio || onFreezeFrame) && (
+          <div className="flex items-center gap-1.5">
+            {onDetachAudio && (
+              <button
+                type="button"
+                onClick={() => onDetachAudio(trackId, clip.id)}
+                title="Extract this clip's audio onto an Audio Track and mute the video clip"
+                className="inline-flex flex-1 items-center justify-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-amber-200 hover:bg-amber-500/20"
+              >
+                <Music className="h-3.5 w-3.5" />
+                Detach Audio
+              </button>
+            )}
+            {onFreezeFrame && (
+              <button
+                type="button"
+                onClick={() => onFreezeFrame(trackId, clip.id)}
+                title="Insert a 2s freeze-frame clip at the playhead"
+                className="inline-flex flex-1 items-center justify-center gap-1 rounded border border-sky-500/40 bg-sky-500/10 px-2 py-1.5 text-sky-200 hover:bg-sky-500/20"
+              >
+                <Snowflake className="h-3.5 w-3.5" />
+                Freeze Frame
+              </button>
+            )}
+          </div>
+        )}
       </div>
     );
   };
@@ -1301,8 +1504,8 @@ export function ContextualInspector({
                   <span className="text-zinc-400">Speed ({clip.speed.toFixed(2)}x)</span>
                   <input
                     type="range"
-                    min={0.75}
-                    max={1.5}
+                    min={0.8}
+                    max={1.25}
                     step={0.05}
                     value={clip.speed}
                     onChange={(e) =>
@@ -1418,6 +1621,88 @@ export function ContextualInspector({
                   }}
                   className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-1 font-mono text-[11px] text-zinc-100"
                 />
+              </label>
+            </div>
+
+            <div className="mt-2 grid grid-cols-3 gap-1.5">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] text-zinc-500">Color</span>
+                <input
+                  type="color"
+                  value={assColorToHex(
+                    clip.style_override?.primary_color ?? project.caption_settings.primary_color,
+                    "#ffffff"
+                  )}
+                  onChange={(e) =>
+                    patchClip(
+                      {
+                        style_override: {
+                          ...clip.style_override,
+                          primary_color: hexToAssColor(e.target.value),
+                        },
+                      },
+                      "Change caption color",
+                      `cc-col-${clip.id}`
+                    )
+                  }
+                  className="h-6 w-full cursor-pointer rounded border border-zinc-700 bg-zinc-900"
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] text-zinc-500">Animation</span>
+                <select
+                  value={clip.style_override?.animation ?? ""}
+                  onChange={(e) =>
+                    patchClip(
+                      {
+                        style_override: {
+                          ...clip.style_override,
+                          animation: (e.target.value || null) as CaptionAnimation | null,
+                        },
+                      },
+                      "Change caption animation"
+                    )
+                  }
+                  className="rounded border border-zinc-700 bg-zinc-900 px-1 py-1 text-[11px] text-zinc-100"
+                >
+                  <option value="">Default</option>
+                  <option value="none">None</option>
+                  <option value="pop">Pop</option>
+                  <option value="fade">Fade</option>
+                </select>
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] text-zinc-500">Karaoke</span>
+                <select
+                  value={
+                    clip.style_override?.karaoke_highlight === true
+                      ? "on"
+                      : clip.style_override?.karaoke_highlight === false
+                        ? "off"
+                        : ""
+                  }
+                  onChange={(e) =>
+                    patchClip(
+                      {
+                        style_override: {
+                          ...clip.style_override,
+                          karaoke_highlight:
+                            e.target.value === "on"
+                              ? true
+                              : e.target.value === "off"
+                                ? false
+                                : null,
+                        },
+                      },
+                      "Toggle caption karaoke highlight"
+                    )
+                  }
+                  className="rounded border border-zinc-700 bg-zinc-900 px-1 py-1 text-[11px] text-zinc-100"
+                >
+                  <option value="">Default</option>
+                  <option value="on">On</option>
+                  <option value="off">Off</option>
+                </select>
               </label>
             </div>
           </div>
@@ -1903,30 +2188,32 @@ export function ContextualInspector({
           </label>
 
           <div className="space-y-1.5">
-            <span className="block text-zinc-400">Transition to Next View</span>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => updateKf({ transition: "tween" })}
-                className={`rounded border px-2.5 py-1.5 font-medium transition ${
-                  transition === "tween"
-                    ? "border-emerald-500 bg-emerald-500/20 text-emerald-200"
-                    : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200"
-                }`}
-              >
-                Tween (Smooth)
-              </button>
-              <button
-                type="button"
-                onClick={() => updateKf({ transition: "snap" })}
-                className={`rounded border px-2.5 py-1.5 font-medium transition ${
-                  transition === "snap"
-                    ? "border-amber-500 bg-amber-500/20 text-amber-200"
-                    : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200"
-                }`}
-              >
-                Snap (Instant)
-              </button>
+            <span className="block text-zinc-400">Transition / Easing Curve</span>
+            <div className="grid grid-cols-2 gap-1.5">
+              {(
+                [
+                  { id: "tween", label: "Linear" },
+                  { id: "ease_in_out", label: "Ease In-Out" },
+                  { id: "ease_in", label: "Ease In" },
+                  { id: "ease_out", label: "Ease Out" },
+                  { id: "snap", label: "Snap (Cut)" },
+                ] as const
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => updateKf({ transition: opt.id })}
+                  className={`rounded border px-2 py-1 text-[11px] font-medium transition ${
+                    transition === opt.id
+                      ? opt.id === "snap"
+                        ? "border-amber-500 bg-amber-500/20 text-amber-200"
+                        : "border-emerald-500 bg-emerald-500/20 text-emerald-200"
+                      : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
             </div>
           </div>
         </div>
@@ -1936,9 +2223,45 @@ export function ContextualInspector({
 
   const renderDefaultInspector = () => (
     <div className="space-y-3 text-xs">
-      <div className="rounded-lg border border-dashed border-zinc-700 p-4 text-center text-zinc-400">
-        Click any Video/Overlay clip, Audio clip, Caption/Voiceover block, Junction transition,
-        Track header, or Camera keyframe to inspect its settings.
+      <div className="rounded-lg border border-dashed border-zinc-700 p-3 text-center text-zinc-400 space-y-2">
+        <p>
+          Click any Video/Overlay clip, Audio clip, Caption/VO block, Transition,
+          Track header, or Camera keyframe to inspect its settings.
+        </p>
+        {onOpenBulkScript && (
+          <button
+            type="button"
+            onClick={onOpenBulkScript}
+            className="inline-flex items-center gap-1.5 rounded border border-sky-500/40 bg-sky-500/15 px-3 py-1 text-[11px] font-medium text-sky-200 hover:bg-sky-500/25"
+          >
+            <FileText className="h-3.5 w-3.5" />
+            Paste Full Script → Auto-Split Captions
+          </button>
+        )}
+      </div>
+
+      <div className="space-y-2.5 rounded-lg border border-zinc-800 bg-[#11141b] p-3">
+        <span className="block font-semibold text-zinc-200">Caption Style Presets</span>
+        <div className="grid grid-cols-2 gap-1.5">
+          {CAPTION_STYLE_PRESETS.map((preset) => (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() =>
+                onUpdateProject(
+                  (prev) => ({
+                    ...prev,
+                    caption_settings: { ...prev.caption_settings, ...preset.patch },
+                  }),
+                  { label: `Apply caption preset "${preset.label}"` }
+                )
+              }
+              className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-[11px] font-medium text-zinc-200 hover:border-emerald-500/50 hover:bg-zinc-800"
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="space-y-2.5 rounded-lg border border-zinc-800 bg-[#11141b] p-3">
@@ -2002,6 +2325,180 @@ export function ContextualInspector({
                 )
               }
               className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100"
+            />
+          </label>
+        </div>
+
+        <div className="grid grid-cols-4 gap-2 pt-1">
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] text-zinc-400">Text</span>
+            <input
+              type="color"
+              aria-label="Global Caption Text Color"
+              value={assColorToHex(project.caption_settings.primary_color, "#ffffff")}
+              onChange={(e) =>
+                onUpdateProject(
+                  (prev) => ({
+                    ...prev,
+                    caption_settings: {
+                      ...prev.caption_settings,
+                      primary_color: hexToAssColor(e.target.value),
+                    },
+                  }),
+                  { label: "Change caption text color", coalesceKey: "global-cap-color" }
+                )
+              }
+              className="h-7 w-full cursor-pointer rounded border border-zinc-700 bg-zinc-900"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] text-zinc-400">Outline</span>
+            <input
+              type="color"
+              aria-label="Global Caption Outline Color"
+              value={assColorToHex(project.caption_settings.outline_color, "#000000")}
+              onChange={(e) =>
+                onUpdateProject(
+                  (prev) => ({
+                    ...prev,
+                    caption_settings: {
+                      ...prev.caption_settings,
+                      outline_color: hexToAssColor(e.target.value),
+                    },
+                  }),
+                  { label: "Change caption outline color", coalesceKey: "global-cap-out" }
+                )
+              }
+              className="h-7 w-full cursor-pointer rounded border border-zinc-700 bg-zinc-900"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] text-zinc-400">Box Bg</span>
+            <input
+              type="color"
+              aria-label="Global Caption Background Color"
+              value={assColorToHex(project.caption_settings.back_color, "#000000")}
+              onChange={(e) =>
+                onUpdateProject(
+                  (prev) => ({
+                    ...prev,
+                    caption_settings: {
+                      ...prev.caption_settings,
+                      back_color: hexToAssColor(e.target.value, "40"),
+                    },
+                  }),
+                  { label: "Change caption box color", coalesceKey: "global-cap-bg" }
+                )
+              }
+              className="h-7 w-full cursor-pointer rounded border border-zinc-700 bg-zinc-900"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] text-zinc-400">Highlight</span>
+            <input
+              type="color"
+              aria-label="Global Karaoke Highlight Color"
+              value={assColorToHex(project.caption_settings.highlight_color, "#ffff00")}
+              onChange={(e) =>
+                onUpdateProject(
+                  (prev) => ({
+                    ...prev,
+                    caption_settings: {
+                      ...prev.caption_settings,
+                      highlight_color: hexToAssColor(e.target.value),
+                    },
+                  }),
+                  { label: "Change karaoke highlight color", coalesceKey: "global-cap-hi" }
+                )
+              }
+              className="h-7 w-full cursor-pointer rounded border border-zinc-700 bg-zinc-900"
+            />
+          </label>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <label className="flex flex-col gap-1">
+            <span className="text-[11px] text-zinc-400">Animation</span>
+            <select
+              value={project.caption_settings.animation ?? "none"}
+              onChange={(e) =>
+                onUpdateProject(
+                  (prev) => ({
+                    ...prev,
+                    caption_settings: {
+                      ...prev.caption_settings,
+                      animation: e.target.value as CaptionAnimation,
+                    },
+                  }),
+                  { label: "Change global caption animation" }
+                )
+              }
+              className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-zinc-100"
+            >
+              <option value="none">None</option>
+              <option value="pop">Pop In</option>
+              <option value="fade">Fade In/Out</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-[11px] text-zinc-400">Drop Shadow</span>
+            <BufferedNumberInput
+              step={1}
+              min={0}
+              max={12}
+              precision={0}
+              value={project.caption_settings.shadow ?? 0}
+              onCommit={(shadow) =>
+                onUpdateProject(
+                  (prev) => ({
+                    ...prev,
+                    caption_settings: { ...prev.caption_settings, shadow },
+                  }),
+                  { label: "Change caption shadow", coalesceKey: "global-shadow" }
+                )
+              }
+              className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-100"
+            />
+          </label>
+        </div>
+
+        <div className="flex flex-col gap-1.5 pt-1 text-[11px] text-zinc-300">
+          <label className="flex items-center justify-between">
+            <span>Opaque Subtitle Pill Box</span>
+            <input
+              type="checkbox"
+              checked={(project.caption_settings.border_style ?? 1) === 3}
+              onChange={(e) =>
+                onUpdateProject(
+                  (prev) => ({
+                    ...prev,
+                    caption_settings: {
+                      ...prev.caption_settings,
+                      border_style: e.target.checked ? 3 : 1,
+                    },
+                  }),
+                  { label: "Toggle caption background box" }
+                )
+              }
+            />
+          </label>
+          <label className="flex items-center justify-between">
+            <span>Word-by-Word Karaoke Highlight</span>
+            <input
+              type="checkbox"
+              checked={Boolean(project.caption_settings.karaoke_highlight)}
+              onChange={(e) =>
+                onUpdateProject(
+                  (prev) => ({
+                    ...prev,
+                    caption_settings: {
+                      ...prev.caption_settings,
+                      karaoke_highlight: e.target.checked,
+                    },
+                  }),
+                  { label: "Toggle karaoke word highlight" }
+                )
+              }
             />
           </label>
         </div>

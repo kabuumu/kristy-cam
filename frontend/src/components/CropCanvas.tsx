@@ -1,18 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  ChevronLeft,
+  ChevronRight,
   Eye,
   EyeOff,
   Film,
   Grid,
   Layers,
   Loader2,
+  Maximize,
   Maximize2,
   Monitor,
   Pause,
   Play,
   Plus,
+  Repeat,
+  RotateCw,
+  SkipBack,
+  SkipForward,
   Sparkles,
+  Volume2,
+  VolumeX,
   X,
 } from "lucide-react";
 import { apiClient } from "../api/client";
@@ -26,6 +35,7 @@ import type {
   VisualClip,
 } from "../types/studio";
 import {
+  assColorToHex,
   clampCropPosition,
   computeAudioDuckingFactorAt,
   computeAudioFadeGainAt,
@@ -52,10 +62,19 @@ interface CropCanvasProps {
   isPlaying: boolean;
   isProjectPlaying: boolean;
   preparingPlayback?: boolean;
+  loopPlayback?: boolean;
+  playbackRate?: number;
+  masterVolume?: number;
+  masterMuted?: boolean;
   canPreview: boolean;
   previewBusy: boolean;
   previewModalOpen: boolean;
   onTogglePlay: () => void;
+  onToggleLoop?: () => void;
+  onPlaybackRateChange?: (rate: number) => void;
+  onMasterVolumeChange?: (vol: number) => void;
+  onToggleMasterMute?: () => void;
+  onProjectTimeChange?: (t: number) => void;
   onSourceTimeChange: (t: number) => void;
   onUpdateCameraKeyframes: (
     keyframes: CropKeyframe[],
@@ -115,6 +134,23 @@ type DragMode =
       startClientY: number;
       origScale: number;
     }
+  | {
+      type: "overlay-rotate";
+      trackId: string;
+      clipId: string;
+      centerX: number;
+      centerY: number;
+      startAngleDeg: number;
+      origRotation: number;
+    }
+  | {
+      type: "caption-move";
+      trackId: string;
+      clipId: string;
+      startClientY: number;
+      origMarginV: number;
+      align: "bottom" | "center" | "top";
+    }
   | null;
 
 export function CropCanvas({
@@ -128,10 +164,19 @@ export function CropCanvas({
   isPlaying,
   isProjectPlaying,
   preparingPlayback = false,
+  loopPlayback = false,
+  playbackRate = 1.0,
+  masterVolume = 1.0,
+  masterMuted = false,
   canPreview,
   previewBusy,
   previewModalOpen,
   onTogglePlay,
+  onToggleLoop,
+  onPlaybackRateChange,
+  onMasterVolumeChange,
+  onToggleMasterMute,
+  onProjectTimeChange,
   onSourceTimeChange,
   onUpdateCameraKeyframes,
   onUpdateTracks,
@@ -142,6 +187,7 @@ export function CropCanvas({
   onSelectItem,
   onSetMonitorMode,
 }: CropCanvasProps) {
+  const sectionRef = useRef<HTMLElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const cameraStageRef = useRef<HTMLDivElement | null>(null);
   const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -154,7 +200,12 @@ export function CropCanvas({
   const [showMask, setShowMask] = useState(true);
   const [showSafeGuide, setShowSafeGuide] = useState(true);
   const [dragMode, setDragMode] = useState<DragMode>(null);
+  const [snapGuides, setSnapGuides] = useState<{ x: number | null; y: number | null }>({
+    x: null,
+    y: null,
+  });
   const [stageHeightPx, setStageHeightPx] = useState(420);
+  const effectiveMasterGain = masterMuted ? 0 : Math.max(0, Math.min(1, masterVolume));
 
   const projectId = project.project_id;
   const outW = Math.max(2, project.output_settings.width);
@@ -380,8 +431,30 @@ export function CropCanvas({
         if (!rect || rect.width <= 0 || rect.height <= 0) return;
         const dxNorm = (e.clientX - dragMode.startClientX) / rect.width;
         const dyNorm = (e.clientY - dragMode.startClientY) / rect.height;
-        const nextX = Number(Math.max(-0.5, Math.min(1.5, dragMode.origX + dxNorm)).toFixed(4));
-        const nextY = Number(Math.max(-0.5, Math.min(1.5, dragMode.origY + dyNorm)).toFixed(4));
+        let nextX = Math.max(-0.5, Math.min(1.5, dragMode.origX + dxNorm));
+        let nextY = Math.max(-0.5, Math.min(1.5, dragMode.origY + dyNorm));
+        let guideX: number | null = null;
+        let guideY: number | null = null;
+        if (!e.shiftKey) {
+          const snapTol = 0.025;
+          for (const targetX of [0.5, 0.06, 0.94]) {
+            if (Math.abs(nextX - targetX) <= snapTol) {
+              nextX = targetX;
+              guideX = targetX;
+              break;
+            }
+          }
+          for (const targetY of [0.5, 0.1, 0.82]) {
+            if (Math.abs(nextY - targetY) <= snapTol) {
+              nextY = targetY;
+              guideY = targetY;
+              break;
+            }
+          }
+        }
+        setSnapGuides({ x: guideX, y: guideY });
+        const finalX = Number(nextX.toFixed(4));
+        const finalY = Number(nextY.toFixed(4));
         onUpdateTracks(
           (prevTracks) =>
             prevTracks.map((tr) => {
@@ -390,7 +463,7 @@ export function CropCanvas({
                 ...tr,
                 clips: tr.clips.map((c) =>
                   c.id === dragMode.clipId
-                    ? { ...c, transform: { ...c.transform, x: nextX, y: nextY } }
+                    ? { ...c, transform: { ...c.transform, x: finalX, y: finalY } }
                     : c
                 ),
               };
@@ -427,11 +500,87 @@ export function CropCanvas({
             coalesceKey: `ov-scale-${dragMode.clipId}`,
           }
         );
+      } else if (dragMode.type === "overlay-rotate") {
+        const angle =
+          (Math.atan2(e.clientY - dragMode.centerY, e.clientX - dragMode.centerX) * 180) /
+          Math.PI;
+        let nextRot = dragMode.origRotation + (angle - dragMode.startAngleDeg);
+        if (!e.shiftKey) {
+          for (const snapDeg of [-180, -90, 0, 90, 180]) {
+            if (Math.abs(nextRot - snapDeg) <= 4) {
+              nextRot = snapDeg;
+              break;
+            }
+          }
+        }
+        const clampedRot = Number(Math.max(-360, Math.min(360, nextRot)).toFixed(1));
+        onUpdateTracks(
+          (prevTracks) =>
+            prevTracks.map((tr) => {
+              if (tr.kind !== "video" || tr.id !== dragMode.trackId) return tr;
+              return {
+                ...tr,
+                clips: tr.clips.map((c) =>
+                  c.id === dragMode.clipId
+                    ? {
+                        ...c,
+                        transform: { ...c.transform, rotation_deg: clampedRot },
+                      }
+                    : c
+                ),
+              };
+            }),
+          {
+            label: "Rotate overlay layer",
+            coalesceKey: `ov-rot-${dragMode.clipId}`,
+          }
+        );
+      } else if (dragMode.type === "caption-move") {
+        const rect = stageRef.current?.getBoundingClientRect();
+        if (!rect || rect.height <= 0) return;
+        const dyPx = e.clientY - dragMode.startClientY;
+        const dyOut = (dyPx / rect.height) * outH;
+        const nextMarginV = Math.round(
+          Math.max(
+            0,
+            Math.min(
+              outH - 80,
+              dragMode.align === "top"
+                ? dragMode.origMarginV + dyOut * 2
+                : dragMode.origMarginV - dyOut
+            )
+          )
+        );
+        onUpdateTracks(
+          (prevTracks) =>
+            prevTracks.map((tr) => {
+              if (tr.kind !== "caption" || tr.id !== dragMode.trackId) return tr;
+              return {
+                ...tr,
+                clips: tr.clips.map((c) =>
+                  c.id === dragMode.clipId
+                    ? {
+                        ...c,
+                        style_override: {
+                          ...c.style_override,
+                          margin_v: nextMarginV,
+                        },
+                      }
+                    : c
+                ),
+              };
+            }),
+          {
+            label: "Reposition caption",
+            coalesceKey: `cap-mv-${dragMode.clipId}`,
+          }
+        );
       }
     };
 
     const handleMouseUp = () => {
       setDragMode(null);
+      setSnapGuides({ x: null, y: null });
       onEndHistoryTransaction?.();
     };
 
@@ -447,8 +596,9 @@ export function CropCanvas({
   useEffect(() => {
     const vid = sourceVideoRef.current;
     if (!vid || !activeSourceUrl || monitorMode !== "source") return;
-    vid.volume = 1;
-    vid.muted = false;
+    vid.volume = effectiveMasterGain;
+    vid.muted = effectiveMasterGain <= 0;
+    vid.playbackRate = Math.max(0.25, Math.min(4, playbackRate));
     if (isPlaying && !isProjectPlaying) {
       if (Math.abs(vid.currentTime - sourceTime) > 0.35) {
         vid.currentTime = Math.max(0, sourceTime);
@@ -462,7 +612,7 @@ export function CropCanvas({
         vid.currentTime = Math.max(0, sourceTime);
       }
     }
-  }, [monitorMode, activeSourceUrl, isPlaying, isProjectPlaying, sourceTime]);
+  }, [monitorMode, activeSourceUrl, isPlaying, isProjectPlaying, sourceTime, effectiveMasterGain, playbackRate]);
 
   // 2. Sync Camera Frame reference <video>
   useEffect(() => {
@@ -481,6 +631,7 @@ export function CropCanvas({
     const camGain = activeCameraLayer.track.muted
       ? 0
       : activeCameraLayer.clip.volume *
+        effectiveMasterGain *
         computeAudioFadeGainAt(
           activeCameraLayer.clip.duration_sec,
           activeCameraLayer.clip.audio_fade_in_sec,
@@ -489,7 +640,7 @@ export function CropCanvas({
         );
     vid.volume = Math.max(0, Math.min(1, camGain));
     vid.muted = camGain <= 0;
-    vid.playbackRate = Math.max(0.25, Math.min(4, activeCameraLayer.clip.speed));
+    vid.playbackRate = Math.max(0.25, Math.min(4, activeCameraLayer.clip.speed * playbackRate));
     if (isPlaying && !srcState.isFrozen) {
       if (Math.abs(vid.currentTime - srcState.sourceTime) > 0.35) {
         vid.currentTime = Math.max(0, srcState.sourceTime);
@@ -501,7 +652,7 @@ export function CropCanvas({
         vid.currentTime = Math.max(0, srcState.sourceTime);
       }
     }
-  }, [monitorMode, framingMode, activeCameraLayer, projectTime, isPlaying]);
+  }, [monitorMode, framingMode, activeCameraLayer, projectTime, isPlaying, effectiveMasterGain, playbackRate]);
 
   // 3. Sync Active Visual Layer <video> elements
   useEffect(() => {
@@ -528,6 +679,7 @@ export function CropCanvas({
       const audioGain = layer.track.muted
         ? 0
         : layer.clip.volume *
+          effectiveMasterGain *
           computeAudioFadeGainAt(
             layer.clip.duration_sec,
             layer.clip.audio_fade_in_sec,
@@ -536,7 +688,7 @@ export function CropCanvas({
           );
       vid.volume = Math.max(0, Math.min(1, audioGain));
       vid.muted = audioGain <= 0;
-      vid.playbackRate = Math.max(0.25, Math.min(4, layer.clip.speed));
+      vid.playbackRate = Math.max(0.25, Math.min(4, layer.clip.speed * playbackRate));
 
       if (isPlaying && !srcState.isFrozen) {
         if (Math.abs(vid.currentTime - srcState.sourceTime) > 0.35) {
@@ -558,7 +710,7 @@ export function CropCanvas({
         vid.pause();
       }
     }
-  }, [monitorMode, framingMode, activeVisualLayers, projectTime, isPlaying]);
+  }, [monitorMode, framingMode, activeVisualLayers, projectTime, isPlaying, effectiveMasterGain, playbackRate]);
 
   // 4. Sync Active Audio Track <audio> pool
   useEffect(() => {
@@ -577,9 +729,10 @@ export function CropCanvas({
 
         const vol =
           layer.effectiveVolume *
+          effectiveMasterGain *
           (layer.track.duck_under_narration ? duckFactor : 1.0);
         aud.volume = Math.max(0, Math.min(1, vol));
-        aud.playbackRate = Math.max(0.25, Math.min(4, layer.clip.speed));
+        aud.playbackRate = Math.max(0.25, Math.min(4, layer.clip.speed * playbackRate));
 
         if (isPlaying && (layer.clip.loop || scaled < availDur)) {
           if (aud.readyState >= 1 && Math.abs(aud.currentTime - targetTime) > 0.25) {
@@ -599,7 +752,7 @@ export function CropCanvas({
         aud.pause();
       }
     }
-  }, [monitorMode, activeAudioLayers, duckFactor, isPlaying, projectTime]);
+  }, [monitorMode, activeAudioLayers, duckFactor, isPlaying, projectTime, effectiveMasterGain, playbackRate]);
 
   // 5. Sync Active Kokoro TTS Voiceover <audio> pool
   useEffect(() => {
@@ -612,6 +765,8 @@ export function CropCanvas({
         activeIds.add(layer.clip.id);
         const aud = captionAudioMapRef.current[layer.clip.id];
         if (!aud) continue;
+        aud.volume = effectiveMasterGain;
+        aud.playbackRate = Math.max(0.5, Math.min(2, playbackRate));
         const within =
           art.audio_duration > 0 && layer.localTime < art.audio_duration - 0.02;
         if (isPlaying && within) {
@@ -635,7 +790,7 @@ export function CropCanvas({
         aud.pause();
       }
     }
-  }, [monitorMode, activeCaptions, manifest.caption_artifacts, isPlaying, projectTime]);
+  }, [monitorMode, activeCaptions, manifest.caption_artifacts, isPlaying, projectTime, effectiveMasterGain, playbackRate]);
 
   // Determine whether any visible <video> is mounted right now so we can mount a hidden
   // fallback primary <video> during gaps / 0-video-clip timelines
@@ -929,6 +1084,17 @@ export function CropCanvas({
               selection.clipId === clip.id &&
               selection.trackId === layer.track.id;
 
+            const flipX = clip.transform.flip_h ? -1 : 1;
+            const flipY = clip.transform.flip_v ? -1 : 1;
+            const ca = clip.color_adjust;
+            const cssFilter =
+              ca &&
+              (Math.abs(ca.brightness) > 0.001 ||
+                Math.abs(ca.contrast - 1) > 0.001 ||
+                Math.abs(ca.saturation - 1) > 0.001)
+                ? `brightness(${(1 + ca.brightness).toFixed(3)}) contrast(${ca.contrast.toFixed(3)}) saturate(${ca.saturation.toFixed(3)})`
+                : undefined;
+
             if (layer.track.camera_follow) {
               const crop = evaluateCropAt(cameraKeyframes, projectTime, aW, aH, outW, outH);
               const ideal = computeIdealCrop(aW, aH, crop.zoom, outW, outH);
@@ -945,9 +1111,10 @@ export function CropCanvas({
                     top: `${clip.transform.y * 100 + edge.offsetYPct}%`,
                     width: `${clip.transform.scale * 100}%`,
                     height: `${clip.transform.scale * 100}%`,
-                    transform: `translate(-50%, -50%) rotate(${clip.transform.rotation_deg}deg) scale(${edge.scaleMultiplier})`,
+                    transform: `translate(-50%, -50%) rotate(${clip.transform.rotation_deg}deg) scale(${edge.scaleMultiplier * flipX}, ${edge.scaleMultiplier * flipY})`,
                     opacity: effOpacity,
                     clipPath: edge.clipPathCss,
+                    filter: cssFilter,
                   }}
                 >
                   {clip.kind === "image" && mediaUrl ? (
@@ -1037,58 +1204,109 @@ export function CropCanvas({
                   clipPath: edge.clipPathCss,
                 }}
               >
-                {clip.kind === "image" && mediaUrl ? (
-                  <img
-                    src={mediaUrl}
-                    alt={clip.id}
-                    className="h-full w-full object-contain pointer-events-none"
-                  />
-                ) : mediaUrl ? (
-                  <video
-                    ref={(el) => {
-                      videoElMapRef.current[clip.id] = el;
-                    }}
-                    data-clip-id={clip.id}
-                    src={mediaUrl}
-                    playsInline
-                    className="h-full w-full object-contain pointer-events-none"
-                  />
-                ) : null}
+                <div
+                  className="h-full w-full"
+                  style={{
+                    transform: `scale(${flipX}, ${flipY})`,
+                    filter: cssFilter,
+                  }}
+                >
+                  {clip.kind === "image" && mediaUrl ? (
+                    <img
+                      src={mediaUrl}
+                      alt={clip.id}
+                      className="h-full w-full object-contain pointer-events-none"
+                    />
+                  ) : mediaUrl ? (
+                    <video
+                      ref={(el) => {
+                        videoElMapRef.current[clip.id] = el;
+                      }}
+                      data-clip-id={clip.id}
+                      src={mediaUrl}
+                      playsInline
+                      className="h-full w-full object-contain pointer-events-none"
+                    />
+                  ) : null}
+                </div>
 
-                {isSelectedOverlay &&
-                  !layer.track.locked &&
-                  ["tl", "tr", "bl", "br"].map((corner) => (
+                {isSelectedOverlay && !layer.track.locked && (
+                  <>
+                    {/* On-Canvas Rotation Handle */}
                     <div
-                      key={corner}
                       onMouseDown={(e) => {
                         e.stopPropagation();
                         e.preventDefault();
-                        onBeginHistoryTransaction?.("Scale overlay layer");
+                        const parentRect = e.currentTarget.parentElement?.getBoundingClientRect();
+                        if (!parentRect) return;
+                        const cx = parentRect.left + parentRect.width / 2;
+                        const cy = parentRect.top + parentRect.height / 2;
+                        const startAngleDeg =
+                          (Math.atan2(e.clientY - cy, e.clientX - cx) * 180) / Math.PI;
+                        onBeginHistoryTransaction?.("Rotate overlay layer");
                         setDragMode({
-                          type: "overlay-scale",
+                          type: "overlay-rotate",
                           trackId: layer.track.id,
                           clipId: clip.id,
-                          corner,
-                          startClientX: e.clientX,
-                          startClientY: e.clientY,
-                          origScale: clip.transform.scale,
+                          centerX: cx,
+                          centerY: cy,
+                          startAngleDeg,
+                          origRotation: clip.transform.rotation_deg,
                         });
                       }}
-                      title="Drag corner to resize overlay"
-                      className={`absolute h-2.5 w-2.5 rounded-sm border border-zinc-950 bg-purple-400 ${
-                        corner === "tl"
-                          ? "-top-1.5 -left-1.5 cursor-nwse-resize"
-                          : corner === "tr"
-                            ? "-top-1.5 -right-1.5 cursor-nesw-resize"
-                            : corner === "bl"
-                              ? "-bottom-1.5 -left-1.5 cursor-nesw-resize"
-                              : "-bottom-1.5 -right-1.5 cursor-nwse-resize"
-                      }`}
-                    />
-                  ))}
+                      title="Drag to rotate overlay (hold Shift for free angle)"
+                      className="absolute -top-6 left-1/2 flex h-4 w-4 -translate-x-1/2 cursor-grab items-center justify-center rounded-full border border-zinc-950 bg-purple-400 text-zinc-950 shadow hover:bg-purple-300"
+                    >
+                      <RotateCw className="h-2.5 w-2.5" />
+                    </div>
+                    {["tl", "tr", "bl", "br"].map((corner) => (
+                      <div
+                        key={corner}
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          onBeginHistoryTransaction?.("Scale overlay layer");
+                          setDragMode({
+                            type: "overlay-scale",
+                            trackId: layer.track.id,
+                            clipId: clip.id,
+                            corner,
+                            startClientX: e.clientX,
+                            startClientY: e.clientY,
+                            origScale: clip.transform.scale,
+                          });
+                        }}
+                        title="Drag corner to resize overlay"
+                        className={`absolute h-2.5 w-2.5 rounded-sm border border-zinc-950 bg-purple-400 ${
+                          corner === "tl"
+                            ? "-top-1.5 -left-1.5 cursor-nwse-resize"
+                            : corner === "tr"
+                              ? "-top-1.5 -right-1.5 cursor-nesw-resize"
+                              : corner === "bl"
+                                ? "-bottom-1.5 -left-1.5 cursor-nesw-resize"
+                                : "-bottom-1.5 -right-1.5 cursor-nwse-resize"
+                        }`}
+                      />
+                    ))}
+                  </>
+                )}
               </div>
             );
           })
+        )}
+
+        {/* Canvas Magnetic Alignment Snap Guides */}
+        {snapGuides.x !== null && (
+          <div
+            className="pointer-events-none absolute inset-y-0 z-30 w-px bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.9)]"
+            style={{ left: `${snapGuides.x * 100}%` }}
+          />
+        )}
+        {snapGuides.y !== null && (
+          <div
+            className="pointer-events-none absolute inset-x-0 z-30 h-px bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.9)]"
+            style={{ top: `${snapGuides.y * 100}%` }}
+          />
         )}
 
         {/* Safe Area Overlay */}
@@ -1098,7 +1316,7 @@ export function CropCanvas({
           </div>
         )}
 
-        {/* Live Synchronized Caption Overlay Preview */}
+        {/* Live Synchronized Caption Overlay Preview (Draggable vertically + Styled + Karaoke) */}
         {activeCaptions.map((capLayer) => {
           const text = capLayer.clip.display_text.trim();
           if (!text) return null;
@@ -1107,11 +1325,33 @@ export function CropCanvas({
             capLayer.clip.style_override?.font_size ?? captionSettings.font_size;
           const marginV =
             capLayer.clip.style_override?.margin_v ?? captionSettings.margin_v;
+          const textColor = assColorToHex(
+            capLayer.clip.style_override?.primary_color ?? captionSettings.primary_color,
+            "#ffffff"
+          );
+          const outlineColor = assColorToHex(
+            capLayer.clip.style_override?.outline_color ?? captionSettings.outline_color,
+            "#000000"
+          );
+          const backColor = assColorToHex(
+            capLayer.clip.style_override?.back_color ?? captionSettings.back_color,
+            "#000000"
+          );
+          const highlightColor = assColorToHex(captionSettings.highlight_color, "#ffff00");
+          const borderStyle =
+            capLayer.clip.style_override?.border_style ?? captionSettings.border_style ?? 1;
+          const useKaraoke =
+            capLayer.clip.style_override?.karaoke_highlight ??
+            captionSettings.karaoke_highlight ??
+            false;
+          const anim =
+            capLayer.clip.style_override?.animation ?? captionSettings.animation ?? "none";
+
           const scaledFont = Math.max(
             11,
             Math.round((fontSizePx / Math.max(1, outH)) * stageHeightPx)
           );
-          const marginPct = Math.min(44, (marginV / Math.max(1, outH)) * 100);
+          const marginPct = Math.min(70, (marginV / Math.max(1, outH)) * 100);
           const posStyle =
             align === "top"
               ? { top: `${Math.max(4, marginPct * 0.5)}%` }
@@ -1119,27 +1359,87 @@ export function CropCanvas({
                 ? { top: "50%", transform: "translateY(-50%)" }
                 : { bottom: `${marginPct}%` };
 
+          // Compute pop/fade preview animation
+          let animScale = 1;
+          let animOpacity = 1;
+          if (anim === "pop" && capLayer.localTime < 0.11) {
+            animScale = 0.85 + (capLayer.localTime / 0.11) * 0.15;
+          } else if (anim === "fade") {
+            const fadeIn = Math.min(1, capLayer.localTime / 0.12);
+            const fadeOut = Math.min(1, Math.max(0, (capLayer.effectiveDuration - capLayer.localTime) / 0.12));
+            animOpacity = Math.min(fadeIn, fadeOut);
+          }
+
+          const words = text.split(/\s+/);
+          const progressFrac =
+            capLayer.effectiveDuration > 0 ? Math.max(0, Math.min(1, capLayer.localTime / capLayer.effectiveDuration)) : 0;
+          const activeWordCount = Math.ceil(progressFrac * words.length);
+          const isCapSelected =
+            selection?.type === "caption-clip" &&
+            selection.trackId === capLayer.track.id &&
+            selection.clipId === capLayer.clip.id;
+
           return (
             <div
               key={`${capLayer.track.id}-${capLayer.clip.id}`}
-              onClick={(e) => {
+              onMouseDown={(e) => {
                 e.stopPropagation();
                 onSelectItem({
                   type: "caption-clip",
                   trackId: capLayer.track.id,
                   clipId: capLayer.clip.id,
                 });
+                if (capLayer.track.locked || align === "center") return;
+                e.preventDefault();
+                onBeginHistoryTransaction?.("Reposition caption");
+                setDragMode({
+                  type: "caption-move",
+                  trackId: capLayer.track.id,
+                  clipId: capLayer.clip.id,
+                  startClientY: e.clientY,
+                  origMarginV: marginV,
+                  align,
+                });
               }}
-              className="absolute inset-x-[6%] text-center font-extrabold uppercase tracking-wide text-white cursor-pointer"
+              title="Click to select caption • Drag vertically to adjust position"
+              className={`absolute inset-x-[6%] text-center font-extrabold uppercase tracking-wide ${
+                align === "center" ? "cursor-pointer" : "cursor-ns-resize"
+              } ${isCapSelected ? "ring-1 ring-sky-400/70 rounded" : ""}`}
               style={{
                 ...posStyle,
                 fontSize: `${scaledFont}px`,
                 lineHeight: 1.15,
+                opacity: animOpacity,
+                transform: `${posStyle.transform ?? ""} scale(${animScale})`.trim(),
+                color: textColor,
                 textShadow:
-                  "-1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000, 0 2px 6px rgba(0,0,0,0.85)",
+                  borderStyle === 3
+                    ? "none"
+                    : `-1.5px -1.5px 0 ${outlineColor}, 1.5px -1.5px 0 ${outlineColor}, -1.5px 1.5px 0 ${outlineColor}, 1.5px 1.5px 0 ${outlineColor}, 0 2px 6px rgba(0,0,0,0.85)`,
               }}
             >
-              {text}
+              <span
+                className={borderStyle === 3 ? "rounded px-2 py-0.5" : undefined}
+                style={
+                  borderStyle === 3
+                    ? { backgroundColor: `${backColor}cc` }
+                    : undefined
+                }
+              >
+                {useKaraoke
+                  ? words.map((w, i) => (
+                      <span
+                        key={i}
+                        style={{
+                          color: i < activeWordCount ? highlightColor : textColor,
+                        }}
+                      >
+                        {w}
+                        {i < words.length - 1 ? " " : ""}
+                      </span>
+                    ))
+                  : text}
+              </span>
             </div>
           );
         })}
@@ -1147,8 +1447,24 @@ export function CropCanvas({
     );
   };
 
+  const fps = Math.max(1, project.output_settings.fps || 30);
+  const frameStep = 1 / fps;
+
+  const stepPlayhead = (deltaSec: number) => {
+    if (monitorMode === "source") {
+      onSourceTimeChange(Math.max(0, Number((sourceTime + deltaSec).toFixed(3))));
+    } else if (onProjectTimeChange) {
+      onProjectTimeChange(
+        Math.max(0, Math.min(totalProjectDur, Number((projectTime + deltaSec).toFixed(3))))
+      );
+    }
+  };
+
   return (
-    <section className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-zinc-800 bg-[#151821]">
+    <section
+      ref={sectionRef}
+      className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-zinc-800 bg-[#151821]"
+    >
       {/* Stage Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 px-3 py-2">
         <div className="flex flex-wrap items-center gap-2">
@@ -1241,6 +1557,21 @@ export function CropCanvas({
 
           <button
             type="button"
+            onClick={() => {
+              if (document.fullscreenElement) {
+                document.exitFullscreen().catch(() => {});
+              } else {
+                sectionRef.current?.requestFullscreen?.().catch(() => {});
+              }
+            }}
+            title="Toggle Fullscreen Monitor"
+            className="rounded border border-zinc-700 bg-zinc-800/60 p-1 text-zinc-300 hover:bg-zinc-700"
+          >
+            <Maximize className="h-3.5 w-3.5" />
+          </button>
+
+          <button
+            type="button"
             disabled={previewBusy || !canPreview}
             onClick={() => onRenderPreview()}
             className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
@@ -1305,16 +1636,37 @@ export function CropCanvas({
 
       {/* Transport Bar */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 bg-[#13161c] px-3 py-2 text-xs">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() =>
+              monitorMode === "source"
+                ? onSourceTimeChange(0)
+                : onProjectTimeChange?.(0)
+            }
+            title="Jump to Start (Home)"
+            className="rounded border border-zinc-700 bg-zinc-800/80 p-1 text-zinc-300 hover:bg-zinc-700"
+          >
+            <SkipBack className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => stepPlayhead(-frameStep)}
+            title="Step Back 1 Frame (←)"
+            className="rounded border border-zinc-700 bg-zinc-800/80 p-1 text-zinc-300 hover:bg-zinc-700"
+          >
+            <ChevronLeft className="h-3.5 w-3.5" />
+          </button>
           <button
             type="button"
             disabled={preparingPlayback}
             onClick={onTogglePlay}
+            title="Play / Pause (Space)"
             className="inline-flex items-center gap-1 rounded bg-zinc-800 px-2.5 py-1 text-zinc-100 hover:bg-zinc-700 disabled:opacity-50"
           >
             {preparingPlayback ? (
               <>
-                <Loader2 className="h-3.5 w-3.5 animate-spin" /> Preparing Audio...
+                <Loader2 className="h-3.5 w-3.5 animate-spin" /> Preparing...
               </>
             ) : isPlaying ? (
               <>
@@ -1326,6 +1678,56 @@ export function CropCanvas({
               </>
             )}
           </button>
+          <button
+            type="button"
+            onClick={() => stepPlayhead(frameStep)}
+            title="Step Forward 1 Frame (→)"
+            className="rounded border border-zinc-700 bg-zinc-800/80 p-1 text-zinc-300 hover:bg-zinc-700"
+          >
+            <ChevronRight className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              monitorMode === "source"
+                ? onSourceTimeChange(activeSourceMeta?.duration ?? 0)
+                : onProjectTimeChange?.(totalProjectDur)
+            }
+            title="Jump to End (End)"
+            className="rounded border border-zinc-700 bg-zinc-800/80 p-1 text-zinc-300 hover:bg-zinc-700"
+          >
+            <SkipForward className="h-3.5 w-3.5" />
+          </button>
+
+          {onToggleLoop && (
+            <button
+              type="button"
+              onClick={onToggleLoop}
+              title="Toggle Loop Playback"
+              className={`rounded border p-1 transition ${
+                loopPlayback
+                  ? "border-emerald-500/50 bg-emerald-500/20 text-emerald-200"
+                  : "border-zinc-700 bg-zinc-800/80 text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              <Repeat className="h-3.5 w-3.5" />
+            </button>
+          )}
+
+          {onPlaybackRateChange && (
+            <select
+              aria-label="Preview Playback Speed"
+              value={playbackRate}
+              onChange={(e) => onPlaybackRateChange(parseFloat(e.target.value))}
+              className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 font-mono text-[11px] text-zinc-200"
+            >
+              <option value={0.5}>0.5x</option>
+              <option value={1}>1.0x</option>
+              <option value={1.5}>1.5x</option>
+              <option value={2}>2.0x</option>
+            </select>
+          )}
+
           {monitorMode === "source" ? (
             <span className="font-mono text-sky-300">
               Src: {formatTimecode(sourceTime)}
@@ -1338,8 +1740,38 @@ export function CropCanvas({
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Master Preview Volume / Mute */}
+          {onToggleMasterMute && (
+            <div className="hidden sm:flex items-center gap-1 rounded border border-zinc-800 bg-zinc-900/70 px-1.5 py-0.5">
+              <button
+                type="button"
+                onClick={onToggleMasterMute}
+                title={masterMuted ? "Unmute Monitor" : "Mute Monitor"}
+                className="text-zinc-300 hover:text-white"
+              >
+                {masterMuted || masterVolume <= 0 ? (
+                  <VolumeX className="h-3.5 w-3.5 text-rose-400" />
+                ) : (
+                  <Volume2 className="h-3.5 w-3.5 text-emerald-400" />
+                )}
+              </button>
+              {onMasterVolumeChange && (
+                <input
+                  type="range"
+                  aria-label="Master Preview Volume"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={masterMuted ? 0 : masterVolume}
+                  onChange={(e) => onMasterVolumeChange(parseFloat(e.target.value))}
+                  className="w-14"
+                />
+              )}
+            </div>
+          )}
+
           {monitorMode === "timeline" && (
-            <span className="hidden md:inline-flex items-center gap-1 text-[11px] text-zinc-400">
+            <span className="hidden xl:inline-flex items-center gap-1 text-[11px] text-zinc-400">
               <Layers className="h-3 w-3 text-emerald-400" />
               {activeVisualLayers.length}V • {activeAudioLayers.length}A • {activeCaptions.length}T
             </span>

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import array
 import hmac
 import html
 import json
 import re
 import secrets
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -63,6 +65,7 @@ from backend.schemas import (
     AudioTrack,
     CaptionArtifactState,
     CaptionTrack,
+    ExportOptions,
     MediaAssetMetadata,
     MediaProxyState,
     ProjectInput,
@@ -81,6 +84,8 @@ from backend.storage import (
     check_source_media,
     compute_file_fingerprint,
     create_project,
+    delete_project,
+    duplicate_project,
     ensure_free_disk_space,
     ensure_primary_media_registered,
     get_project_dir,
@@ -88,9 +93,15 @@ from backend.storage import (
     load_manifest,
     load_project,
     relink_source_media,
+    rename_project,
     save_global_pronunciations,
     save_manifest,
     save_project,
+)
+from backend.subtitles import (
+    build_segment_subtitle_events,
+    build_timeline_subtitle_events,
+    render_srt_content,
 )
 from backend.tts import (
     compute_caption_tts_hash,
@@ -2024,10 +2035,22 @@ def api_project_preview(project_id: str, request: Request) -> JSONResponse:
 
 
 @app.post("/api/projects/{project_id}/export")
-def api_project_export(project_id: str, request: Request) -> JSONResponse:
+async def api_project_export(project_id: str, request: Request) -> JSONResponse:
     """Enqueue immutable project snapshot render + concat + .ass burn-in (202)."""
     data_dir = _get_data_dir(request)
     job_manager = _get_job_manager(request)
+
+    export_opts = ExportOptions()
+    raw_body = await request.body()
+    if raw_body and raw_body.strip():
+        try:
+            export_opts = ExportOptions.model_validate(json.loads(raw_body.decode("utf-8")))
+        except (ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid export options: {exc}") from exc
+
+    quality_crf_map = {"draft": 24, "standard": 19, "high": 16}
+    export_crf = quality_crf_map.get(export_opts.quality, 19)
+    export_fps_override = export_opts.fps
 
     try:
         project = load_project(project_id, data_dir=data_dir)
@@ -2038,6 +2061,14 @@ def api_project_export(project_id: str, request: Request) -> JSONResponse:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except StorageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    custom_export_path: Path | None = None
+    if export_opts.filename and export_opts.filename.strip():
+        safe_stem = re.sub(r"[^a-zA-Z0-9._-]+", "_", export_opts.filename.strip()).strip("._")
+        if safe_stem:
+            if not safe_stem.lower().endswith(".mp4"):
+                safe_stem = f"{safe_stem}.mp4"
+            custom_export_path = project_dir / "exports" / safe_stem
 
     manifest_snap = load_manifest(project_id, data_dir=data_dir).model_copy(deep=True)
     is_mt = _is_multitrack_project(project)
@@ -2159,8 +2190,11 @@ def api_project_export(project_id: str, request: Request) -> JSONResponse:
                 source_metadata=src_meta,
                 manifest=manifest_snap,
                 project_dir=project_dir,
+                export_path=custom_export_path,
                 cancel_event=ctx.cancel_event,
                 on_process_start=ctx.register_process,
+                crf=export_crf,
+                fps_override=export_fps_override,
             )
         except RenderCancelledError as exc:
             raise JobCancelledError(str(exc)) from exc
@@ -2260,6 +2294,380 @@ def api_stream_media(project_id: str, artifact_id: str, request: Request) -> Res
         media_type=media_type,
         headers=headers,
     )
+
+
+class RenameProjectBody(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+class DuplicateProjectBody(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+
+
+def _project_bundle(
+    project: ProjectInput,
+    manifest: ArtifactManifest,
+    project_dir: Path,
+) -> dict[str, Any]:
+    return {
+        "project": project.model_dump(mode="json"),
+        "manifest": manifest.model_dump(mode="json"),
+        "source_status": check_source_media(project.source_media),
+        "stale_tts_segments": _compute_stale_tts_segments(project, manifest, project_dir),
+        "stale_tts_captions": _compute_stale_tts_captions(project, manifest, project_dir),
+    }
+
+
+@app.patch("/api/projects/{project_id}")
+def api_rename_project(project_id: str, body: RenameProjectBody, request: Request) -> dict[str, Any]:
+    """Rename a project's title atomically and return updated bundle."""
+    data_dir = _get_data_dir(request)
+    try:
+        updated = rename_project(project_id, body.title, data_dir=data_dir)
+        manifest = load_manifest(project_id, data_dir=data_dir)
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _project_bundle(updated, manifest, project_dir)
+
+
+@app.post("/api/projects/{project_id}/duplicate", status_code=201)
+def api_duplicate_project(
+    project_id: str,
+    request: Request,
+    body: DuplicateProjectBody | None = None,
+) -> dict[str, Any]:
+    """Duplicate an existing project into a new project ID and return its bundle."""
+    data_dir = _get_data_dir(request)
+    new_id = f"proj_{uuid.uuid4().hex[:10]}"
+    try:
+        new_proj, new_manifest = duplicate_project(
+            project_id,
+            new_project_id=new_id,
+            new_title=body.title if body else None,
+            data_dir=data_dir,
+        )
+        new_dir = get_project_dir(new_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _project_bundle(new_proj, new_manifest, new_dir)
+
+
+@app.delete("/api/projects/{project_id}")
+def api_delete_project(project_id: str, request: Request) -> dict[str, Any]:
+    """Delete a project directory and all its local artifacts."""
+    data_dir = _get_data_dir(request)
+    job_manager = _get_job_manager(request)
+    active_jobs = [
+        j for j in job_manager.list_jobs(project_id=project_id)
+        if j.status in ("queued", "running")
+    ]
+    if active_jobs:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete project while a background job is running; cancel it first.",
+        )
+    try:
+        delete_project(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"deleted": True, "project_id": project_id}
+
+
+@app.get("/api/projects/{project_id}/subtitles.srt")
+def api_download_srt(project_id: str, request: Request) -> Response:
+    """Export project captions as a downloadable UTF-8 SubRip (.srt) file."""
+    data_dir = _get_data_dir(request)
+    try:
+        project = load_project(project_id, data_dir=data_dir)
+        manifest = load_manifest(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if _is_multitrack_project(project):
+        events = build_timeline_subtitle_events(project.tracks, manifest.caption_artifacts)
+    else:
+        events = []
+        offset_sec = 0.0
+        src_dur = manifest.source_metadata.duration if manifest.source_metadata else 0.0
+        for seg in project.segments:
+            seg_art = manifest.segments.get(seg.id)
+            audio_dur = seg_art.audio_duration if seg_art else 0.0
+            timings = seg_art.clause_timings if seg_art else []
+            if timings and seg.clauses:
+                events.extend(build_segment_subtitle_events(seg.clauses, timings, segment_offset_sec=offset_sec))
+            plan = plan_segment_duration(
+                segment=seg,
+                audio_duration=audio_dur,
+                source_duration=src_dur,
+                tail_padding_sec=project.output_settings.tail_padding_sec,
+                fps=project.output_settings.fps,
+            )
+            offset_sec += plan.final_dur
+
+    srt_text = render_srt_content(events)
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", project.title.strip() or project_id).strip("._") or project_id
+    return Response(
+        content=srt_text,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.srt"'},
+    )
+
+
+def _compute_waveform_peaks(media_path: Path, buckets: int, data_dir: Path) -> list[float]:
+    """Extract normalized [0..1] audio peak amplitudes using ffmpeg mono s16le PCM."""
+    buckets = max(16, min(400, int(buckets)))
+    try:
+        ffmpeg_bin, _ = verify_ffmpeg(data_dir=data_dir, offline=is_offline_env())
+    except Exception:
+        return [0.0] * buckets
+
+    cmd = [
+        str(ffmpeg_bin),
+        "-v",
+        "error",
+        "-i",
+        str(media_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "8000",
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=20, check=False)
+    except Exception:
+        return [0.0] * buckets
+
+    raw = proc.stdout
+    if not raw or len(raw) < 2:
+        return [0.0] * buckets
+
+    samples = array.array("h")
+    usable_len = len(raw) - (len(raw) % 2)
+    samples.frombytes(raw[:usable_len])
+    total = len(samples)
+    if total == 0:
+        return [0.0] * buckets
+
+    peaks: list[float] = []
+    for i in range(buckets):
+        start = int((i * total) / buckets)
+        end = max(start + 1, int(((i + 1) * total) / buckets))
+        end = min(total, end)
+        max_abs = 0
+        # Subsample large windows for speed
+        step = max(1, (end - start) // 256)
+        for j in range(start, end, step):
+            v = abs(samples[j])
+            if v > max_abs:
+                max_abs = v
+        peaks.append(round(min(1.0, max_abs / 32768.0), 3))
+    return peaks
+
+
+@app.get("/api/projects/{project_id}/assets/{asset_id}/thumbnail")
+def api_asset_thumbnail(project_id: str, asset_id: str, request: Request) -> Response:
+    """Return a cached JPEG thumbnail for a video/image project asset."""
+    data_dir = _get_data_dir(request)
+    try:
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+        project = load_project(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    asset = project.media_assets.get(asset_id)
+    if asset is None and asset_id == project.source_media.media_id:
+        media_path = Path(project.source_media.path)
+        kind = "video"
+    elif asset is not None:
+        media_path = Path(asset.path)
+        kind = asset.kind
+    else:
+        raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} not found")
+
+    if not media_path.is_file():
+        raise HTTPException(status_code=404, detail="Asset file missing on disk")
+
+    if kind == "image":
+        return FileResponse(media_path, media_type=_media_content_type(media_path))
+    if kind != "video":
+        raise HTTPException(status_code=400, detail="Thumbnails are only available for video/image assets")
+
+    thumbs_dir = project_dir / "artifacts" / "thumbs"
+    thumbs_dir.mkdir(parents=True, exist_ok=True)
+    file_sig = media_path.stat().st_mtime_ns
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", f"{asset_id}_{file_sig}")
+    thumb_path = thumbs_dir / f"{safe_id}.jpg"
+    if not thumb_path.is_file():
+        tmp_thumb = thumbs_dir / f"{safe_id}.{uuid.uuid4().hex[:6]}.tmp.jpg"
+        try:
+            ffmpeg_bin, _ = verify_ffmpeg(data_dir=data_dir, offline=is_offline_env())
+            subprocess.run(
+                [
+                    str(ffmpeg_bin),
+                    "-y",
+                    "-v",
+                    "error",
+                    "-ss",
+                    "0.2",
+                    "-i",
+                    str(media_path),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=320:-2",
+                    "-q:v",
+                    "6",
+                    str(tmp_thumb),
+                ],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            if not tmp_thumb.is_file() or tmp_thumb.stat().st_size == 0:
+                # Retry at t=0 for very short clips
+                subprocess.run(
+                    [
+                        str(ffmpeg_bin),
+                        "-y",
+                        "-v",
+                        "error",
+                        "-i",
+                        str(media_path),
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        "scale=320:-2",
+                        "-q:v",
+                        "6",
+                        str(tmp_thumb),
+                    ],
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+            if tmp_thumb.is_file() and tmp_thumb.stat().st_size > 0:
+                tmp_thumb.replace(thumb_path)
+        except Exception as exc:
+            tmp_thumb.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail=f"Thumbnail generation failed: {exc}") from exc
+        finally:
+            tmp_thumb.unlink(missing_ok=True)
+
+    if not thumb_path.is_file():
+        raise HTTPException(status_code=404, detail="Could not generate thumbnail")
+    return FileResponse(thumb_path, media_type="image/jpeg")
+
+
+@app.get("/api/projects/{project_id}/assets/{asset_id}/waveform")
+def api_asset_waveform(
+    project_id: str,
+    asset_id: str,
+    request: Request,
+    buckets: int = 120,
+) -> dict[str, Any]:
+    """Return cached normalized audio peak waveform array for a project media asset."""
+    data_dir = _get_data_dir(request)
+    buckets = max(16, min(400, int(buckets)))
+    try:
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+        project = load_project(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    asset = project.media_assets.get(asset_id)
+    if asset is None and asset_id == project.source_media.media_id:
+        media_path = Path(project.source_media.path)
+    elif asset is not None:
+        media_path = Path(asset.path)
+    else:
+        raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} not found")
+
+    if not media_path.is_file():
+        return {"asset_id": asset_id, "peaks": [0.0] * buckets}
+
+    wf_dir = project_dir / "artifacts" / "waveforms"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    file_sig = media_path.stat().st_mtime_ns
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", f"{asset_id}_{file_sig}")
+    cache_path = wf_dir / f"{safe_id}_{buckets}.json"
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, list):
+                return {"asset_id": asset_id, "peaks": cached}
+        except Exception:
+            pass
+
+    peaks = _compute_waveform_peaks(media_path, buckets=buckets, data_dir=data_dir)
+    tmp_cache = wf_dir / f"{safe_id}_{buckets}.{uuid.uuid4().hex[:6]}.tmp"
+    try:
+        tmp_cache.write_text(json.dumps(peaks), encoding="utf-8")
+        tmp_cache.replace(cache_path)
+    except Exception:
+        tmp_cache.unlink(missing_ok=True)
+    return {"asset_id": asset_id, "peaks": peaks}
+
+
+@app.get("/api/projects/{project_id}/media/{artifact_id}/waveform")
+def api_media_artifact_waveform(
+    project_id: str,
+    artifact_id: str,
+    request: Request,
+    buckets: int = 80,
+) -> dict[str, Any]:
+    """Return cached normalized audio peak waveform array for a synthesized TTS/media artifact."""
+    data_dir = _get_data_dir(request)
+    buckets = max(16, min(400, int(buckets)))
+    try:
+        project_dir = get_project_dir(project_id, data_dir=data_dir)
+        project = load_project(project_id, data_dir=data_dir)
+        manifest = load_manifest(project_id, data_dir=data_dir)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    target_path = _resolve_artifact_path(manifest, project_dir, artifact_id, project=project)
+    if target_path is None or not target_path.is_file():
+        return {"artifact_id": artifact_id, "peaks": [0.0] * buckets}
+
+    wf_dir = project_dir / "artifacts" / "waveforms"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", f"{artifact_id}_{target_path.stat().st_mtime_ns}")
+    cache_path = wf_dir / f"art_{safe_id}_{buckets}.json"
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, list):
+                return {"artifact_id": artifact_id, "peaks": cached}
+        except Exception:
+            pass
+
+    peaks = _compute_waveform_peaks(target_path, buckets=buckets, data_dir=data_dir)
+    tmp_cache = wf_dir / f"art_{safe_id}_{buckets}.{uuid.uuid4().hex[:6]}.tmp"
+    try:
+        tmp_cache.write_text(json.dumps(peaks), encoding="utf-8")
+        tmp_cache.replace(cache_path)
+    except Exception:
+        tmp_cache.unlink(missing_ok=True)
+    return {"artifact_id": artifact_id, "peaks": peaks}
 
 
 @app.get("/api/pronunciations")

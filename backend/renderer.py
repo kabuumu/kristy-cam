@@ -1040,8 +1040,10 @@ def render_timeline_composite(
     fonts_dir: Path | None = None,
     cancel_event: threading.Event | None = None,
     on_process_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    crf: int = 19,
+    fps_override: int | None = None,
 ) -> Path:
-    """Composite multi-track video/image/camera/audio/caption timeline into a 1080x1920 MP4."""
+    """Composite multi-track video/image/camera/audio/caption timeline into an MP4."""
     raw_dur, frame_count, final_dur = get_project_timeline_duration(project, manifest)
     if raw_dur <= 0.0 or frame_count <= 0:
         raise RenderError("Project timeline has zero duration; nothing to render")
@@ -1061,7 +1063,10 @@ def render_timeline_composite(
 
     out_w = round_even(float(project.output_settings.width))
     out_h = round_even(float(project.output_settings.height))
-    fps = max(1, int(project.output_settings.fps))
+    fps = max(1, int(fps_override if fps_override is not None else project.output_settings.fps))
+    if fps_override is not None and fps != int(project.output_settings.fps):
+        frame_count = max(1, math.ceil(raw_dur * fps))
+        final_dur = frame_count / float(fps)
 
     unique_tag = uuid.uuid4().hex[:8]
     master_ass_path = tmp_dir / f"{project.project_id}_timeline_{unique_tag}.ass"
@@ -1222,6 +1227,37 @@ def render_timeline_composite(
                 filter_lines.append(
                     f"[{raw_v_lbl}]scale={clip_w}:{clip_h}:flags=lanczos,setsar=1,format=rgba[{framed_lbl}]"
                 )
+
+            # Flip H / V
+            if clip.transform.flip_h:
+                fh_lbl = _next_lbl("vfh")
+                filter_lines.append(f"[{framed_lbl}]hflip[{fh_lbl}]")
+                framed_lbl = fh_lbl
+            if clip.transform.flip_v:
+                fv_lbl = _next_lbl("vfv")
+                filter_lines.append(f"[{framed_lbl}]vflip[{fv_lbl}]")
+                framed_lbl = fv_lbl
+
+            # Color Adjustments (brightness, contrast, saturation) — preserve RGBA alpha via alphamerge
+            ca = clip.color_adjust
+            if (
+                abs(float(ca.brightness)) > 1e-4
+                or abs(float(ca.contrast) - 1.0) > 1e-4
+                or abs(float(ca.saturation) - 1.0) > 1e-4
+            ):
+                sp_c = _next_lbl("veqc")
+                sp_a = _next_lbl("veqa")
+                eq_c = _next_lbl("veqce")
+                ex_a = _next_lbl("veqae")
+                eq_lbl = _next_lbl("veq")
+                filter_lines.append(f"[{framed_lbl}]split[{sp_c}][{sp_a}]")
+                filter_lines.append(
+                    f"[{sp_c}]eq=brightness={float(ca.brightness):.4f}:"
+                    f"contrast={float(ca.contrast):.4f}:saturation={float(ca.saturation):.4f},format=rgba[{eq_c}]"
+                )
+                filter_lines.append(f"[{sp_a}]alphaextract[{ex_a}]")
+                filter_lines.append(f"[{eq_c}][{ex_a}]alphamerge[{eq_lbl}]")
+                framed_lbl = eq_lbl
 
             # Opacity multiplier
             if float(clip.transform.opacity) < 0.999:
@@ -1605,7 +1641,7 @@ def render_timeline_composite(
                 "-c:v",
                 "libx264",
                 "-crf",
-                "19",
+                str(crf),
                 "-preset",
                 "medium",
                 "-pix_fmt",
@@ -1661,8 +1697,10 @@ def render_final_export(
     fonts_dir: Path | None = None,
     cancel_event: threading.Event | None = None,
     on_process_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    crf: int = 19,
+    fps_override: int | None = None,
 ) -> Path:
-    """Render full project to final 1080x1920 MP4 (multi-track compositor or legacy two-stage concat)."""
+    """Render full project to final MP4 (multi-track compositor or legacy two-stage concat)."""
     if _is_multitrack_project(project):
         return render_timeline_composite(
             project=project,
@@ -1675,6 +1713,8 @@ def render_final_export(
             fonts_dir=fonts_dir,
             cancel_event=cancel_event,
             on_process_start=on_process_start,
+            crf=crf,
+            fps_override=fps_override,
         )
 
     if not project.segments:

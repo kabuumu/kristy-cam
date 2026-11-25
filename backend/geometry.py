@@ -145,6 +145,19 @@ def validate_keyframes(
             )
 
 
+def _apply_easing(u: float, transition: str) -> float:
+    """Map linear progress u in [0, 1] through the selected keyframe easing curve."""
+    u = max(0.0, min(1.0, u))
+    if transition == "ease_in":
+        return u * u
+    if transition == "ease_out":
+        inv = 1.0 - u
+        return 1.0 - inv * inv
+    if transition == "ease_in_out":
+        return u * u * (3.0 - 2.0 * u)
+    return u
+
+
 def evaluate_crop_at(
     keyframes: Sequence[CropKeyframe],
     t: float,
@@ -153,7 +166,7 @@ def evaluate_crop_at(
     output_width: int = 1080,
     output_height: int = 1920,
 ) -> CropBox:
-    """Linearly interpolate (x, y, zoom) at timestamp t, clamping t <= 0 and holding final keyframe."""
+    """Interpolate (x, y, zoom) at timestamp t with easing/snap, clamping t <= 0 and holding final keyframe."""
     if not keyframes:
         raise GeometryValidationError("keyframes must be non-empty")
     if width <= 0 or height <= 0:
@@ -173,7 +186,8 @@ def evaluate_crop_at(
                 if k0.transition == "snap" and t < k1.t:
                     alpha = 0.0
                 else:
-                    alpha = 0.0 if dt <= 0.0 else (t - k0.t) / dt
+                    raw_u = 0.0 if dt <= 0.0 else (t - k0.t) / dt
+                    alpha = _apply_easing(raw_u, k0.transition)
                 x_norm = k0.x + (k1.x - k0.x) * alpha
                 y_norm = k0.y + (k1.y - k0.y) * alpha
                 zoom = k0.zoom + (k1.zoom - k0.zoom) * alpha
@@ -311,7 +325,7 @@ def _piecewise_linear_expr(
     time_var: str = "t",
     transitions: Sequence[str] | None = None,
 ) -> str:
-    """Build a nested FFmpeg piecewise-linear/step expression over `time_var` with final hold."""
+    """Build a nested FFmpeg piecewise-linear/eased/step expression over `time_var` with final hold."""
     if len(values) == 1:
         return f"{values[0]:.6f}"
 
@@ -322,12 +336,21 @@ def _piecewise_linear_expr(
         v0 = values[idx]
         v1 = values[idx + 1]
         dt = t1 - t0
-        is_snap = transitions is not None and idx < len(transitions) and transitions[idx] == "snap"
-        if dt <= 0.0 or is_snap or abs(v1 - v0) < 1e-12:
+        tr = transitions[idx] if transitions is not None and idx < len(transitions) else "tween"
+        if dt <= 0.0 or tr == "snap" or abs(v1 - v0) < 1e-12:
             seg_expr = f"{v0:.6f}"
         else:
             dv = v1 - v0
-            seg_expr = f"({v0:.6f}+({dv:.6f})*({time_var}-{t0:.6f})/{dt:.6f})"
+            u_expr = f"clip(({time_var}-{t0:.6f})/{dt:.6f},0,1)"
+            if tr == "ease_in":
+                alpha_expr = f"pow({u_expr},2)"
+            elif tr == "ease_out":
+                alpha_expr = f"(1-pow(1-{u_expr},2))"
+            elif tr == "ease_in_out":
+                alpha_expr = f"(3*pow({u_expr},2)-2*pow({u_expr},3))"
+            else:
+                alpha_expr = f"({time_var}-{t0:.6f})/{dt:.6f}"
+            seg_expr = f"({v0:.6f}+({dv:.6f})*{alpha_expr})"
         expr = f"if(lt({time_var},{t1:.6f}),{seg_expr},{expr})"
 
     return expr

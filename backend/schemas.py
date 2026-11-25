@@ -37,6 +37,9 @@ JunctionTransitionType = Literal[
     "zoomin",
 ]
 CaptionAlign = Literal["bottom", "center", "top"]
+CaptionAnimation = Literal["none", "pop", "fade"]
+KeyframeTransition = Literal["tween", "snap", "ease_in", "ease_out", "ease_in_out"]
+ExportQuality = Literal["draft", "standard", "high"]
 
 
 def utc_now_iso() -> str:
@@ -96,13 +99,19 @@ class CaptionSettings(BaseModel):
     font_size: int = Field(default=64, gt=0)
     primary_color: str = Field(default="&H00FFFFFF", min_length=1)
     outline_color: str = Field(default="&H00000000", min_length=1)
+    back_color: str = Field(default="&H64000000", min_length=1)
     outline_width: float = Field(default=5.0, ge=0.0)
+    shadow: float = Field(default=0.0, ge=0.0, le=16.0)
+    border_style: int = Field(default=1, ge=1, le=3)
     margin_v: int = Field(default=340, ge=0)
+    karaoke_highlight: bool = False
+    highlight_color: str = Field(default="&H0000FFFF", min_length=1)
+    animation: CaptionAnimation = "none"
 
-    @field_validator("outline_width")
+    @field_validator("outline_width", "shadow")
     @classmethod
-    def _validate_outline_width(cls, v: float) -> float:
-        return _check_finite(v, "outline_width")
+    def _validate_outline_width(cls, v: float, info: Any) -> float:
+        return _check_finite(v, info.field_name)
 
 
 class CropKeyframe(BaseModel):
@@ -114,7 +123,7 @@ class CropKeyframe(BaseModel):
     x: float = Field(ge=0.0, le=1.0)
     y: float = Field(ge=0.0, le=1.0)
     zoom: float = Field(default=1.0, ge=1.0, le=3.0)
-    transition: Literal["tween", "snap"] = "tween"
+    transition: KeyframeTransition = "tween"
 
     @field_validator("t", "x", "y", "zoom")
     @classmethod
@@ -214,10 +223,27 @@ class VisualClipTransform(BaseModel):
     scale: float = Field(default=1.0, ge=0.05, le=4.0)
     rotation_deg: float = Field(default=0.0, ge=-360.0, le=360.0)
     opacity: float = Field(default=1.0, ge=0.0, le=1.0)
+    flip_h: bool = False
+    flip_v: bool = False
 
     @field_validator("x", "y", "scale", "rotation_deg", "opacity")
     @classmethod
     def _validate_finite_floats(cls, v: float, info: Any) -> float:
+        return _check_finite(v, info.field_name)
+
+
+class VisualClipColorAdjust(BaseModel):
+    """Basic per-clip color adjustments (brightness, contrast, saturation)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    brightness: float = Field(default=0.0, ge=-1.0, le=1.0)
+    contrast: float = Field(default=1.0, ge=0.0, le=3.0)
+    saturation: float = Field(default=1.0, ge=0.0, le=3.0)
+
+    @field_validator("brightness", "contrast", "saturation")
+    @classmethod
+    def _validate_finite_color(cls, v: float, info: Any) -> float:
         return _check_finite(v, info.field_name)
 
 
@@ -276,6 +302,7 @@ class VisualClip(BaseModel):
     audio_fade_in_sec: float = Field(default=0.0, ge=0.0)
     audio_fade_out_sec: float = Field(default=0.0, ge=0.0)
     transform: VisualClipTransform = Field(default_factory=VisualClipTransform)
+    color_adjust: VisualClipColorAdjust = Field(default_factory=VisualClipColorAdjust)
     transition_in: ClipEdgeTransition = Field(default_factory=ClipEdgeTransition)
     transition_out: ClipEdgeTransition = Field(default_factory=ClipEdgeTransition)
 
@@ -339,13 +366,19 @@ class AudioClip(BaseModel):
 
 
 class CaptionStyleOverride(BaseModel):
-    """Optional per-caption positioning and font size overrides."""
+    """Optional per-caption positioning, color, animation, and font size overrides."""
 
     model_config = ConfigDict(extra="forbid")
 
     margin_v: int | None = Field(default=None, ge=0)
     font_size: int | None = Field(default=None, gt=0)
     align: CaptionAlign | None = None
+    primary_color: str | None = None
+    outline_color: str | None = None
+    back_color: str | None = None
+    border_style: int | None = Field(default=None, ge=1, le=3)
+    karaoke_highlight: bool | None = None
+    animation: CaptionAnimation | None = None
 
 
 class CaptionClip(BaseModel):
@@ -461,6 +494,32 @@ class CaptionTrack(BaseModel):
 TimelineTrack = Annotated[Union[VideoTrack, AudioTrack, CaptionTrack], Field(discriminator="kind")]
 
 
+class TimelineMarker(BaseModel):
+    """Named/colored timeline marker placed on the project ruler."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    t: float = Field(ge=0.0)
+    label: str = ""
+    color: str = Field(default="#f59e0b", min_length=1)
+
+    @field_validator("t")
+    @classmethod
+    def _validate_finite_t(cls, v: float) -> float:
+        return _check_finite(v, "t")
+
+
+class ExportOptions(BaseModel):
+    """Optional export configuration overrides (filename, quality preset, fps)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str | None = None
+    quality: ExportQuality = "standard"
+    fps: int | None = Field(default=None, ge=15, le=60)
+
+
 class ProjectInput(BaseModel):
     """Authoritative user-editable project state persisted in project.json."""
 
@@ -480,6 +539,7 @@ class ProjectInput(BaseModel):
     caption_settings: CaptionSettings = Field(default_factory=CaptionSettings)
     pronunciations: dict[str, str] = Field(default_factory=dict)
     camera_keyframes: list[CropKeyframe] = Field(default_factory=list)
+    markers: list[TimelineMarker] = Field(default_factory=list)
     tracks: list[TimelineTrack] = Field(default_factory=list)
     segments: list[SegmentInput] = Field(default_factory=list)
 

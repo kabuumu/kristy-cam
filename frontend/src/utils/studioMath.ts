@@ -99,6 +99,22 @@ export function clampCropPosition(
   };
 }
 
+export function applyKeyframeEasing(
+  u: number,
+  transition?: CropKeyframe["transition"]
+): number {
+  const clamped = Math.max(0, Math.min(1, u));
+  if (transition === "ease_in") return clamped * clamped;
+  if (transition === "ease_out") {
+    const inv = 1 - clamped;
+    return 1 - inv * inv;
+  }
+  if (transition === "ease_in_out") {
+    return clamped * clamped * (3 - 2 * clamped);
+  }
+  return clamped;
+}
+
 export function evaluateCropAt(
   keyframes: CropKeyframe[],
   t: number,
@@ -147,12 +163,11 @@ export function evaluateCropAt(
     const b = sorted[i + 1];
     if ((t >= a.t && t < b.t) || (i === sorted.length - 2 && t >= a.t && t <= b.t)) {
       const span = b.t - a.t;
+      const rawU = span > 0 ? (t - a.t) / span : 0;
       const alpha =
         a.transition === "snap" && t < b.t
           ? 0
-          : span > 0
-            ? (t - a.t) / span
-            : 0;
+          : applyKeyframeEasing(rawU, a.transition);
       const x = a.x + (b.x - a.x) * alpha;
       const y = a.y + (b.y - a.y) * alpha;
       const zoom = a.zoom + (b.zoom - a.zoom) * alpha;
@@ -1269,6 +1284,9 @@ export function collectTimelineSnapCandidates(
   for (const kf of project.camera_keyframes ?? []) {
     pts.add(kf.t);
   }
+  for (const m of project.markers ?? []) {
+    pts.add(m.t);
+  }
   for (const tr of project.tracks ?? []) {
     if (tr.kind === "video" || tr.kind === "audio") {
       for (const c of tr.clips) {
@@ -1334,3 +1352,301 @@ export function findNextTrackId(project: ProjectInput, prefix: string): string {
   }
   return `${prefix}${idx}`;
 }
+
+// ---------------------------------------------------------------------------
+// QOL Helpers: Ripple Delete, Close Gap, Cut Navigation, Bulk Script, Colors
+// ---------------------------------------------------------------------------
+
+export function rippleDeleteClip(
+  tracks: TimelineTrack[],
+  trackId: string,
+  clipId: string,
+  manifest?: ArtifactManifest | null
+): TimelineTrack[] {
+  return tracks.map((tr) => {
+    if (tr.id !== trackId) return tr;
+    if (tr.kind === "video") {
+      const target = tr.clips.find((c) => c.id === clipId);
+      if (!target) return tr;
+      const shift = target.duration_sec;
+      const cutoff = target.start_sec;
+      return {
+        ...tr,
+        clips: tr.clips
+          .filter((c) => c.id !== clipId)
+          .map((c) =>
+            c.start_sec >= cutoff - 1e-4
+              ? { ...c, start_sec: Number(Math.max(0, c.start_sec - shift).toFixed(3)) }
+              : c
+          )
+          .sort((a, b) => a.start_sec - b.start_sec),
+        transitions: tr.transitions.filter(
+          (jt) => jt.from_clip_id !== clipId && jt.to_clip_id !== clipId
+        ),
+      };
+    }
+    if (tr.kind === "audio") {
+      const target = tr.clips.find((c) => c.id === clipId);
+      if (!target) return tr;
+      const shift = target.duration_sec;
+      const cutoff = target.start_sec;
+      return {
+        ...tr,
+        clips: tr.clips
+          .filter((c) => c.id !== clipId)
+          .map((c) =>
+            c.start_sec >= cutoff - 1e-4
+              ? { ...c, start_sec: Number(Math.max(0, c.start_sec - shift).toFixed(3)) }
+              : c
+          )
+          .sort((a, b) => a.start_sec - b.start_sec),
+      };
+    }
+    const target = tr.clips.find((c) => c.id === clipId);
+    if (!target) return tr;
+    const shift = getCaptionClipEffectiveDuration(target, manifest ?? null);
+    const cutoff = target.start_sec;
+    return {
+      ...tr,
+      clips: tr.clips
+        .filter((c) => c.id !== clipId)
+        .map((c) =>
+          c.start_sec >= cutoff - 1e-4
+            ? { ...c, start_sec: Number(Math.max(0, c.start_sec - shift).toFixed(3)) }
+            : c
+        )
+        .sort((a, b) => a.start_sec - b.start_sec),
+    };
+  });
+}
+
+export function closeGapOnTrack(
+  tracks: TimelineTrack[],
+  trackId: string,
+  gapTime: number,
+  manifest?: ArtifactManifest | null
+): TimelineTrack[] {
+  return tracks.map((tr) => {
+    if (tr.id !== trackId) return tr;
+    const intervals = tr.clips
+      .map((c) => {
+        const dur =
+          tr.kind === "caption"
+            ? getCaptionClipEffectiveDuration(c as CaptionClip, manifest ?? null)
+            : (c as VisualClip | AudioClip).duration_sec;
+        return { start: c.start_sec, end: c.start_sec + dur };
+      })
+      .sort((a, b) => a.start - b.start);
+
+    // Find the gap containing gapTime
+    let prevEnd = 0;
+    let nextStart: number | null = null;
+    for (const iv of intervals) {
+      if (gapTime >= prevEnd - 1e-3 && gapTime <= iv.start + 1e-3 && iv.start > prevEnd + 0.02) {
+        nextStart = iv.start;
+        break;
+      }
+      prevEnd = Math.max(prevEnd, iv.end);
+    }
+    if (nextStart === null) return tr;
+    const gapLen = nextStart - prevEnd;
+    if (gapLen <= 0.01) return tr;
+
+    if (tr.kind === "video") {
+      return {
+        ...tr,
+        clips: tr.clips
+          .map((c) =>
+            c.start_sec >= nextStart! - 1e-4
+              ? { ...c, start_sec: Number(Math.max(0, c.start_sec - gapLen).toFixed(3)) }
+              : c
+          )
+          .sort((a, b) => a.start_sec - b.start_sec),
+      };
+    }
+    if (tr.kind === "audio") {
+      return {
+        ...tr,
+        clips: tr.clips
+          .map((c) =>
+            c.start_sec >= nextStart! - 1e-4
+              ? { ...c, start_sec: Number(Math.max(0, c.start_sec - gapLen).toFixed(3)) }
+              : c
+          )
+          .sort((a, b) => a.start_sec - b.start_sec),
+      };
+    }
+    return {
+      ...tr,
+      clips: tr.clips
+        .map((c) =>
+          c.start_sec >= nextStart! - 1e-4
+            ? { ...c, start_sec: Number(Math.max(0, c.start_sec - gapLen).toFixed(3)) }
+            : c
+        )
+        .sort((a, b) => a.start_sec - b.start_sec),
+    };
+  });
+}
+
+export function findCutPoints(
+  project: ProjectInput,
+  manifest: ArtifactManifest | null
+): number[] {
+  const pts = collectTimelineSnapCandidates(project, manifest);
+  const unique = Array.from(new Set(pts.map((p) => Number(p.toFixed(3)))));
+  unique.sort((a, b) => a - b);
+  return unique;
+}
+
+export function parseBulkScriptToCaptionClips(
+  scriptText: string,
+  startSec: number,
+  project: ProjectInput,
+  options?: { ttsEnabled?: boolean; speed?: number; pauseSec?: number }
+): CaptionClip[] {
+  const rawLines = scriptText
+    .split(/\r?\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const chunks: string[] = [];
+  for (const line of rawLines) {
+    const parts = autoSplitTextToClauses(line).filter((p) => p.trim().length > 0);
+    chunks.push(...parts);
+  }
+  if (chunks.length === 0) return [];
+
+  const used = new Set<string>();
+  for (const tr of project.tracks ?? []) {
+    for (const c of tr.clips) used.add(c.id);
+  }
+  let idx = 1;
+  const allocCapId = () => {
+    while (used.has(`cap_${String(idx).padStart(2, "0")}`)) idx += 1;
+    const id = `cap_${String(idx).padStart(2, "0")}`;
+    used.add(id);
+    return id;
+  };
+
+  const ttsEnabled = options?.ttsEnabled ?? true;
+  const speed = options?.speed ?? 1.0;
+  const pauseSec = options?.pauseSec ?? 0.15;
+  let cursor = Math.max(0, Number(startSec.toFixed(3)));
+
+  return chunks.map((text) => {
+    const words = Math.max(1, text.split(/\s+/).length);
+    const estDur = Number(Math.max(1.0, Math.min(6.0, (words * 0.42) / speed)).toFixed(3));
+    const clip: CaptionClip = {
+      id: allocCapId(),
+      start_sec: cursor,
+      duration_sec: estDur,
+      auto_fit_tts: ttsEnabled,
+      display_text: text,
+      spoken_text_override: null,
+      tts_enabled: ttsEnabled,
+      speed,
+      voice_override: null,
+      style_override: null,
+    };
+    cursor = Number((cursor + estDur + pauseSec).toFixed(3));
+    return clip;
+  });
+}
+
+/** Convert ASS &HAABBGGRR (or &HBBGGRR) color string to CSS #RRGGBB hex. */
+export function assColorToHex(assColor?: string | null, fallback = "#ffffff"): string {
+  if (!assColor) return fallback;
+  const m = assColor.trim().match(/^&H([0-9A-Fa-f]{6,8})&?$/);
+  if (!m) {
+    return assColor.startsWith("#") && assColor.length === 7 ? assColor : fallback;
+  }
+  const hex = m[1];
+  const bgr = hex.length === 8 ? hex.slice(2) : hex;
+  const bb = bgr.slice(0, 2);
+  const gg = bgr.slice(2, 4);
+  const rr = bgr.slice(4, 6);
+  return `#${rr}${gg}${bb}`.toLowerCase();
+}
+
+/** Convert CSS #RRGGBB hex + optional alphaByte (00=opaque, 64=semi) to ASS &HAABBGGRR. */
+export function hexToAssColor(hexColor: string, alphaHex = "00"): string {
+  const clean = hexColor.replace(/^#/, "").trim();
+  if (clean.length !== 6 || !/^[0-9A-Fa-f]{6}$/.test(clean)) {
+    return `&H${alphaHex}FFFFFF`;
+  }
+  const rr = clean.slice(0, 2).toUpperCase();
+  const gg = clean.slice(2, 4).toUpperCase();
+  const bb = clean.slice(4, 6).toUpperCase();
+  return `&H${alphaHex.toUpperCase()}${bb}${gg}${rr}`;
+}
+
+export interface CaptionStylePreset {
+  id: string;
+  label: string;
+  patch: Partial<ProjectInput["caption_settings"]>;
+}
+
+export const CAPTION_STYLE_PRESETS: CaptionStylePreset[] = [
+  {
+    id: "classic-bold",
+    label: "Classic Bold",
+    patch: {
+      font_size: 64,
+      primary_color: "&H00FFFFFF",
+      outline_color: "&H00000000",
+      back_color: "&H64000000",
+      outline_width: 5,
+      shadow: 0,
+      border_style: 1,
+      karaoke_highlight: false,
+      animation: "none",
+    },
+  },
+  {
+    id: "yellow-pop",
+    label: "Yellow Pop",
+    patch: {
+      font_size: 72,
+      primary_color: "&H0000E5FF",
+      outline_color: "&H00000000",
+      back_color: "&H64000000",
+      outline_width: 6,
+      shadow: 2,
+      border_style: 1,
+      karaoke_highlight: false,
+      animation: "pop",
+    },
+  },
+  {
+    id: "subtitle-pill",
+    label: "Subtitle Box",
+    patch: {
+      font_size: 56,
+      primary_color: "&H00FFFFFF",
+      outline_color: "&H00000000",
+      back_color: "&H40000000",
+      outline_width: 4,
+      shadow: 0,
+      border_style: 3,
+      karaoke_highlight: false,
+      animation: "fade",
+    },
+  },
+  {
+    id: "karaoke-neon",
+    label: "Karaoke Highlight",
+    patch: {
+      font_size: 68,
+      primary_color: "&H00FFFFFF",
+      highlight_color: "&H0000FFFF",
+      outline_color: "&H00000000",
+      back_color: "&H64000000",
+      outline_width: 6,
+      shadow: 2,
+      border_style: 1,
+      karaoke_highlight: true,
+      animation: "pop",
+    },
+  },
+];
+

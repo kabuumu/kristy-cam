@@ -2,11 +2,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
+  Bookmark,
   Camera,
   Captions,
+  Copy,
   Eye,
   EyeOff,
+  FileText,
   Film,
+  GripHorizontal,
   Layers,
   Loader2,
   Lock,
@@ -16,6 +20,7 @@ import {
   Play,
   Plus,
   Scissors,
+  Snowflake,
   Trash2,
   Unlock,
   Volume2,
@@ -25,6 +30,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import { apiClient } from "../api/client";
 import type {
   ArtifactManifest,
   AudioClip,
@@ -34,6 +40,7 @@ import type {
   CropKeyframe,
   MediaAssetKind,
   ProjectInput,
+  TimelineMarker,
   TimelineSelection,
   TimelineTrack,
   TrackTransition,
@@ -41,20 +48,29 @@ import type {
   VisualClip,
 } from "../types/studio";
 import {
+  closeGapOnTrack,
   collectTimelineSnapCandidates,
   computeAdjacentJunctionPairs,
   evaluateCropAt,
   findActiveVisualLayersAt,
+  findCutPoints,
   findNextClipId,
   findNextTrackId,
   formatTimecode,
   getCaptionClipEffectiveDuration,
   getProjectDuration,
+  rippleDeleteClip,
   snapTimelineTime,
   splitAudioClipAt,
   splitVisualClipAt,
 } from "../utils/studioMath";
 import { MEDIA_BIN_DND_MIME } from "./MediaBin";
+
+export interface TimelineMultiItem {
+  kind: "video-clip" | "audio-clip" | "caption-clip";
+  trackId: string;
+  clipId: string;
+}
 
 interface TimelineProps {
   project: ProjectInput;
@@ -66,6 +82,8 @@ interface TimelineProps {
   isModalOpen: boolean;
   isProjectPlaying: boolean;
   preparingPlayback?: boolean;
+  canPasteClip?: boolean;
+  canPasteAttributes?: boolean;
   onSelectItem: (sel: TimelineSelection) => void;
   onProjectTimeChange: (t: number) => void;
   onSourceTimeChange: (t: number) => void;
@@ -76,6 +94,10 @@ interface TimelineProps {
   ) => void;
   onUpdateCameraKeyframes: (
     keyframes: CropKeyframe[],
+    meta?: { label?: string; coalesceKey?: string }
+  ) => void;
+  onUpdateMarkers?: (
+    markers: TimelineMarker[],
     meta?: { label?: string; coalesceKey?: string }
   ) => void;
   onBeginHistoryTransaction?: (label: string) => void;
@@ -94,10 +116,22 @@ interface TimelineProps {
     startSec: number
   ) => void;
   onToggleProjectPlayback: () => void;
+  onSaveProject?: () => void;
+  onCopySelectedClip?: () => void;
+  onPasteClipAtPlayhead?: () => void;
+  onDuplicateSelectedClip?: () => void;
+  onCopyAttributes?: () => void;
+  onPasteAttributes?: () => void;
+  onDetachAudio?: (trackId: string, clipId: string) => void;
+  onFreezeFrame?: (trackId: string, clipId: string) => void;
+  onOpenShortcuts?: () => void;
+  onOpenBulkScript?: () => void;
+  onToast?: (msg: string, kind?: "info" | "success" | "warning") => void;
 }
 
 type DragAction =
   | { type: "scrub" }
+  | { type: "height-resize"; startY: number; origHeight: number }
   | {
       type: "zoom-drag";
       startX: number;
@@ -128,25 +162,36 @@ type DragAction =
       spanSec: number;
     }
   | {
-      type: "aclip-move" | "aclip-left" | "aclip-right";
+      type: "aclip-move" | "aclip-left" | "aclip-right" | "aclip-fade-in" | "aclip-fade-out";
       trackId: string;
       clipId: string;
       startX: number;
       origStart: number;
       origDur: number;
       origMediaIn: number;
+      origFade?: number;
       speed: number;
       assetDur: number;
       spanSec: number;
     }
   | {
-      type: "cclip-move" | "cclip-right";
+      type: "cclip-move" | "cclip-left" | "cclip-right";
       trackId: string;
       clipId: string;
       startX: number;
       origStart: number;
       origDur: number;
       spanSec: number;
+    }
+  | null;
+
+type ContextMenuState =
+  | {
+      x: number;
+      y: number;
+      target:
+        | { kind: "clip"; sel: NonNullable<TimelineSelection>; trackId: string; clipId: string; clipKind: "video" | "image" | "audio" | "caption" }
+        | { kind: "gap"; trackId: string; timeSec: number };
     }
   | null;
 
@@ -186,6 +231,39 @@ function reorderVideoTrackZ(
   return next;
 }
 
+function WaveformBars({
+  peaks,
+  colorClass,
+}: {
+  peaks: number[] | undefined;
+  colorClass: string;
+}) {
+  if (!peaks || peaks.length === 0) return null;
+  const n = peaks.length;
+  return (
+    <svg
+      viewBox={`0 0 ${n} 24`}
+      preserveAspectRatio="none"
+      className={`pointer-events-none absolute inset-0 h-full w-full opacity-35 ${colorClass}`}
+    >
+      {peaks.map((p, idx) => {
+        const h = Math.max(2, p * 22);
+        const y = (24 - h) / 2;
+        return (
+          <rect
+            key={idx}
+            x={idx}
+            y={y}
+            width={0.75}
+            height={h}
+            fill="currentColor"
+          />
+        );
+      })}
+    </svg>
+  );
+}
+
 export function Timeline({
   project,
   manifest,
@@ -196,16 +274,30 @@ export function Timeline({
   isModalOpen,
   isProjectPlaying,
   preparingPlayback = false,
+  canPasteClip = false,
+  canPasteAttributes = false,
   onSelectItem,
   onProjectTimeChange,
   onSourceTimeChange,
   onUpdateTracks,
   onUpdateCameraKeyframes,
+  onUpdateMarkers,
   onBeginHistoryTransaction,
   onEndHistoryTransaction,
   onAddSourceClip,
   onDropMediaAsset,
   onToggleProjectPlayback,
+  onSaveProject,
+  onCopySelectedClip,
+  onPasteClipAtPlayhead,
+  onDuplicateSelectedClip,
+  onCopyAttributes,
+  onPasteAttributes,
+  onDetachAudio,
+  onFreezeFrame,
+  onOpenShortcuts,
+  onOpenBulkScript,
+  onToast,
 }: TimelineProps) {
   const activeSrcId = previewAssetId || project.source_media.media_id;
   const activeSrcMeta =
@@ -230,11 +322,18 @@ export function Timeline({
   const [markOut, setMarkOut] = useState(() => Math.min(3.0, sourceDur));
   const [timelineZoom, setTimelineZoom] = useState(1);
   const [snapEnabled, setSnapEnabled] = useState(true);
+  const [snapGuideTime, setSnapGuideTime] = useState<number | null>(null);
+  const [timelineHeightPx, setTimelineHeightPx] = useState(250);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
+  const [multiSelected, setMultiSelected] = useState<TimelineMultiItem[]>([]);
+  const [waveforms, setWaveforms] = useState<Record<string, number[]>>({});
+  const fetchedWfKeysRef = useRef<Set<string>>(new Set());
   const [dragOverTrackId, setDragOverTrackId] = useState<string | null>(null);
   const [drag, setDrag] = useState<DragAction>(null);
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const trackLaneRef = useRef<HTMLDivElement | null>(null);
+  const markers = project.markers ?? [];
 
   const tracks = project.tracks ?? [];
   const videoTracks = useMemo(
@@ -276,6 +375,12 @@ export function Timeline({
     setMarkOut((prev) => (prev > sourceDur ? Math.max(0.2, sourceDur) : prev));
   }, [sourceDur, activeSrcId]);
 
+  useEffect(() => {
+    setMultiSelected([]);
+    setWaveforms({});
+    fetchedWfKeysRef.current = new Set();
+  }, [project.project_id]);
+
   const startDrag = (action: NonNullable<DragAction>) => {
     const txLabels: Partial<Record<NonNullable<DragAction>["type"], string>> = {
       "keyframe-move": "Move camera keyframe",
@@ -286,7 +391,10 @@ export function Timeline({
       "aclip-move": "Move audio clip",
       "aclip-left": "Trim audio clip start",
       "aclip-right": "Trim audio clip end",
+      "aclip-fade-in": "Adjust audio fade-in",
+      "aclip-fade-out": "Adjust audio fade-out",
       "cclip-move": "Move caption block",
+      "cclip-left": "Trim caption start",
       "cclip-right": "Resize caption duration",
     };
     const label = txLabels[action.type];
@@ -478,23 +586,256 @@ export function Timeline({
     });
   };
 
-  // Global keyboard shortcuts: I (In), O (Out), S (Split), Backspace/Delete
+  // Close context menu on outside click or Escape
+  useEffect(() => {
+    if (!contextMenu) return;
+    const dismiss = () => setContextMenu(null);
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setContextMenu(null);
+    };
+    window.addEventListener("mousedown", dismiss);
+    window.addEventListener("keydown", onEsc);
+    return () => {
+      window.removeEventListener("mousedown", dismiss);
+      window.removeEventListener("keydown", onEsc);
+    };
+  }, [contextMenu]);
+
+  // Fetch cached audio waveforms for audio clips & synthesized TTS caption clips
+  useEffect(() => {
+    let cancelled = false;
+    const audioAssetIds = new Set<string>();
+    for (const tr of audioTracks) {
+      for (const c of tr.clips) audioAssetIds.add(c.asset_id);
+    }
+    for (const assetId of audioAssetIds) {
+      const key = `asset:${project.project_id}:${assetId}`;
+      if (fetchedWfKeysRef.current.has(key)) continue;
+      fetchedWfKeysRef.current.add(key);
+      apiClient
+        .getAssetWaveform(project.project_id, assetId, 96)
+        .then((res) => {
+          if (!cancelled && res.peaks?.length) {
+            setWaveforms((prev) => ({ ...prev, [key]: res.peaks }));
+          }
+        })
+        .catch(() => {});
+    }
+
+    for (const tr of captionTracks) {
+      for (const c of tr.clips) {
+        const art = manifest.caption_artifacts?.[c.id];
+        if (!c.tts_enabled || !art?.audio_artifact_id) continue;
+        const key = `art:${project.project_id}:${art.audio_artifact_id}:${art.tts_hash ?? ""}`;
+        if (fetchedWfKeysRef.current.has(key)) continue;
+        fetchedWfKeysRef.current.add(key);
+        apiClient
+          .getMediaWaveform(project.project_id, art.audio_artifact_id, 64)
+          .then((res) => {
+            if (!cancelled && res.peaks?.length) {
+              setWaveforms((prev) => ({ ...prev, [key]: res.peaks }));
+            }
+          })
+          .catch(() => {});
+      }
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [project.project_id, audioTracks, captionTracks, manifest.caption_artifacts]);
+
+  // Auto-scroll timeline viewport to keep playhead visible during playback
+  useEffect(() => {
+    if (!isProjectPlaying || timelineZoom <= 1) return;
+    const scroller = scrollContainerRef.current;
+    if (!scroller || scroller.clientWidth <= 0) return;
+    const totalW = scroller.clientWidth * timelineZoom;
+    const playheadX = (clampedPlayhead / timelineSpan) * totalW;
+    const viewLeft = scroller.scrollLeft;
+    const viewRight = viewLeft + scroller.clientWidth;
+    if (playheadX > viewRight - 40 || playheadX < viewLeft + 20) {
+      scroller.scrollLeft = Math.max(0, playheadX - scroller.clientWidth * 0.25);
+    }
+  }, [isProjectPlaying, clampedPlayhead, timelineSpan, timelineZoom]);
+
+  const handleAddMarkerAt = (tSec?: number) => {
+    if (!onUpdateMarkers) return;
+    const t = Number(Math.max(0, tSec ?? projectTime).toFixed(3));
+    const existing = markers.find((m) => Math.abs(m.t - t) < 0.05);
+    if (existing) {
+      onProjectTimeChange(existing.t);
+      return;
+    }
+    const newMarker: TimelineMarker = {
+      id: `m_${Date.now().toString(36)}`,
+      t,
+      label: `M${markers.length + 1}`,
+      color: "#f59e0b",
+    };
+    const next = [...markers, newMarker].sort((a, b) => a.t - b.t);
+    onUpdateMarkers(next, { label: `Add marker @${t.toFixed(2)}s` });
+    onToast?.(`Marker added at ${formatTimecode(t)}`, "info");
+  };
+
+  const handleDeleteMarker = (markerId: string) => {
+    if (!onUpdateMarkers) return;
+    onUpdateMarkers(
+      markers.filter((m) => m.id !== markerId),
+      { label: "Delete timeline marker" }
+    );
+  };
+
+  const handleRippleDelete = (trackId: string, clipId: string) => {
+    onUpdateTracks(
+      (prev) => rippleDeleteClip(prev, trackId, clipId, manifest),
+      { label: `Ripple delete ${clipId}` },
+      null
+    );
+    setMultiSelected([]);
+    onToast?.("Ripple deleted clip", "info");
+  };
+
+  const handleCloseGap = (trackId: string, gapTime: number) => {
+    onUpdateTracks(
+      (prev) => closeGapOnTrack(prev, trackId, gapTime, manifest),
+      { label: "Close timeline gap" }
+    );
+    onToast?.("Closed gap", "info");
+  };
+
+  const handleBatchDeleteMulti = () => {
+    if (multiSelected.length === 0) return;
+    const idSet = new Set(multiSelected.map((m) => m.clipId));
+    onUpdateTracks(
+      (prev) =>
+        prev.map((tr) => {
+          if (tr.locked) return tr;
+          if (tr.kind === "video") {
+            return {
+              ...tr,
+              clips: tr.clips.filter((c) => !idSet.has(c.id)),
+              transitions: tr.transitions.filter(
+                (jt) => !idSet.has(jt.from_clip_id) && !idSet.has(jt.to_clip_id)
+              ),
+            };
+          }
+          if (tr.kind === "audio") {
+            return { ...tr, clips: tr.clips.filter((c) => !idSet.has(c.id)) };
+          }
+          return { ...tr, clips: tr.clips.filter((c) => !idSet.has(c.id)) };
+        }),
+      { label: `Delete ${multiSelected.length} clips` },
+      null
+    );
+    setMultiSelected([]);
+  };
+
+  const isMultiSelected = (clipId: string) =>
+    multiSelected.some((m) => m.clipId === clipId);
+
+  const toggleMultiSelect = (item: TimelineMultiItem) => {
+    setMultiSelected((prev) => {
+      const exists = prev.some((m) => m.clipId === item.clipId);
+      if (exists) return prev.filter((m) => m.clipId !== item.clipId);
+      return [...prev, item];
+    });
+  };
+
+  // Global NLE keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isModalOpen) return;
       const active = document.activeElement;
       const tag = active?.tagName.toLowerCase();
-      if (
+      const isTextInput =
         tag === "input" ||
         tag === "textarea" ||
         tag === "select" ||
-        (active instanceof HTMLElement && active.isContentEditable)
-      ) {
+        (active instanceof HTMLElement && active.isContentEditable);
+
+      const isMod = e.metaKey || e.ctrlKey;
+
+      // Ctrl/Cmd + S works even when focused inside inputs
+      if (isMod && !e.altKey && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        onSaveProject?.();
         return;
       }
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-      if (e.key === "i" || e.key === "I") {
+      if (isTextInput) return;
+
+      // Ctrl/Cmd + B (CapCut Split), C (Copy), V (Paste), D (Duplicate)
+      if (isMod && !e.altKey) {
+        const k = e.key.toLowerCase();
+        if (k === "b") {
+          if (splitTarget) {
+            e.preventDefault();
+            handleSplitAtPlayhead();
+          }
+          return;
+        }
+        if (k === "c") {
+          const hasTextSelection = Boolean(window.getSelection()?.toString());
+          const hasClipSelection =
+            selection?.type === "video-clip" ||
+            selection?.type === "audio-clip" ||
+            selection?.type === "caption-clip";
+          if (!hasTextSelection && hasClipSelection) {
+            e.preventDefault();
+            onCopySelectedClip?.();
+          }
+          return;
+        }
+        if (k === "v") {
+          e.preventDefault();
+          onPasteClipAtPlayhead?.();
+          return;
+        }
+        if (k === "d") {
+          e.preventDefault();
+          onDuplicateSelectedClip?.();
+          return;
+        }
+        return;
+      }
+
+      if (e.altKey) return;
+
+      const fpsVal = Math.max(1, project.output_settings.fps || 30);
+      const frameStep = 1 / fpsVal;
+
+      if (e.code === "Space" || e.key === " ") {
+        e.preventDefault();
+        if (!e.repeat) {
+          onToggleProjectPlayback();
+        }
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        const step = e.shiftKey ? frameStep * 10 : frameStep;
+        onProjectTimeChange(Number(Math.max(0, projectTime - step).toFixed(3)));
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        const step = e.shiftKey ? frameStep * 10 : frameStep;
+        onProjectTimeChange(
+          Number(Math.min(Math.max(rawDuration, timelineSpan), projectTime + step).toFixed(3))
+        );
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        onProjectTimeChange(0);
+      } else if (e.key === "End") {
+        e.preventDefault();
+        onProjectTimeChange(Number(rawDuration.toFixed(3)));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        const cuts = findCutPoints(project, manifest);
+        const prevCut = [...cuts].reverse().find((c) => c < projectTime - 0.02);
+        onProjectTimeChange(prevCut !== undefined ? prevCut : 0);
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        const cuts = findCutPoints(project, manifest);
+        const nextCut = cuts.find((c) => c > projectTime + 0.02);
+        if (nextCut !== undefined) onProjectTimeChange(nextCut);
+      } else if (e.key === "i" || e.key === "I") {
         e.preventDefault();
         const clampedIn = Math.max(0, Math.min(sourceTime, sourceDur - 0.1));
         setMarkIn(Number(clampedIn.toFixed(2)));
@@ -510,7 +851,42 @@ export function Timeline({
           e.preventDefault();
           handleSplitAtPlayhead();
         }
+      } else if (e.key === "n" || e.key === "N") {
+        e.preventDefault();
+        setSnapEnabled((v) => {
+          const next = !v;
+          onToast?.(`Magnetic snapping ${next ? "ON" : "OFF"}`, "info");
+          return next;
+        });
+      } else if (e.key === "m" || e.key === "M") {
+        e.preventDefault();
+        handleAddMarkerAt(projectTime);
+      } else if (e.key === "+" || e.key === "=") {
+        e.preventDefault();
+        applyZoom(timelineZoom * 1.4);
+      } else if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        applyZoom(timelineZoom / 1.4);
+      } else if (e.key === "?") {
+        e.preventDefault();
+        onOpenShortcuts?.();
       } else if (e.key === "Backspace" || e.key === "Delete") {
+        if (multiSelected.length > 1) {
+          e.preventDefault();
+          handleBatchDeleteMulti();
+          return;
+        }
+        if (
+          e.shiftKey &&
+          selection &&
+          (selection.type === "video-clip" ||
+            selection.type === "audio-clip" ||
+            selection.type === "caption-clip")
+        ) {
+          e.preventDefault();
+          handleRippleDelete(selection.trackId, selection.clipId);
+          return;
+        }
         if (
           selection &&
           (selection.type === "video-clip" ||
@@ -562,6 +938,12 @@ export function Timeline({
     const snapThreshold = Math.max(0.08, (timelineSpan * 0.015) / timelineZoom);
 
     const handleMove = (e: MouseEvent) => {
+      if (drag.type === "height-resize") {
+        const dy = drag.startY - e.clientY;
+        setTimelineHeightPx(Math.max(150, Math.min(540, Math.round(drag.origHeight + dy))));
+        return;
+      }
+
       if (drag.type === "zoom-drag") {
         const dy = e.clientY - drag.startY;
         const dx = e.clientX - drag.startX;
@@ -667,14 +1049,18 @@ export function Timeline({
               let nextStart = useSnap
                 ? snapTimelineTime(rawStart, candidates, snapThreshold)
                 : Number(rawStart.toFixed(3));
+              let snappedAt: number | null =
+                useSnap && Math.abs(nextStart - rawStart) > 1e-4 ? nextStart : null;
               // Also allow snapping the tail edge when dragging right edge near a candidate
-              if (useSnap && Math.abs(nextStart - rawStart) < 1e-4) {
+              if (useSnap && snappedAt === null) {
                 const rawEnd = rawStart + drag.origDur;
                 const snappedEnd = snapTimelineTime(rawEnd, candidates, snapThreshold);
                 if (Math.abs(snappedEnd - rawEnd) > 1e-4) {
                   nextStart = Math.max(0, Number((snappedEnd - drag.origDur).toFixed(3)));
+                  snappedAt = snappedEnd;
                 }
               }
+              setSnapGuideTime(snappedAt);
               updatedClip = { ...movedClip, start_sec: nextStart };
             } else if (drag.type === "vclip-left") {
               const origEnd = drag.origStart + drag.origDur;
@@ -777,7 +1163,9 @@ export function Timeline({
       if (
         drag.type === "aclip-move" ||
         drag.type === "aclip-left" ||
-        drag.type === "aclip-right"
+        drag.type === "aclip-right" ||
+        drag.type === "aclip-fade-in" ||
+        drag.type === "aclip-fade-out"
       ) {
         const hoveredTrackId =
           drag.type === "aclip-move" ? findHoveredTrackId(e.clientY, "audio") : null;
@@ -807,6 +1195,9 @@ export function Timeline({
               const nextStart = useSnap
                 ? snapTimelineTime(rawStart, candidates, snapThreshold)
                 : Number(rawStart.toFixed(3));
+              setSnapGuideTime(
+                useSnap && Math.abs(nextStart - rawStart) > 1e-4 ? nextStart : null
+              );
               updated = { ...movedClip, start_sec: nextStart };
             } else if (drag.type === "aclip-left") {
               const origEnd = drag.origStart + drag.origDur;
@@ -823,6 +1214,16 @@ export function Timeline({
                 duration_sec: Number(Math.max(0.1, origEnd - nextStart).toFixed(3)),
                 media_in: Number(Math.max(0, drag.origMediaIn + delta * drag.speed).toFixed(3)),
               };
+            } else if (drag.type === "aclip-fade-in") {
+              const nextFade = Number(
+                Math.max(0, Math.min(drag.origDur * 0.5, (drag.origFade ?? 0) + dxSec)).toFixed(2)
+              );
+              updated = { ...movedClip, fade_in_sec: nextFade };
+            } else if (drag.type === "aclip-fade-out") {
+              const nextFade = Number(
+                Math.max(0, Math.min(drag.origDur * 0.5, (drag.origFade ?? 0) - dxSec)).toFixed(2)
+              );
+              updated = { ...movedClip, fade_out_sec: nextFade };
             } else {
               const rawEnd = Math.max(drag.origStart + 0.1, drag.origStart + drag.origDur + dxSec);
               const snappedEnd = useSnap
@@ -866,7 +1267,7 @@ export function Timeline({
         return;
       }
 
-      if (drag.type === "cclip-move" || drag.type === "cclip-right") {
+      if (drag.type === "cclip-move" || drag.type === "cclip-left" || drag.type === "cclip-right") {
         const hoveredTrackId =
           drag.type === "cclip-move" ? findHoveredTrackId(e.clientY, "caption") : null;
         const targetTrack =
@@ -895,7 +1296,23 @@ export function Timeline({
               const nextStart = useSnap
                 ? snapTimelineTime(rawStart, candidates, snapThreshold)
                 : Number(rawStart.toFixed(3));
+              setSnapGuideTime(
+                useSnap && Math.abs(nextStart - rawStart) > 1e-4 ? nextStart : null
+              );
               updated = { ...movedClip, start_sec: nextStart };
+            } else if (drag.type === "cclip-left") {
+              const origEnd = drag.origStart + drag.origDur;
+              const maxStart = origEnd - 0.2;
+              const rawStart = Math.max(0, Math.min(maxStart, drag.origStart + dxSec));
+              const nextStart = useSnap
+                ? Math.max(0, Math.min(maxStart, snapTimelineTime(rawStart, candidates, snapThreshold)))
+                : Number(rawStart.toFixed(3));
+              updated = {
+                ...movedClip,
+                start_sec: nextStart,
+                auto_fit_tts: false,
+                duration_sec: Number(Math.max(0.2, origEnd - nextStart).toFixed(3)),
+              };
             } else {
               const rawEnd = Math.max(drag.origStart + 0.2, drag.origStart + drag.origDur + dxSec);
               const snappedEnd = useSnap
@@ -941,9 +1358,14 @@ export function Timeline({
     };
 
     const handleUp = () => {
-      if (drag.type !== "scrub" && drag.type !== "zoom-drag") {
+      if (
+        drag.type !== "scrub" &&
+        drag.type !== "zoom-drag" &&
+        drag.type !== "height-resize"
+      ) {
         onEndHistoryTransaction?.();
       }
+      setSnapGuideTime(null);
       setDrag(null);
     };
 
@@ -1202,8 +1624,24 @@ export function Timeline({
   return (
     <section
       data-testid="timeline-panel"
-      className="flex shrink-0 flex-col rounded-xl border border-zinc-800 bg-[#151821]"
+      className="relative flex shrink-0 flex-col rounded-xl border border-zinc-800 bg-[#151821]"
     >
+      {/* Draggable Timeline Height Splitter */}
+      <div
+        onMouseDown={(e) => {
+          e.preventDefault();
+          startDrag({
+            type: "height-resize",
+            startY: e.clientY,
+            origHeight: timelineHeightPx,
+          });
+        }}
+        title="Drag up/down to resize timeline height"
+        className="flex h-2.5 cursor-ns-resize items-center justify-center rounded-t-xl border-b border-zinc-800/70 bg-zinc-900/70 text-zinc-600 hover:bg-zinc-800 hover:text-zinc-300"
+      >
+        <GripHorizontal className="h-3 w-3" />
+      </div>
+
       {/* Top Timeline Controls */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 px-3 py-2 text-xs">
         <div className="flex flex-wrap items-center gap-1.5">
@@ -1211,6 +1649,7 @@ export function Timeline({
             type="button"
             onClick={onToggleProjectPlayback}
             disabled={rawDuration <= 0 || preparingPlayback}
+            title="Play / Stop Project (Space)"
             className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-2.5 py-1 font-medium text-white hover:bg-emerald-500 disabled:opacity-40"
           >
             {preparingPlayback ? (
@@ -1232,7 +1671,7 @@ export function Timeline({
             type="button"
             disabled={!splitTarget}
             onClick={handleSplitAtPlayhead}
-            title="Split clip at playhead (S)"
+            title="Split clip at playhead (S or Ctrl+B)"
             className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
           >
             <Scissors className="h-3 w-3" />
@@ -1248,6 +1687,18 @@ export function Timeline({
             Caption / VO
           </button>
 
+          {onOpenBulkScript && (
+            <button
+              type="button"
+              onClick={onOpenBulkScript}
+              title="Paste full script and auto-split into timed captions"
+              className="inline-flex items-center gap-1 rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[11px] font-medium text-sky-200 hover:bg-sky-500/20"
+            >
+              <FileText className="h-3 w-3" />
+              Script
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => handleAddCameraKeyframeAt()}
@@ -1257,10 +1708,22 @@ export function Timeline({
             Keyframe
           </button>
 
+          {onUpdateMarkers && (
+            <button
+              type="button"
+              onClick={() => handleAddMarkerAt(projectTime)}
+              title="Drop timeline marker at playhead (M)"
+              className="inline-flex items-center gap-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-500/20"
+            >
+              <Bookmark className="h-3 w-3" />
+              Marker
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => setSnapEnabled((v) => !v)}
-            title="Toggle magnetic timeline snapping (hold Shift while dragging to bypass)"
+            title="Toggle magnetic timeline snapping (N, or hold Shift while dragging to bypass)"
             className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] font-medium ${
               snapEnabled
                 ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200"
@@ -1270,6 +1733,18 @@ export function Timeline({
             <Magnet className="h-3 w-3" />
             Snap
           </button>
+
+          {multiSelected.length > 1 && (
+            <button
+              type="button"
+              onClick={handleBatchDeleteMulti}
+              title="Delete all Shift-selected clips"
+              className="inline-flex items-center gap-1 rounded border border-rose-500/50 bg-rose-500/20 px-2 py-1 text-[11px] font-medium text-rose-200 hover:bg-rose-500/30"
+            >
+              <Trash2 className="h-3 w-3" />
+              Delete ({multiSelected.length})
+            </button>
+          )}
 
           <div className="flex items-center gap-1 border-l border-zinc-800 pl-1.5">
             <button
@@ -1406,7 +1881,10 @@ export function Timeline({
         </div>
 
         {/* Vertically Scrollable Synchronized Track Headers + Track Lanes */}
-        <div className="flex max-h-[245px] gap-2 overflow-y-auto select-none pr-0.5">
+        <div
+          className="flex gap-2 overflow-y-auto select-none pr-0.5"
+          style={{ maxHeight: `${timelineHeightPx}px` }}
+        >
           {/* Left Sticky Track Controls Column */}
           <div className="w-44 shrink-0 space-y-1.5 text-[10px] font-medium text-zinc-400">
             {/* Spacer aligning with DAW Zoom strip (h-3.5) + Ruler (h-5) */}
@@ -1828,7 +2306,17 @@ export function Timeline({
 
           {/* Right Scrollable Horizontal Track Canvas */}
           <div className="flex min-w-0 flex-1 flex-col overflow-hidden rounded border border-zinc-800 bg-[#0b0d11]">
-            <div ref={scrollContainerRef} className="overflow-x-auto">
+            <div
+              ref={scrollContainerRef}
+              onWheel={(e) => {
+                if (e.ctrlKey || e.metaKey) {
+                  e.preventDefault();
+                  const factor = e.deltaY < 0 ? 1.2 : 1 / 1.2;
+                  applyZoom(timelineZoom * factor, e.clientX);
+                }
+              }}
+              className="overflow-x-auto"
+            >
               <div
                 ref={trackLaneRef}
                 className="relative"
@@ -1841,7 +2329,7 @@ export function Timeline({
                   aria-valuemin={MIN_TIMELINE_ZOOM}
                   aria-valuemax={MAX_TIMELINE_ZOOM}
                   aria-valuenow={timelineZoom}
-                  title="DAW Zoom: Drag down to zoom in, up to zoom out, left/right to pan"
+                  title="DAW Zoom: Drag down to zoom in, up to zoom out, left/right to pan (or Ctrl+Wheel)"
                   onMouseDown={(e) => {
                     e.preventDefault();
                     startDrag({
@@ -1856,10 +2344,10 @@ export function Timeline({
                   onDoubleClick={() => applyZoom(1)}
                   className="relative flex h-3.5 cursor-ns-resize items-center justify-center border-b border-zinc-800/80 bg-zinc-900/80 text-[9px] font-mono text-zinc-500 hover:bg-zinc-800/80 hover:text-zinc-300"
                 >
-                  <span>↕ Drag to Zoom ({timelineZoom.toFixed(1)}x)</span>
+                  <span>↕ Drag to Zoom ({timelineZoom.toFixed(1)}x) • Ctrl+Wheel</span>
                 </div>
 
-                {/* Global Scrubbable Ruler */}
+                {/* Global Scrubbable Ruler + Timeline Markers */}
                 <div
                   data-log-intent="Scrub timeline ruler"
                   onMouseDown={(e) => {
@@ -1885,6 +2373,28 @@ export function Timeline({
                       {tk.t.toFixed(timelineZoom >= 3 ? 2 : 1)}s ({tk.f}f)
                     </div>
                   ))}
+                  {markers.map((m) => {
+                    const leftPct = Math.max(0, Math.min(100, (m.t / timelineSpan) * 100));
+                    return (
+                      <div
+                        key={m.id}
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          onProjectTimeChange(m.t);
+                        }}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          handleDeleteMarker(m.id);
+                        }}
+                        title={`Marker ${m.label || m.id} @${formatTimecode(m.t)} (Click to jump, Right-click to delete)`}
+                        style={{ left: `${leftPct}%`, transform: "translateX(-50%)" }}
+                        className="absolute top-0 z-20 flex items-center gap-0.5 rounded-b border border-amber-400/70 bg-amber-500/85 px-1 text-[8px] font-bold text-zinc-950 shadow hover:bg-amber-400"
+                      >
+                        <span>{m.label || "M"}</span>
+                      </div>
+                    );
+                  })}
                 </div>
 
                 {/* Track Rows Stack */}
@@ -1903,6 +2413,17 @@ export function Timeline({
                           if (dragOverTrackId === tr.id) setDragOverTrackId(null);
                         }}
                         onDrop={(e) => handleAssetDrop(e, tr)}
+                        onContextMenu={(e) => {
+                          if (tr.locked) return;
+                          const tSec = timeFromClientX(e.clientX);
+                          if (tSec === null) return;
+                          e.preventDefault();
+                          setContextMenu({
+                            x: e.clientX,
+                            y: e.clientY,
+                            target: { kind: "gap", trackId: tr.id, timeSec: tSec },
+                          });
+                        }}
                         className={`relative h-8 transition-colors ${
                           isDropTarget
                             ? "bg-emerald-500/15 ring-1 ring-inset ring-emerald-400"
@@ -1924,9 +2445,10 @@ export function Timeline({
                             (clip.duration_sec / timelineSpan) * 100
                           );
                           const isSelected =
-                            selection?.type === "video-clip" &&
-                            selection.trackId === tr.id &&
-                            selection.clipId === clip.id;
+                            (selection?.type === "video-clip" &&
+                              selection.trackId === tr.id &&
+                              selection.clipId === clip.id) ||
+                            isMultiSelected(clip.id);
                           const asset = project.media_assets?.[clip.asset_id];
                           const assetMeta = manifest.media_metadata?.[clip.asset_id];
                           const assetDur =
@@ -1950,8 +2472,39 @@ export function Timeline({
                             <div
                               key={clip.id}
                               data-testid={`clip-${clip.id}`}
-                              onMouseDown={(e) => {
+                              onContextMenu={(e) => {
+                                e.preventDefault();
                                 e.stopPropagation();
+                                const sel: NonNullable<TimelineSelection> = {
+                                  type: "video-clip",
+                                  trackId: tr.id,
+                                  clipId: clip.id,
+                                };
+                                onSelectItem(sel);
+                                setContextMenu({
+                                  x: e.clientX,
+                                  y: e.clientY,
+                                  target: {
+                                    kind: "clip",
+                                    sel,
+                                    trackId: tr.id,
+                                    clipId: clip.id,
+                                    clipKind: clip.kind,
+                                  },
+                                });
+                              }}
+                              onMouseDown={(e) => {
+                                if (e.button === 2) return;
+                                e.stopPropagation();
+                                if (e.shiftKey) {
+                                  toggleMultiSelect({
+                                    kind: "video-clip",
+                                    trackId: tr.id,
+                                    clipId: clip.id,
+                                  });
+                                } else {
+                                  setMultiSelected([]);
+                                }
                                 onSelectItem({
                                   type: "video-clip",
                                   trackId: tr.id,
@@ -1973,7 +2526,7 @@ export function Timeline({
                                   spanSec: timelineSpan,
                                 });
                               }}
-                              title={`${asset?.name ?? clip.asset_id} • ${clip.start_sec.toFixed(2)}s → ${(clip.start_sec + clip.duration_sec).toFixed(2)}s • Drag freely (Alt+Drag slip)`}
+                              title={`${asset?.name ?? clip.asset_id} • ${clip.start_sec.toFixed(2)}s → ${(clip.start_sec + clip.duration_sec).toFixed(2)}s • Drag freely (Alt+Drag slip • Right-click menu)`}
                               className={`group absolute inset-y-0.5 flex items-center justify-between overflow-hidden rounded-sm border text-[10px] font-mono ${
                                 tr.locked ? "cursor-not-allowed" : "cursor-grab active:cursor-grabbing"
                               } ${baseColors}`}
@@ -2020,6 +2573,19 @@ export function Timeline({
                                   title="Drag to trim clip start"
                                 />
                               )}
+
+                              <img
+                                src={apiClient.assetThumbnailUrl(
+                                  project.project_id,
+                                  clip.asset_id
+                                )}
+                                alt=""
+                                loading="lazy"
+                                onError={(e) => {
+                                  e.currentTarget.style.display = "none";
+                                }}
+                                className="pointer-events-none relative z-10 h-5 w-7 shrink-0 rounded-[2px] object-cover opacity-80"
+                              />
 
                               <span className="relative z-10 min-w-0 flex-1 truncate px-1">
                                 {asset?.name ?? clip.id} ({clip.duration_sec.toFixed(1)}s)
@@ -2218,6 +2784,17 @@ export function Timeline({
                         const clickedT = timeFromClientX(e.clientX);
                         if (clickedT !== null) handleAddCaptionAt(tr.id, clickedT);
                       }}
+                      onContextMenu={(e) => {
+                        if (tr.locked) return;
+                        const tSec = timeFromClientX(e.clientX);
+                        if (tSec === null) return;
+                        e.preventDefault();
+                        setContextMenu({
+                          x: e.clientX,
+                          y: e.clientY,
+                          target: { kind: "gap", trackId: tr.id, timeSec: tSec },
+                        });
+                      }}
                       title="Double-click anywhere (independent of video) to add Caption / Voiceover block"
                       className={`relative h-8 bg-zinc-900/55 ${!tr.visible ? "opacity-50" : ""}`}
                     >
@@ -2231,21 +2808,56 @@ export function Timeline({
                         const leftPct = (clip.start_sec / timelineSpan) * 100;
                         const widthPct = Math.max(1.5, (dur / timelineSpan) * 100);
                         const isSelected =
-                          selection?.type === "caption-clip" &&
-                          selection.trackId === tr.id &&
-                          selection.clipId === clip.id;
-                        const hasAudio = Boolean(
-                          manifest.caption_artifacts?.[clip.id]?.audio_artifact_id
-                        );
+                          (selection?.type === "caption-clip" &&
+                            selection.trackId === tr.id &&
+                            selection.clipId === clip.id) ||
+                          isMultiSelected(clip.id);
+                        const capArt = manifest.caption_artifacts?.[clip.id];
+                        const hasAudio = Boolean(capArt?.audio_artifact_id);
                         const isStale = staleCaptionSet.has(clip.id);
+                        const capWfKey =
+                          capArt?.audio_artifact_id
+                            ? `art:${project.project_id}:${capArt.audio_artifact_id}:${capArt.tts_hash ?? ""}`
+                            : "";
 
                         return (
                           <div
                             key={clip.id}
                             data-testid={`clip-${clip.id}`}
                             onDoubleClick={(e) => e.stopPropagation()}
-                            onMouseDown={(e) => {
+                            onContextMenu={(e) => {
+                              e.preventDefault();
                               e.stopPropagation();
+                              const sel: NonNullable<TimelineSelection> = {
+                                type: "caption-clip",
+                                trackId: tr.id,
+                                clipId: clip.id,
+                              };
+                              onSelectItem(sel);
+                              setContextMenu({
+                                x: e.clientX,
+                                y: e.clientY,
+                                target: {
+                                  kind: "clip",
+                                  sel,
+                                  trackId: tr.id,
+                                  clipId: clip.id,
+                                  clipKind: "caption",
+                                },
+                              });
+                            }}
+                            onMouseDown={(e) => {
+                              if (e.button === 2) return;
+                              e.stopPropagation();
+                              if (e.shiftKey) {
+                                toggleMultiSelect({
+                                  kind: "caption-clip",
+                                  trackId: tr.id,
+                                  clipId: clip.id,
+                                });
+                              } else {
+                                setMultiSelected([]);
+                              }
                               onSelectItem({
                                 type: "caption-clip",
                                 trackId: tr.id,
@@ -2273,8 +2885,37 @@ export function Timeline({
                             }`}
                             style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
                           >
+                            {capWfKey && (
+                              <WaveformBars
+                                peaks={waveforms[capWfKey]}
+                                colorClass="text-sky-300"
+                              />
+                            )}
+                            {!tr.locked && (
+                              <div
+                                onMouseDown={(e) => {
+                                  e.stopPropagation();
+                                  onSelectItem({
+                                    type: "caption-clip",
+                                    trackId: tr.id,
+                                    clipId: clip.id,
+                                  });
+                                  startDrag({
+                                    type: "cclip-left",
+                                    trackId: tr.id,
+                                    clipId: clip.id,
+                                    startX: e.clientX,
+                                    origStart: clip.start_sec,
+                                    origDur: dur,
+                                    spanSec: timelineSpan,
+                                  });
+                                }}
+                                className="absolute inset-y-0 left-0 z-10 w-2 cursor-ew-resize hover:bg-sky-300/40"
+                                title="Drag to trim caption start"
+                              />
+                            )}
                             <span
-                              className={`shrink-0 rounded px-1 font-mono text-[9px] ${
+                              className={`relative z-10 shrink-0 rounded px-1 font-mono text-[9px] ${
                                 clip.tts_enabled
                                   ? hasAudio
                                     ? "bg-emerald-500/25 text-emerald-200"
@@ -2286,7 +2927,7 @@ export function Timeline({
                             >
                               {clip.tts_enabled ? "VO" : "TXT"}
                             </span>
-                            <span className="min-w-0 flex-1 truncate">
+                            <span className="relative z-10 min-w-0 flex-1 truncate">
                               {clip.display_text || "Empty caption..."}
                             </span>
                             {!tr.locked && (
@@ -2327,7 +2968,7 @@ export function Timeline({
                                     spanSec: timelineSpan,
                                   });
                                 }}
-                                className="absolute inset-y-0 right-0 w-2 cursor-ew-resize hover:bg-sky-300/40"
+                                className="absolute inset-y-0 right-0 z-10 w-2 cursor-ew-resize hover:bg-sky-300/40"
                                 title="Drag to set fixed display duration"
                               />
                             )}
@@ -2350,6 +2991,17 @@ export function Timeline({
                           if (dragOverTrackId === tr.id) setDragOverTrackId(null);
                         }}
                         onDrop={(e) => handleAssetDrop(e, tr)}
+                        onContextMenu={(e) => {
+                          if (tr.locked) return;
+                          const tSec = timeFromClientX(e.clientX);
+                          if (tSec === null) return;
+                          e.preventDefault();
+                          setContextMenu({
+                            x: e.clientX,
+                            y: e.clientY,
+                            target: { kind: "gap", trackId: tr.id, timeSec: tSec },
+                          });
+                        }}
                         className={`relative h-8 transition-colors ${
                           isDropTarget
                             ? "bg-amber-500/15 ring-1 ring-inset ring-amber-400"
@@ -2368,19 +3020,60 @@ export function Timeline({
                             (clip.duration_sec / timelineSpan) * 100
                           );
                           const isSelected =
-                            selection?.type === "audio-clip" &&
-                            selection.trackId === tr.id &&
-                            selection.clipId === clip.id;
+                            (selection?.type === "audio-clip" &&
+                              selection.trackId === tr.id &&
+                              selection.clipId === clip.id) ||
+                            isMultiSelected(clip.id);
                           const asset = project.media_assets?.[clip.asset_id];
                           const assetDur =
                             manifest.media_metadata?.[clip.asset_id]?.duration ?? 60;
+                          const wfKey = `asset:${project.project_id}:${clip.asset_id}`;
+                          const fadeInPct = Math.min(
+                            45,
+                            (clip.fade_in_sec / Math.max(0.1, clip.duration_sec)) * 100
+                          );
+                          const fadeOutPct = Math.min(
+                            45,
+                            (clip.fade_out_sec / Math.max(0.1, clip.duration_sec)) * 100
+                          );
 
                           return (
                             <div
                               key={clip.id}
                               data-testid={`clip-${clip.id}`}
-                              onMouseDown={(e) => {
+                              onContextMenu={(e) => {
+                                e.preventDefault();
                                 e.stopPropagation();
+                                const sel: NonNullable<TimelineSelection> = {
+                                  type: "audio-clip",
+                                  trackId: tr.id,
+                                  clipId: clip.id,
+                                };
+                                onSelectItem(sel);
+                                setContextMenu({
+                                  x: e.clientX,
+                                  y: e.clientY,
+                                  target: {
+                                    kind: "clip",
+                                    sel,
+                                    trackId: tr.id,
+                                    clipId: clip.id,
+                                    clipKind: "audio",
+                                  },
+                                });
+                              }}
+                              onMouseDown={(e) => {
+                                if (e.button === 2) return;
+                                e.stopPropagation();
+                                if (e.shiftKey) {
+                                  toggleMultiSelect({
+                                    kind: "audio-clip",
+                                    trackId: tr.id,
+                                    clipId: clip.id,
+                                  });
+                                } else {
+                                  setMultiSelected([]);
+                                }
                                 onSelectItem({
                                   type: "audio-clip",
                                   trackId: tr.id,
@@ -2400,7 +3093,7 @@ export function Timeline({
                                   spanSec: timelineSpan,
                                 });
                               }}
-                              title={`${asset?.name ?? clip.asset_id} • ${clip.start_sec.toFixed(2)}s (${clip.duration_sec.toFixed(2)}s)`}
+                              title={`${asset?.name ?? clip.asset_id} • ${clip.start_sec.toFixed(2)}s (${clip.duration_sec.toFixed(2)}s) • Right-click menu`}
                               className={`group absolute inset-y-0.5 flex items-center justify-between overflow-hidden rounded-sm border text-[10px] font-mono ${
                                 tr.locked ? "cursor-not-allowed" : "cursor-grab active:cursor-grabbing"
                               } ${
@@ -2410,6 +3103,81 @@ export function Timeline({
                               }`}
                               style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
                             >
+                              <WaveformBars
+                                peaks={waveforms[wfKey]}
+                                colorClass="text-amber-300"
+                              />
+                              {/* Visual Fade In / Out slopes */}
+                              {fadeInPct > 0 && (
+                                <div
+                                  className="pointer-events-none absolute inset-y-0 left-0 bg-gradient-to-r from-black/50 to-transparent"
+                                  style={{ width: `${fadeInPct}%` }}
+                                />
+                              )}
+                              {fadeOutPct > 0 && (
+                                <div
+                                  className="pointer-events-none absolute inset-y-0 right-0 bg-gradient-to-l from-black/50 to-transparent"
+                                  style={{ width: `${fadeOutPct}%` }}
+                                />
+                              )}
+                              {/* Draggable Fade In / Out top-corner handles */}
+                              {!tr.locked && (
+                                <>
+                                  <div
+                                    onMouseDown={(e) => {
+                                      e.stopPropagation();
+                                      onSelectItem({
+                                        type: "audio-clip",
+                                        trackId: tr.id,
+                                        clipId: clip.id,
+                                      });
+                                      startDrag({
+                                        type: "aclip-fade-in",
+                                        trackId: tr.id,
+                                        clipId: clip.id,
+                                        startX: e.clientX,
+                                        origStart: clip.start_sec,
+                                        origDur: clip.duration_sec,
+                                        origMediaIn: clip.media_in,
+                                        origFade: clip.fade_in_sec,
+                                        speed: clip.speed,
+                                        assetDur,
+                                        spanSec: timelineSpan,
+                                      });
+                                    }}
+                                    title={`Fade In: ${clip.fade_in_sec.toFixed(2)}s (drag horizontally)`}
+                                    style={{ left: `${fadeInPct}%` }}
+                                    className="absolute top-0 z-20 h-2.5 w-2.5 -translate-x-1/2 cursor-ew-resize rounded-br bg-amber-300/80 opacity-0 transition group-hover:opacity-100"
+                                  />
+                                  <div
+                                    onMouseDown={(e) => {
+                                      e.stopPropagation();
+                                      onSelectItem({
+                                        type: "audio-clip",
+                                        trackId: tr.id,
+                                        clipId: clip.id,
+                                      });
+                                      startDrag({
+                                        type: "aclip-fade-out",
+                                        trackId: tr.id,
+                                        clipId: clip.id,
+                                        startX: e.clientX,
+                                        origStart: clip.start_sec,
+                                        origDur: clip.duration_sec,
+                                        origMediaIn: clip.media_in,
+                                        origFade: clip.fade_out_sec,
+                                        speed: clip.speed,
+                                        assetDur,
+                                        spanSec: timelineSpan,
+                                      });
+                                    }}
+                                    title={`Fade Out: ${clip.fade_out_sec.toFixed(2)}s (drag horizontally)`}
+                                    style={{ right: `${fadeOutPct}%` }}
+                                    className="absolute top-0 z-20 h-2.5 w-2.5 translate-x-1/2 cursor-ew-resize rounded-bl bg-amber-300/80 opacity-0 transition group-hover:opacity-100"
+                                  />
+                                </>
+                              )}
+
                               {!tr.locked && (
                                 <div
                                   onMouseDown={(e) => {
@@ -2489,6 +3257,16 @@ export function Timeline({
                     );
                   })}
 
+                  {/* Magnetic Snap Visual Guideline */}
+                  {snapGuideTime !== null && (
+                    <div
+                      className="pointer-events-none absolute inset-y-0 z-25 w-px bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.95)]"
+                      style={{
+                        left: `${Math.max(0, Math.min(100, (snapGuideTime / timelineSpan) * 100))}%`,
+                      }}
+                    />
+                  )}
+
                   {/* Shared Global Playhead across all lanes */}
                   <div
                     className="pointer-events-none absolute inset-y-0 z-30 w-0.5 bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.85)]"
@@ -2500,6 +3278,196 @@ export function Timeline({
           </div>
         </div>
       </div>
+
+      {/* Right-Click Context Menu */}
+      {contextMenu && (
+        <div
+          onMouseDown={(e) => e.stopPropagation()}
+          style={{
+            left: Math.min(contextMenu.x, window.innerWidth - 210),
+            top: Math.min(contextMenu.y, window.innerHeight - 280),
+          }}
+          className="fixed z-50 w-48 rounded-lg border border-zinc-700 bg-[#181c26] p-1 text-xs text-zinc-200 shadow-2xl"
+        >
+          {contextMenu.target.kind === "gap" ? (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = contextMenu.target;
+                  if (target.kind === "gap") {
+                    handleCloseGap(target.trackId, target.timeSec);
+                  }
+                  setContextMenu(null);
+                }}
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+              >
+                <Magnet className="h-3.5 w-3.5 text-emerald-400" />
+                Close Gap
+              </button>
+              {canPasteClip && onPasteClipAtPlayhead && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (contextMenu.target.kind === "gap") {
+                      onProjectTimeChange(contextMenu.target.timeSec);
+                    }
+                    onPasteClipAtPlayhead();
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+                >
+                  <Copy className="h-3.5 w-3.5 text-sky-400" />
+                  Paste Clip Here
+                </button>
+              )}
+              {onUpdateMarkers && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (contextMenu.target.kind === "gap") {
+                      handleAddMarkerAt(contextMenu.target.timeSec);
+                    }
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+                >
+                  <Bookmark className="h-3.5 w-3.5 text-amber-400" />
+                  Add Marker Here
+                </button>
+              )}
+            </>
+          ) : (
+            <>
+              {splitTarget && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleSplitAtPlayhead();
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+                >
+                  <Scissors className="h-3.5 w-3.5 text-zinc-400" />
+                  Split at Playhead (S)
+                </button>
+              )}
+              {onCopySelectedClip && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onCopySelectedClip();
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+                >
+                  <Copy className="h-3.5 w-3.5 text-zinc-400" />
+                  Copy Clip (Ctrl+C)
+                </button>
+              )}
+              {onDuplicateSelectedClip && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onDuplicateSelectedClip();
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+                >
+                  <Plus className="h-3.5 w-3.5 text-zinc-400" />
+                  Duplicate (Ctrl+D)
+                </button>
+              )}
+              {onCopyAttributes && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onCopyAttributes();
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+                >
+                  <Copy className="h-3.5 w-3.5 text-sky-400" />
+                  Copy Attributes
+                </button>
+              )}
+              {canPasteAttributes && onPasteAttributes && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onPasteAttributes();
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+                >
+                  <Copy className="h-3.5 w-3.5 text-emerald-400" />
+                  Paste Attributes
+                </button>
+              )}
+              {contextMenu.target.clipKind === "video" && onDetachAudio && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (contextMenu.target.kind === "clip") {
+                      onDetachAudio(contextMenu.target.trackId, contextMenu.target.clipId);
+                    }
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+                >
+                  <Music className="h-3.5 w-3.5 text-amber-400" />
+                  Detach Audio
+                </button>
+              )}
+              {contextMenu.target.clipKind === "video" && onFreezeFrame && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (contextMenu.target.kind === "clip") {
+                      onFreezeFrame(contextMenu.target.trackId, contextMenu.target.clipId);
+                    }
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-zinc-800"
+                >
+                  <Snowflake className="h-3.5 w-3.5 text-sky-400" />
+                  Insert Freeze Frame
+                </button>
+              )}
+              <div className="my-1 border-t border-zinc-800" />
+              <button
+                type="button"
+                onClick={() => {
+                  if (contextMenu.target.kind === "clip") {
+                    handleRippleDelete(
+                      contextMenu.target.trackId,
+                      contextMenu.target.clipId
+                    );
+                  }
+                  setContextMenu(null);
+                }}
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-amber-200 hover:bg-amber-500/20"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                Ripple Delete (Shift+Del)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (contextMenu.target.kind === "clip") {
+                    deleteSelectedOrSpecified(contextMenu.target.sel);
+                  }
+                  setContextMenu(null);
+                }}
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-rose-300 hover:bg-rose-500/20"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                Delete Clip
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </section>
   );
 }

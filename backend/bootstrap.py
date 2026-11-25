@@ -17,7 +17,14 @@ from typing import Iterator
 
 import httpx
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+def _resolve_repo_root() -> Path:
+    """Resolve repository/bundle root in both development and PyInstaller frozen builds."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(getattr(sys, "_MEIPASS")).resolve()
+    return Path(__file__).resolve().parent.parent
+
+
+REPO_ROOT = _resolve_repo_root()
 APP_DIR_NAME = "SimsVerticalStudio"
 
 KOKORO_ASSETS: dict[str, dict[str, object]] = {
@@ -74,6 +81,9 @@ def get_data_dir() -> Path:
 
 
 def _run_subprocess(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    kwargs: dict[str, object] = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return subprocess.run(
         cmd,
         shell=False,
@@ -82,6 +92,7 @@ def _run_subprocess(cmd: list[str]) -> subprocess.CompletedProcess[str]:
         encoding="utf-8",
         errors="replace",
         check=False,
+        **kwargs,  # type: ignore[arg-type]
     )
 
 
@@ -95,13 +106,18 @@ def verify_ffmpeg(data_dir: Path | None = None, offline: bool = False) -> tuple[
     bin_dir = data_dir / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
 
+    bundled_ffmpeg = REPO_ROOT / "bin" / f"ffmpeg{exe_suffix}"
+    bundled_ffprobe = REPO_ROOT / "bin" / f"ffprobe{exe_suffix}"
     cached_ffmpeg = bin_dir / f"ffmpeg{exe_suffix}"
     cached_ffprobe = bin_dir / f"ffprobe{exe_suffix}"
 
     ffmpeg_path: Path | None = None
     ffprobe_path: Path | None = None
 
-    if cached_ffmpeg.is_file() and cached_ffprobe.is_file():
+    if bundled_ffmpeg.is_file() and bundled_ffprobe.is_file():
+        ffmpeg_path = bundled_ffmpeg
+        ffprobe_path = bundled_ffprobe
+    elif cached_ffmpeg.is_file() and cached_ffprobe.is_file():
         ffmpeg_path = cached_ffmpeg
         ffprobe_path = cached_ffprobe
     else:
