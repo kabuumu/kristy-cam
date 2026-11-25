@@ -10,6 +10,8 @@ import type {
   ProjectBundle,
   ProjectInput,
   ProjectSummary,
+  UpdateCheckResult,
+  UpdateInstallState,
 } from "../types/studio";
 
 export class ApiError extends Error {
@@ -415,5 +417,19 @@ export const apiClient = {
     if (options?.projectId) params.set("project_id", options.projectId);
     const qs = params.toString();
     return request(`/api/logs${qs ? `?${qs}` : ""}`, { method: "GET" });
+  },
+
+  checkForUpdate(force = false): Promise<UpdateCheckResult> {
+    return request(`/api/app/update-check${force ? "?force=true" : ""}`, {
+      method: "GET",
+    });
+  },
+
+  getUpdateStatus(): Promise<UpdateInstallState> {
+    return request("/api/app/update-status", { method: "GET" });
+  },
+
+  installUpdate(): Promise<UpdateInstallState> {
+    return request("/api/app/update-install", { method: "POST" });
   },
 };

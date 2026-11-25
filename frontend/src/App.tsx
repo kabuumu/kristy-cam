@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  ArrowUpCircle,
   Copy,
   Download,
   Film,
@@ -29,6 +30,7 @@ import { MediaBin } from "./components/MediaBin";
 import { ShortcutModal } from "./components/ShortcutModal";
 import { Timeline } from "./components/Timeline";
 import { ToastContainer, type ToastItem } from "./components/ToastContainer";
+import { UpdateModal } from "./components/UpdateModal";
 import type {
   ArtifactManifest,
   AudioClip,
@@ -51,6 +53,8 @@ import type {
   TimelineMarker,
   TimelineSelection,
   TimelineTrack,
+  UpdateCheckResult,
+  UpdateInstallState,
   VideoTrack,
   VisualClip,
   VisualClipColorAdjust,
@@ -277,6 +281,63 @@ export default function App() {
   const [bulkScriptOpen, setBulkScriptOpen] = useState(false);
   const [logModalOpen, setLogModalOpen] = useState(false);
   const [customResolutionMode, setCustomResolutionMode] = useState(false);
+
+  // App Auto-Updater state
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateInstallState, setUpdateInstallState] = useState<UpdateInstallState>({
+    status: "idle",
+    progress: 0,
+    stage: "",
+    error: null,
+  });
+
+  const handleCheckForUpdate = useCallback(async (force = false) => {
+    setCheckingUpdate(true);
+    try {
+      const res = await apiClient.checkForUpdate(force);
+      setUpdateInfo(res);
+    } catch {
+      // Silently ignore background check failures
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }, []);
+
+  const handleInstallUpdate = useCallback(async () => {
+    try {
+      const st = await apiClient.installUpdate();
+      setUpdateInstallState(st);
+    } catch (err) {
+      setUpdateInstallState({
+        status: "error",
+        progress: 0,
+        stage: "Update failed",
+        error: err instanceof Error ? err.message : "Failed to start update",
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void handleCheckForUpdate(false);
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [handleCheckForUpdate]);
+
+  useEffect(() => {
+    if (updateInstallState.status !== "downloading") return;
+    const interval = window.setInterval(async () => {
+      try {
+        const st = await apiClient.getUpdateStatus();
+        setUpdateInstallState(st);
+      } catch {
+        // Server may be shutting down to launch installer
+      }
+    }, 400);
+    return () => window.clearInterval(interval);
+  }, [updateInstallState.status]);
 
   const [historyState, setHistoryState] = useState<UndoHistoryState>(() =>
     createInitialHistoryState()
@@ -2017,7 +2078,8 @@ export default function App() {
     exportConfigOpen ||
     shortcutsOpen ||
     bulkScriptOpen ||
-    logModalOpen;
+    logModalOpen ||
+    updateModalOpen;
   isModalOpenRef.current = isModalOpen;
   const sourceBroken =
     sourceStatus &&
@@ -2125,6 +2187,34 @@ export default function App() {
           >
             <ScrollText className="h-3.5 w-3.5 text-sky-400" />
             <span className="hidden md:inline">Logs</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setUpdateModalOpen(true);
+              if (!updateInfo) void handleCheckForUpdate(false);
+            }}
+            title={
+              updateInfo?.update_available
+                ? `Update available: ${updateInfo.latest_version}`
+                : `Check for updates (${updateInfo?.current_version ?? "v0.1"})`
+            }
+            aria-label="Check for updates"
+            className={`inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs font-medium transition ${
+              updateInfo?.update_available
+                ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30"
+                : "border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+            }`}
+          >
+            <ArrowUpCircle
+              className={`h-3.5 w-3.5 ${
+                updateInfo?.update_available ? "text-emerald-300 animate-pulse" : "text-zinc-400"
+              }`}
+            />
+            {updateInfo?.update_available && (
+              <span className="hidden sm:inline">Update</span>
+            )}
           </button>
         </div>
 
@@ -2839,6 +2929,16 @@ export default function App() {
       <ShortcutModal
         open={shortcutsOpen}
         onClose={() => setShortcutsOpen(false)}
+      />
+
+      <UpdateModal
+        open={updateModalOpen}
+        updateInfo={updateInfo}
+        installState={updateInstallState}
+        checking={checkingUpdate}
+        onClose={() => setUpdateModalOpen(false)}
+        onRecheck={() => void handleCheckForUpdate(true)}
+        onInstall={() => void handleInstallUpdate()}
       />
 
       <ToastContainer

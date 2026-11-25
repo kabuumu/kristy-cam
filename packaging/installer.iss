@@ -35,4 +35,4 @@ Name: "{autoprograms}\Sims 4 Vertical Video Studio"; Filename: "{app}\SimsVertic
 Name: "{autodesktop}\Sims 4 Vertical Video Studio"; Filename: "{app}\SimsVerticalStudio.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\SimsVerticalStudio.exe"; Description: "{cm:LaunchProgram,Sims 4 Vertical Video Studio}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\SimsVerticalStudio.exe"; Description: "{cm:LaunchProgram,Sims 4 Vertical Video Studio}"; Flags: nowait postinstall

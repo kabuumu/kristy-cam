@@ -112,8 +112,15 @@ from backend.tts import (
     synthesize_caption_tts,
     synthesize_segment_tts,
 )
+from backend.updater import (
+    UpdaterError,
+    check_for_update,
+    download_installer,
+    get_build_info,
+    launch_windows_installer_and_exit,
+)
 
-APP_VERSION = "0.1.0"
+APP_VERSION = get_build_info()["version"]
 ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "testserver"})
 ALLOWED_ORIGINS = frozenset({"127.0.0.1", "localhost"})
 MUTATING_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
@@ -121,6 +128,14 @@ FRONTEND_DIST_DIR = REPO_ROOT / "frontend" / "dist"
 STREAM_CHUNK_SIZE = 64 * 1024
 
 _STATE_INIT_LOCK = threading.Lock()
+_UPDATE_LOCK = threading.Lock()
+_UPDATE_CHECK_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+_UPDATE_INSTALL_STATE: dict[str, Any] = {
+    "status": "idle",  # idle | downloading | installing | error
+    "progress": 0,
+    "stage": "",
+    "error": None,
+}
 
 
 def _extract_hostname(host_header: str) -> str:
@@ -787,6 +802,88 @@ def _compute_stale_tts_segments(
 def api_health() -> dict[str, str]:
     """Liveness and app identity check."""
     return {"status": "ok", "app": "sims-vertical-studio", "version": APP_VERSION}
+
+
+@app.get("/api/app/update-check")
+def api_app_update_check(force: bool = False) -> dict[str, Any]:
+    """Check GitHub Releases for a newer Windows release (cached 5 min unless force=true)."""
+    now = time.monotonic()
+    with _UPDATE_LOCK:
+        cached = _UPDATE_CHECK_CACHE.get("data")
+        cached_ts = float(_UPDATE_CHECK_CACHE.get("ts") or 0.0)
+        if not force and cached is not None and (now - cached_ts) < 300.0:
+            return dict(cached)
+
+    result = check_for_update()
+    with _UPDATE_LOCK:
+        _UPDATE_CHECK_CACHE["ts"] = time.monotonic()
+        _UPDATE_CHECK_CACHE["data"] = dict(result)
+    return result
+
+
+@app.get("/api/app/update-status")
+def api_app_update_status() -> dict[str, Any]:
+    """Return current download/install status of an in-progress self-update."""
+    with _UPDATE_LOCK:
+        return dict(_UPDATE_INSTALL_STATE)
+
+
+@app.post("/api/app/update-install", status_code=202)
+def api_app_update_install(request: Request) -> dict[str, Any]:
+    """Download the latest Windows Setup installer from GitHub and launch it silently."""
+    data_dir = _get_data_dir(request)
+    info = get_build_info()
+    if not info.get("can_self_update"):
+        raise HTTPException(
+            status_code=400,
+            detail="Automatic in-app updates are only available in the installed Windows desktop app.",
+        )
+
+    with _UPDATE_LOCK:
+        if _UPDATE_INSTALL_STATE["status"] in ("downloading", "installing"):
+            return dict(_UPDATE_INSTALL_STATE)
+
+    check = check_for_update()
+    if check.get("error"):
+        raise HTTPException(status_code=502, detail=str(check["error"]))
+    if not check.get("download_url") or not check.get("asset_name"):
+        raise HTTPException(status_code=404, detail="No Windows installer asset found in the latest release.")
+
+    download_url = str(check["download_url"])
+    asset_name = str(check["asset_name"])
+
+    with _UPDATE_LOCK:
+        _UPDATE_INSTALL_STATE.update(
+            {"status": "downloading", "progress": 2, "stage": "Starting download...", "error": None}
+        )
+
+    def _worker() -> None:
+        def _on_prog(pct: int, stage: str) -> None:
+            with _UPDATE_LOCK:
+                _UPDATE_INSTALL_STATE["progress"] = pct
+                _UPDATE_INSTALL_STATE["stage"] = stage
+
+        try:
+            installer_path = download_installer(
+                download_url=download_url,
+                asset_name=asset_name,
+                data_dir=data_dir,
+                on_progress=_on_prog,
+            )
+            with _UPDATE_LOCK:
+                _UPDATE_INSTALL_STATE.update(
+                    {"status": "installing", "progress": 100, "stage": "Launching installer & restarting..."}
+                )
+            launch_windows_installer_and_exit(installer_path)
+        except (UpdaterError, Exception) as exc:
+            with _UPDATE_LOCK:
+                _UPDATE_INSTALL_STATE.update(
+                    {"status": "error", "stage": "Update failed", "error": str(exc)}
+                )
+
+    threading.Thread(target=_worker, name="app-self-updater", daemon=True).start()
+    with _UPDATE_LOCK:
+        return dict(_UPDATE_INSTALL_STATE)
 
 
 @app.get("/api/capabilities")

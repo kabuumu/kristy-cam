@@ -4,6 +4,7 @@ frontend/node_modules/
 /dist/
 /release-out/
 /packaging/bin/
+/packaging/build_info.json
 __pycache__/
 .pytest_cache/
 *.py[cod]

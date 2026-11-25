@@ -432,3 +432,32 @@ export interface JobAccepted {
   job_id: string;
   status?: JobStatus;
 }
+
+export interface UpdateCheckResult {
+  current_version: string;
+  current_tag: string;
+  current_build_number: number;
+  repo: string;
+  is_frozen: boolean;
+  can_self_update: boolean;
+  update_available: boolean;
+  offline: boolean;
+  error: string | null;
+  latest_version: string | null;
+  latest_tag: string | null;
+  latest_build_number: number | null;
+  release_name: string | null;
+  release_notes: string | null;
+  release_url: string;
+  published_at: string | null;
+  asset_name: string | null;
+  asset_size: number | null;
+  download_url: string | null;
+}
+
+export interface UpdateInstallState {
+  status: "idle" | "downloading" | "installing" | "error";
+  progress: number;
+  stage: string;
+  error: string | null;
+}

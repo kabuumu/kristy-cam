@@ -17,6 +17,11 @@ if bundled_bin.is_dir():
     for exe in bundled_bin.glob("*.exe"):
         datas.append((str(exe), "bin"))
 
+# Include embedded build metadata for GitHub auto-updater
+build_info_file = ROOT / "packaging" / "build_info.json"
+if build_info_file.is_file():
+    datas.append((str(build_info_file), "."))
+
 binaries = []
 hiddenimports = [
     "backend.main",
